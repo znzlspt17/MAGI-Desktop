@@ -22,6 +22,7 @@ struct State {
     storage: storage::Storage,
     close_check: bool,
     close_allowed: bool,
+    close_confirmation: bool,
 }
 
 impl State {
@@ -166,7 +167,11 @@ impl App {
                 } else if self.state.close_check {
                     self.state.close_check = false;
                     if self.state.storage.may_close() {
-                        self.state.close_allowed = true;
+                        if self.state.storage.has_pending_result() {
+                            self.state.close_confirmation = true;
+                        } else {
+                            self.state.close_allowed = true;
+                        }
                     } else {
                         self.state.status = "완료 저장 상태를 확인한 뒤 다시 닫아 주세요".into();
                     }
@@ -250,6 +255,9 @@ impl App {
         if self.state.close_allowed && !self.state.storage.may_close() {
             self.state.close_allowed = false;
         }
+        if self.state.close_confirmation && !self.state.storage.may_close() {
+            self.state.close_confirmation = false;
+        }
         if self.state.close_allowed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -284,6 +292,23 @@ impl App {
             });
         });
         self.storage_panel(ctx);
+        if self.state.close_confirmation {
+            egui::Window::new("완료 저장 대기")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("완료 결과가 저장 대기 중입니다. 복구 기록은 보존되며 엔진은 계속 실행됩니다.");
+                    ui.horizontal(|ui| {
+                        if ui.button("창 유지").clicked() {
+                            self.state.close_confirmation = false;
+                        }
+                        if ui.button("창만 닫기").clicked() && self.state.storage.may_close() {
+                            self.state.close_confirmation = false;
+                            self.state.close_allowed = true;
+                        }
+                    });
+                });
+        }
         egui::SidePanel::left("sidebar")
             .default_width(230.0)
             .show(ctx, |ui| {
@@ -563,6 +588,132 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
+    }
+
+    #[test]
+    fn journaled_pending_requires_confirmation_before_close() {
+        let (tx, _requests) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(input, |ctx| app.render(ctx));
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"r","project_id":"p","stage":"worktree","state":"pending","attempts":1,"journaled":true,"message":"저장 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Close)),
+            "저장 대기를 확인하기 전에 창이 닫혔습니다"
+        );
+        fn click(ctx: &egui::Context, app: &mut App, label: &str) {
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input(), |ctx| app.render(ctx));
+            let output = ctx.run(input(), |ctx| app.render(ctx));
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("선택 버튼이 보여야 합니다");
+            let mut down = input();
+            down.events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(down, |ctx| app.render(ctx));
+            let mut up = input();
+            up.events = vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            let _ = ctx.run(up, |ctx| app.render(ctx));
+        }
+        click(&ctx, &mut app, "창 유지");
+        assert!(!app.state.close_allowed && !app.state.close_confirmation);
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(input, |ctx| app.render(ctx));
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"r","project_id":"p","stage":"worktree","state":"retrying","attempts":1,"journaled":true,"message":"저장 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+        click(&ctx, &mut app, "창만 닫기");
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn close_confirmation_cannot_bypass_new_unresolved_storage_state() {
+        for (stage, journaled, local_retry) in [
+            ("agent", false, false),
+            ("unknown", true, false),
+            ("agent", true, true),
+        ] {
+            let (tx, _requests) = std::sync::mpsc::sync_channel(8);
+            let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+            let mut app = App {
+                state: State::default(),
+                tx,
+                rx,
+                cancel_startup: Default::default(),
+            };
+            app.state.close_confirmation = true;
+            if local_retry {
+                app.state.storage.retries.insert("r".into());
+            }
+            app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+                "failures":[{"run_id":"r","project_id":"p","stage":stage,"state":"pending","attempts":1,"journaled":journaled,"message":"대기"}],
+                "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+            }))) });
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+            assert!(!app.state.close_confirmation && !app.state.close_allowed);
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::Close)));
+        }
     }
 
     #[test]

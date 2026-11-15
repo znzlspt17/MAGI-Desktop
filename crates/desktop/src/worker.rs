@@ -58,14 +58,28 @@ fn connect_or_launch(
         command: Command::Status,
     };
     let probe = || {
-        runtime.block_on(async {
+        #[cfg(test)]
+        let began = Instant::now();
+        let result = runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_millis(400),
                 transport::request(pipe, &request),
             )
             .await
             .map_err(|_| anyhow::Error::new(ProbeTimeout))?
-        })
+        });
+        #[cfg(test)]
+        eprintln!(
+            "기동 probe: {:?}, {}",
+            began.elapsed(),
+            match &result {
+                Ok(_) => "응답",
+                Err(error) if error.is::<ProbeTimeout>() => "400ms 응답 제한",
+                Err(error) if should_launch(error) => "pipe 미생성",
+                Err(_) => "기타 연결 오류",
+            }
+        );
+        result
     };
     if cancel.load(Ordering::Acquire) {
         return Err("엔진 시작 대기가 취소됐습니다 (엔진은 계속 실행될 수 있습니다)".into());
@@ -748,6 +762,7 @@ mod tests {
         };
         let database = std::env::var_os("MAGI_TEST_AUTO_DB").unwrap();
         let engine = Arc::new(engine::Engine::open(std::path::Path::new(&database)).unwrap());
+        eprintln!("테스트 엔진 DB 준비됨");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -762,10 +777,12 @@ mod tests {
                 let mut first = slow_first;
                 while let Some((req, reply)) = rx.recv().await {
                     if first {
+                        eprintln!("테스트 엔진 첫 요청 수신");
                         first = false;
                         tokio::time::sleep(Duration::from_millis(550)).await;
                     }
                     let _ = reply.send(engine.clone().handle_async(req).await);
+                    eprintln!("테스트 엔진 응답 처리됨");
                 }
             });
             let _ = tokio::time::timeout(
@@ -808,7 +825,7 @@ mod tests {
                     .env("MAGI_TEST_AUTO_SLOW", "1")
                     .creation_flags(0x08000000)
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
                     .spawn()
                     .map_err(|e| e.to_string())
             },

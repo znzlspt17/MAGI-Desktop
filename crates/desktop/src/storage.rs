@@ -113,6 +113,15 @@ impl Default for Storage {
 }
 
 impl Storage {
+    pub fn has_pending_result(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .failures
+                .iter()
+                .any(|failure| matches!(failure.state.as_str(), "pending" | "retrying"))
+        })
+    }
+
     pub fn may_close(&self) -> bool {
         self.known
             && !self.pending_poll
