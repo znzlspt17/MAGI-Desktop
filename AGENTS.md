@@ -28,6 +28,12 @@
 - 새 Rust 역할의 구성과 호출은 사용자가 승인했다. 모델은 `gpt-6.1-terra`, reasoning effort는 `medium`이다.
 - `cto` 및 Astra 계열은 호출별 별도 승인이 필요하다.
 
+## 에이전트 이름과 서명
+
+- `pm`: 이음 (Ieum), `dev`: 다온 (Daon), `designer`: 가람 (Garam), `devops`: 지안 (Jian)
+- `intern`: 나윤 (Nayoon), `rust_desktop`: 서윤 (Seoyun), `rust_inference`: 벼리 (Byeori), `cto`: 서진 (Seojin)
+- PR 본문, 리뷰와 작업 보고에는 실제 수행한 에이전트만 `이름(role)` 형식으로 서명한다. 사용자나 다른 에이전트의 수행을 대신 주장하지 않는다. 서명은 GitHub 표시 계정과 별개이며 계정이나 Git identity를 변경하지 않는다.
+
 ## 구현과 검증
 
 - 행동 변경은 명세의 인수 조건에서 테스트를 도출하고 Red → Green → Refactor를 따른다.
