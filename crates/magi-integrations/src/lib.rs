@@ -206,3 +206,38 @@ impl KnowledgeIndex {
         self.set_embedding(&ticket.id, ticket.version, model, vector)
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub id: String,
+    pub version: u64,
+    pub text: String,
+}
+#[derive(Default)]
+pub struct DecisionStore {
+    versions: BTreeMap<(String, u64), Decision>,
+}
+impl DecisionStore {
+    pub fn save(&mut self, decision: Decision) -> Result<(), String> {
+        if decision.id.trim().is_empty() || decision.text.trim().is_empty() || decision.version == 0
+        {
+            return Err("invalid decision".into());
+        }
+        if self
+            .versions
+            .keys()
+            .any(|(id, version)| id == &decision.id && *version >= decision.version)
+        {
+            return Err("decision version is not newer".into());
+        }
+        self.versions
+            .insert((decision.id.clone(), decision.version), decision);
+        Ok(())
+    }
+    pub fn select(&self, id: &str, version: u64) -> Result<Decision, String> {
+        self.versions
+            .get(&(id.to_owned(), version))
+            .cloned()
+            .ok_or_else(|| "decision version not found".into())
+    }
+}

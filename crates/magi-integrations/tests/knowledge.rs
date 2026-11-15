@@ -104,3 +104,32 @@ fn cancelled_embedding_cannot_publish_late_result() {
         .is_err());
     assert!(index.semantic_search(&[1.0, 0.0], &model, 0, 1).is_err());
 }
+
+#[test]
+fn selected_decision_is_a_versioned_snapshot() {
+    let mut store = DecisionStore::default();
+    store
+        .save(Decision {
+            id: "d".into(),
+            version: 1,
+            text: "first".into(),
+        })
+        .unwrap();
+    let selected = store.select("d", 1).unwrap();
+    store
+        .save(Decision {
+            id: "d".into(),
+            version: 2,
+            text: "revised".into(),
+        })
+        .unwrap();
+    assert_eq!(selected.text, "first");
+    assert_eq!(store.select("d", 1).unwrap(), selected);
+    assert!(store
+        .save(Decision {
+            id: "d".into(),
+            version: 1,
+            text: "overwrite".into()
+        })
+        .is_err());
+}
