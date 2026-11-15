@@ -188,10 +188,42 @@ async fn status(engine: &Arc<Engine>, id: &str) -> String {
     );
     v["status"].as_str().unwrap().into()
 }
+fn status_is_finished(status: &serde_json::Value) -> bool {
+    status["resources_released"] == true
+        && matches!(
+            status["status"].as_str(),
+            Some("completed" | "cancelled" | "failed" | "uncertain" | "interrupted")
+        )
+}
+
+#[test]
+fn publishing_is_not_a_finished_indexing_job() {
+    assert!(!status_is_finished(
+        &serde_json::json!({"status":"publishing","resources_released":false})
+    ));
+    assert!(!status_is_finished(
+        &serde_json::json!({"status":"completed","resources_released":false})
+    ));
+    assert!(status_is_finished(
+        &serde_json::json!({"status":"completed","resources_released":true})
+    ));
+}
+
 async fn wait_finished(engine: &Arc<Engine>, id: &str) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if !["running", "cancelling"].contains(&status(engine, id).await.as_str()) {
+            let value = data(
+                send(
+                    engine,
+                    Command::KnowledgeIndexStatus {
+                        project_id: id.to_owned(),
+                        document_id: "d".into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            if status_is_finished(&value) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
