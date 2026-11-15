@@ -292,6 +292,16 @@ mod tests {
     #[test]
     #[ignore = "검증 대상 engine.exe 경로를 지정해 실행하는 저장 복구 통합 검사"]
     fn storage_ui_recovers_real_engine_journal_after_database_unlock() {
+        storage_ui_recovers_real_engine_journal(false);
+    }
+
+    #[test]
+    #[ignore = "Agent 완료 저장 기능이 포함된 engine.exe 경로를 지정해 실행하는 통합 검사"]
+    fn agent_storage_ui_recovers_real_engine_journal_after_database_unlock() {
+        storage_ui_recovers_real_engine_journal(true);
+    }
+
+    fn storage_ui_recovers_real_engine_journal(agent: bool) {
         use std::os::windows::process::CommandExt;
 
         struct Fixture {
@@ -348,16 +358,38 @@ mod tests {
         let locked = redb::Database::open(&database).unwrap();
         let tx = locked.begin_write().unwrap();
         {
+            if agent {
+                let mut projects = tx
+                    .open_table(redb::TableDefinition::<&str, &str>::new("projects"))
+                    .unwrap();
+                let mut value = serde_json::to_value(&project).unwrap();
+                value["draft_hash"] = "fixture".into();
+                value["context_version"] = 1.into();
+                value["approved"] = serde_json::json!({"version":1,"hash":"fixture","base_revision":"base","scope":[],"requirements":[],"acceptance":[]});
+                projects
+                    .insert(project.id.as_str(), value.to_string().as_str())
+                    .unwrap();
+            }
             let mut table = tx
                 .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
                 .unwrap();
-            let value = serde_json::json!({"id":run,"project_id":project.id,"status":"preparing","events":[]}).to_string();
+            let value = if agent {
+                serde_json::json!({"id":run,"project_id":project.id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1})
+            } else {
+                serde_json::json!({"id":run,"project_id":project.id,"status":"preparing","events":[]})
+            }.to_string();
             table.insert(run.as_str(), value.as_str()).unwrap();
         }
         tx.commit().unwrap();
         let journal = fixture.dir.join("state.redb.completion-journal");
         std::fs::create_dir(&journal).unwrap();
-        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run,"project_id":project.id,"outcome":{"stage":"worktree","result":{"Ok":null}}});
+        let completion_id = uuid::Uuid::new_v4().to_string();
+        let outcome = if agent {
+            serde_json::json!({"stage":"agent","result":{"success":false,"attempt":1}})
+        } else {
+            serde_json::json!({"stage":"worktree","result":{"Ok":null}})
+        };
+        let record = serde_json::json!({"version":1,"id":completion_id,"run_id":run,"project_id":project.id,"outcome":outcome});
         std::fs::write(
             journal.join(format!("{run}.json")),
             serde_json::to_vec(&record).unwrap(),
@@ -448,6 +480,60 @@ mod tests {
         assert!(find_text(&output, "아직 저장되지 않음").is_some());
         assert!(find_text(&output, "events.log").is_some());
         assert!(find_text(&output, &run).is_some());
+        if agent {
+            assert!(find_text(&output, "단계: agent").is_some());
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let close = ctx.run(input, |ctx| app.render(ctx));
+            assert!(close.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
+            loop {
+                let output = frame(&mut app, vec![]);
+                assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::Close)));
+                if app.state.close_confirmation {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "종료 전 저장 진단 시간 초과"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = frame(&mut app, vec![]);
+            let keep = find_text(&frame(&mut app, vec![]), "창 유지").expect("창 유지 선택");
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(keep),
+                    egui::Event::PointerButton {
+                        pos: keep,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: keep,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(!app.state.close_allowed && !app.state.close_confirmation);
+        }
         let retry = find_text(&output, "완료 저장 재시도").expect("재시도 버튼");
         drop(locked);
         frame(
@@ -511,18 +597,49 @@ mod tests {
             .unwrap();
         let value = table.get(run.as_str()).unwrap().unwrap();
         let stored: serde_json::Value = serde_json::from_str(value.value()).unwrap();
-        assert_eq!(stored["status"], "awaiting_implementation");
+        assert_eq!(stored["events"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            stored["status"],
+            if agent {
+                "interrupted"
+            } else {
+                "awaiting_implementation"
+            }
+        );
+        if agent {
+            assert_eq!(stored["agent_active"], false);
+        }
         assert_eq!(
             stored["events"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|event| event["kind"] == "worktree_ready")
+                .filter(|event| event["kind"]
+                    == if agent {
+                        "interrupted"
+                    } else {
+                        "worktree_ready"
+                    })
                 .count(),
             1
         );
         drop(value);
         drop(table);
+        if agent {
+            let markers = tx
+                .open_table(redb::TableDefinition::<&str, u8>::new(
+                    "completion_commits_v1",
+                ))
+                .unwrap();
+            assert_eq!(
+                markers
+                    .get(completion_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                1
+            );
+        }
         drop(tx);
         drop(db);
     }
