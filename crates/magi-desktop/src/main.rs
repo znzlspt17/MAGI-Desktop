@@ -125,57 +125,59 @@ impl App {
         egui::SidePanel::left("sidebar")
             .default_width(230.0)
             .show(ctx, |ui| {
-                ui.heading("프로젝트");
-                if self.state.status.starts_with("오류:") {
-                    ui.label("엔진이 실행 중인지 확인한 뒤 새로고침하세요.");
-                }
-                if ui.button("새로고침").clicked() {
-                    self.send(worker::Work::new(worker::Kind::Status, Command::Status));
-                    self.send(worker::Work::new(worker::Kind::List, Command::ListProjects));
-                }
-                for project in self.state.projects.clone() {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("프로젝트");
+                    if self.state.status.starts_with("오류:") {
+                        ui.label("엔진이 실행 중인지 확인한 뒤 새로고침하세요.");
+                    }
+                    if ui.button("새로고침").clicked() {
+                        self.send(worker::Work::new(worker::Kind::Status, Command::Status));
+                        self.send(worker::Work::new(worker::Kind::List, Command::ListProjects));
+                    }
+                    for project in self.state.projects.clone() {
+                        if ui
+                            .selectable_label(
+                                self.state.selected.as_deref() == Some(&project.id),
+                                &project.name,
+                            )
+                            .clicked()
+                        {
+                            let generation = self.state.select(&project.id);
+                            self.send(worker::Work::new(
+                                worker::Kind::Get { generation },
+                                Command::GetProject {
+                                    project_id: project.id,
+                                },
+                            ));
+                        }
+                    }
+                    ui.separator();
+                    ui.label("새 프로젝트");
+                    ui.text_edit_singleline(&mut self.state.name);
+                    ui.text_edit_singleline(&mut self.state.path);
                     if ui
-                        .selectable_label(
-                            self.state.selected.as_deref() == Some(&project.id),
-                            &project.name,
+                        .add_enabled(
+                            !self.state.creating
+                                && !self.state.name.trim().is_empty()
+                                && !self.state.path.trim().is_empty(),
+                            egui::Button::new("생성"),
                         )
                         .clicked()
                     {
-                        let generation = self.state.select(&project.id);
-                        self.send(worker::Work::new(
-                            worker::Kind::Get { generation },
-                            Command::GetProject {
-                                project_id: project.id,
+                        let name = self.state.name.clone();
+                        let path = self.state.path.clone();
+                        if self.send(worker::Work::new(
+                            worker::Kind::Create {
+                                name: name.clone(),
+                                path: path.clone(),
                             },
-                        ));
+                            Command::CreateProject { name, path },
+                        )) {
+                            self.state.creating = true;
+                            self.state.status = "프로젝트 생성 중".into();
+                        }
                     }
-                }
-                ui.separator();
-                ui.label("새 프로젝트");
-                ui.text_edit_singleline(&mut self.state.name);
-                ui.text_edit_singleline(&mut self.state.path);
-                if ui
-                    .add_enabled(
-                        !self.state.creating
-                            && !self.state.name.trim().is_empty()
-                            && !self.state.path.trim().is_empty(),
-                        egui::Button::new("생성"),
-                    )
-                    .clicked()
-                {
-                    let name = self.state.name.clone();
-                    let path = self.state.path.clone();
-                    if self.send(worker::Work::new(
-                        worker::Kind::Create {
-                            name: name.clone(),
-                            path: path.clone(),
-                        },
-                        Command::CreateProject { name, path },
-                    )) {
-                        self.state.creating = true;
-                        self.state.status = "프로젝트 생성 중".into();
-                    }
-                }
+                });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = &self.state.project {
@@ -334,6 +336,140 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(scale);
             let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        }
+    }
+
+    #[test]
+    fn long_project_list_allows_selecting_last_and_creating_project() {
+        for size in [egui::vec2(800.0, 600.0), egui::vec2(320.0, 240.0)] {
+            let (tx, work) = std::sync::mpsc::sync_channel(8);
+            let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+            let mut app = App {
+                state: State {
+                    projects: (0..40).map(|i| project(&format!("project-{i}"))).collect(),
+                    name: "new".into(),
+                    path: "C:/work".into(),
+                    ..Default::default()
+                },
+                tx,
+                rx,
+            };
+            let ctx = egui::Context::default();
+            let mut time = 0.0;
+            let mut frame = |events: Vec<egui::Event>, app: &mut App| {
+                time += 0.1;
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.render(ctx),
+                )
+            };
+            frame(
+                vec![egui::Event::PointerMoved(egui::pos2(80.0, 100.0))],
+                &mut app,
+            );
+            let mut output = frame(
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -3000.0),
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut app,
+            );
+            for _ in 0..30 {
+                output = frame(vec![], &mut app);
+            }
+            let visible = |output: &egui::FullOutput, label: &str| -> Option<egui::Pos2> {
+                output.shapes.iter().find_map(|clipped| {
+                    if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                        let center = text.visual_bounding_rect().center();
+                        if text.galley.job.text == label
+                            && clipped.clip_rect.contains(center)
+                            && center.x >= 0.0
+                            && center.x < size.x
+                            && center.y >= 0.0
+                            && center.y < size.y
+                        {
+                            return Some(center);
+                        }
+                    }
+                    None
+                })
+            };
+            let last =
+                visible(&output, "project-39").expect("마지막 프로젝트가 보이고 선택 가능해야 함");
+            frame(
+                vec![
+                    egui::Event::PointerMoved(last),
+                    egui::Event::PointerButton {
+                        pos: last,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut app,
+            );
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: last,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut app,
+            );
+            assert_eq!(app.state.selected.as_deref(), Some("project-39"));
+            frame(
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(80.0, 100.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -3000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut app,
+            );
+            for _ in 0..30 {
+                output = frame(vec![], &mut app);
+            }
+            let create =
+                visible(&output, "생성").expect("프로젝트 생성 버튼이 보이고 클릭 가능해야 함");
+            frame(
+                vec![
+                    egui::Event::PointerMoved(create),
+                    egui::Event::PointerButton {
+                        pos: create,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut app,
+            );
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: create,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut app,
+            );
+            assert_eq!(app.state.selected.as_deref(), Some("project-39"));
+            assert!(matches!(
+                work.try_recv().unwrap().command,
+                Command::GetProject { .. }
+            ));
+            assert!(matches!(
+                work.try_recv().unwrap().command,
+                Command::CreateProject { .. }
+            ));
         }
     }
 }
