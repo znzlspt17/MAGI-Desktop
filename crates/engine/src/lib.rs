@@ -8,6 +8,7 @@ pub mod agent_loop;
 mod agent_runtime;
 mod completion;
 mod knowledge_text;
+mod mcp_runtime;
 mod runs;
 mod storage;
 pub mod tools;
@@ -142,6 +143,7 @@ impl Engine {
                 | Command::StartRun { .. }
                 | Command::PutKnowledge { .. }
                 | Command::SubmitTool { .. }
+                | Command::RequestMcpApproval { .. }
                 | Command::ApproveTool { .. }
                 | Command::SaveDraft { .. }
                 | Command::SubmitInterview { .. }
@@ -161,6 +163,17 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if let Command::CallMcpApproved {
+            run_id,
+            approval_id,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: mcp_runtime::call(Arc::clone(&self), run_id.clone(), approval_id.clone())
+                    .await,
+            };
+        }
         #[cfg(windows)]
         if let Command::StartAgent {
             run_id,
@@ -443,7 +456,8 @@ impl Engine {
             Command::StartAgent { run_id, .. }
             | Command::ResumeAgent { run_id, .. }
             | Command::SubmitTool { run_id, .. }
-            | Command::ApproveTool { run_id, .. } => Some(run_id),
+            | Command::ApproveTool { run_id, .. }
+            | Command::RequestMcpApproval { run_id, .. } => Some(run_id),
             _ => None,
         };
         if (!read_or_control
@@ -517,6 +531,10 @@ impl Engine {
                 if semantic { return Err("semantic search unavailable".into()); }
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::search(&db, &project_id, &query, 0, 100)
+            }
+            Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                Ok(ResponseData::Data(runs::request_mcp(&db, &run_id, endpoint, name, arguments, cwd)?))
             }
             Command::SubmitTool { run_id, tool, arguments } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
