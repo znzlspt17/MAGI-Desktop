@@ -62,6 +62,11 @@ impl Engine {
 
     fn execute(&self, command: Command) -> Result<ResponseData, String> {
         match command {
+            // 2026-11-15: 부분 엔진의 준비 상태가 미구현 기능까지 보장하는 것으로 보이지 않게 한다.
+            Command::Status => Ok(ResponseData::Status {
+                message: "engine ready; project storage only; workflow and models unavailable"
+                    .into(),
+            }),
             Command::CreateProject { name, path } => {
                 if name.trim().is_empty() || path.trim().is_empty() {
                     return Err("project name and path required".into());

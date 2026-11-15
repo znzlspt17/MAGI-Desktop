@@ -668,6 +668,7 @@ name = "magi-engine"
 version = "0.1.0"
 dependencies = [
  "magi-core",
+ "magi-transport",
  "redb",
  "serde_json",
  "sha2",
