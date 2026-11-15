@@ -4,11 +4,29 @@ use integrations::mcp::{OAuthFlow, OAuthMetadata};
 use std::sync::Arc;
 
 type Snapshot = (String, Option<String>);
+type Authentication = (Option<(String, bool)>, Option<SecretString>);
 pub(crate) struct Session {
     snapshot: Snapshot,
     id: String,
     flow: Option<OAuthFlow>,
     _token: Option<SecretString>,
+}
+
+// 2026-11-16: 응답 검증에는 세션 식별자만 쓰고 토큰은 일시적인 메모리 사본으로 전달한다.
+pub(crate) fn authentication(
+    engine: &Engine,
+    project: &str,
+    endpoint: &Snapshot,
+) -> Result<Authentication, String> {
+    let sessions = engine.oauth.lock().map_err(|_| "OAuth state unavailable")?;
+    match sessions.get(project) {
+        Some(session) if &session.snapshot == endpoint => Ok((
+            Some((session.id.clone(), session._token.is_some())),
+            session._token.clone(),
+        )),
+        Some(_) => Err("MCP endpoint changed".into()),
+        None => Ok((None, None)),
+    }
 }
 
 async fn snapshot(engine: Arc<Engine>, project: String) -> Result<Snapshot, String> {
