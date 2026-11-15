@@ -345,3 +345,112 @@ async fn concurrent_interviews_do_not_lose_either_update() {
         .iter()
         .any(|message| message == "두 번째 답변"));
 }
+
+fn configure(
+    engine: &Engine,
+    id: &str,
+    provider: &str,
+    model: &str,
+) -> Result<ResponseData, String> {
+    call(
+        engine,
+        "configure",
+        Command::ConfigureModel {
+            project_id: id.into(),
+            provider: provider.into(),
+            model: model.into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(4321),
+            },
+        },
+    )
+}
+
+#[test]
+fn model_settings_are_persisted_and_make_assessment_stale() {
+    let fixture = TestDatabase::new();
+    let original = seed_approved_project(&fixture.path, 7);
+    let engine = Engine::open(&fixture.path).unwrap();
+    for (index, provider) in ["mock", "openai", "local"].iter().enumerate() {
+        let updated =
+            project(configure(&engine, &original.id, provider, "  explicit-model  ").unwrap());
+        assert_eq!(updated.context_version, 8 + index as u64);
+        let settings = updated.model_settings.unwrap();
+        assert_eq!(settings.provider, *provider);
+        assert_eq!(settings.model, "  explicit-model  ");
+        assert!(settings.capabilities.streaming);
+        assert!(!settings.capabilities.tools);
+        assert_eq!(settings.capabilities.context_tokens, Some(4321));
+        assert_eq!(
+            serde_json::to_value(updated.approved).unwrap(),
+            serde_json::to_value(&original.approved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(updated.assessment).unwrap(),
+            serde_json::to_value(&original.assessment).unwrap()
+        );
+    }
+    assert_eq!(
+        call(
+            &engine,
+            "approve",
+            Command::ApproveSpec {
+                project_id: original.id.clone(),
+                expected_draft_hash: original.draft_hash.clone(),
+                accepted_optional: vec![]
+            }
+        )
+        .unwrap_err(),
+        "draft requires a new assessment"
+    );
+    let repeated =
+        project(configure(&engine, &original.id, "local", "  explicit-model  ").unwrap());
+    assert_eq!(repeated.context_version, 11);
+    drop(engine);
+    let engine = Engine::open(&fixture.path).unwrap();
+    let saved = read_project(&engine, &original.id);
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(repeated).unwrap()
+    );
+    assert_eq!(saved.context_version, 11);
+    assert_eq!(saved.model_settings.unwrap().provider, "local");
+}
+
+#[test]
+fn invalid_model_settings_leave_project_unchanged() {
+    let fixture = TestDatabase::new();
+    let original = seed_approved_project(&fixture.path, 7);
+    let engine = Engine::open(&fixture.path).unwrap();
+    for (provider, model) in [("other", "model"), ("mock", " \t")] {
+        assert_eq!(
+            configure(&engine, &original.id, provider, model).unwrap_err(),
+            "unsupported provider or empty model"
+        );
+    }
+    drop(engine);
+    let engine = Engine::open(&fixture.path).unwrap();
+    assert_eq!(
+        serde_json::to_value(read_project(&engine, &original.id)).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+}
+
+#[test]
+fn exhausted_context_rejects_model_settings_without_changes() {
+    let fixture = TestDatabase::new();
+    let original = seed_approved_project(&fixture.path, u64::MAX);
+    let engine = Engine::open(&fixture.path).unwrap();
+    assert_eq!(
+        configure(&engine, &original.id, "mock", "model").unwrap_err(),
+        "interview context version exhausted"
+    );
+    drop(engine);
+    let engine = Engine::open(&fixture.path).unwrap();
+    assert_eq!(
+        serde_json::to_value(read_project(&engine, &original.id)).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+}
