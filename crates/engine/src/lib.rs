@@ -7,6 +7,7 @@ pub mod agent_loop;
 // 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
+mod knowledge_text;
 mod mcp_runtime;
 mod runs;
 mod storage;
@@ -140,6 +141,7 @@ impl Engine {
             &request.command,
             Command::CreateProject { .. }
                 | Command::StartRun { .. }
+                | Command::PutKnowledge { .. }
                 | Command::SubmitTool { .. }
                 | Command::RequestMcpApproval { .. }
                 | Command::ApproveTool { .. }
@@ -425,6 +427,9 @@ impl Engine {
         let read_or_control = matches!(
             &command,
             Command::Status
+                | Command::SearchKnowledge { .. }
+                | Command::SearchKnowledgePage { .. }
+                | Command::GetKnowledgeSource { .. }
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
                 | Command::GetProject { .. }
@@ -443,7 +448,8 @@ impl Engine {
             | Command::GenerateSpec { project_id }
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
-            | Command::ApproveSpec { project_id, .. } => Some(project_id),
+            | Command::ApproveSpec { project_id, .. }
+            | Command::PutKnowledge { project_id, .. } => Some(project_id),
             _ => None,
         };
         let run = match &command {
@@ -508,6 +514,23 @@ impl Engine {
                 }
                 if state=="saved" || state=="superseded" {self.finish_startup_recovery();}
                 Ok(ResponseData::Data(serde_json::json!({"state":state})))
+            }
+            Command::PutKnowledge { project_id, document } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::put(&db, &project_id, document)
+            }
+            Command::GetKnowledgeSource { project_id, document_id } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::source(&db, &project_id, &document_id)
+            }
+            Command::SearchKnowledgePage { project_id, query, offset, limit } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::search(&db, &project_id, &query, offset, limit)
+            }
+            Command::SearchKnowledge { project_id, query, semantic } => {
+                if semantic { return Err("semantic search unavailable".into()); }
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::search(&db, &project_id, &query, 0, 100)
             }
             Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
