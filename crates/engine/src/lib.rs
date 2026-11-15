@@ -5,6 +5,7 @@ mod completion;
 mod runs;
 mod storage;
 pub mod tools;
+mod verification;
 mod worktree;
 
 use domain::{ApprovedSpec, Command, Project, Request, Response, ResponseData, SpecDraft};

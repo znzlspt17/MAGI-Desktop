@@ -2,6 +2,60 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
+// 2026-11-16: 검증 중 stale 상태나 취소가 확인되면 근거를 같은 transaction에 남기지 않는다.
+pub(crate) fn record_verification(
+    db: &Database,
+    id: &str,
+    expected_run: &serde_json::Value,
+    expected_project: &domain::Project,
+    evidence: &domain::VerificationEvidence,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+        let row = projects
+            .get(expected_project.id.as_str())
+            .map_err(|e| e.to_string())?
+            .ok_or("project not found")?;
+        let project: domain::Project =
+            serde_json::from_str(row.value()).map_err(|_| "invalid project")?;
+        if serde_json::to_value(project).map_err(|_| "invalid project")?
+            != serde_json::to_value(expected_project).map_err(|_| "invalid project")?
+        {
+            return Err("project changed".into());
+        }
+    }
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let row = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(row.value()).map_err(|_| "invalid run")?
+        };
+        normalize_run(&mut run)?;
+        if &run != expected_run {
+            return Err("run changed".into());
+        }
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        let items = run["evidence"].as_array_mut().ok_or("invalid evidence")?;
+        if items
+            .iter()
+            .any(|item| item["verification_id"] == evidence.verification_id)
+        {
+            return Err("duplicate verification id".into());
+        }
+        items.push(serde_json::to_value(evidence).map_err(|_| "invalid evidence")?);
+        table
+            .insert(id, run.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
 #[cfg(all(test, windows))]
 struct DiffTestHook {
     run_id: String,
