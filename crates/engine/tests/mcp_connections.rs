@@ -53,9 +53,21 @@ async fn send(engine: &Arc<Engine>, command: Command) -> Result<ResponseData, St
         .result
 }
 
+// 2026-11-16: 요청 헤더가 여러 조각으로 도착해도 서버가 조기에 응답하지 않도록 한다.
+async fn receive_request_headers(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut received = Vec::new();
+    let mut buffer = [0; 4096];
+    while !received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert!(count > 0, "request ended before its headers");
+        received.extend_from_slice(&buffer[..count]);
+    }
+}
+
 #[tokio::test]
 async fn configured_endpoint_survives_restart_and_lists_tools_only_for_its_project() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let fixture = Fixture::new();
     let engine = fixture.engine();
     let a = fixture.project(&engine, "a");
@@ -65,8 +77,7 @@ async fn configured_endpoint_survives_restart_and_lists_tools_only_for_its_proje
     let server = tokio::spawn(async move {
         for step in 0..3 {
             let (mut s, _) = listener.accept().await.unwrap();
-            let mut b = [0; 4096];
-            s.read(&mut b).await.unwrap();
+            receive_request_headers(&mut s).await;
             let body = match step {
                 0 => r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}"#,
                 1 => "",
@@ -122,7 +133,7 @@ async fn configured_endpoint_survives_restart_and_lists_tools_only_for_its_proje
 
 #[tokio::test]
 async fn changed_then_restored_endpoint_discards_inflight_list_response() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let fixture = Fixture::new();
     let engine = fixture.engine();
     let id = fixture.project(&engine, "project");
@@ -135,8 +146,7 @@ async fn changed_then_restored_endpoint_discards_inflight_list_response() {
         let mut release = Some(release_rx);
         for step in 0..3 {
             let (mut s, _) = listener.accept().await.unwrap();
-            let mut b = [0; 4096];
-            s.read(&mut b).await.unwrap();
+            receive_request_headers(&mut s).await;
             if step == 2 {
                 ready.take().unwrap().send(()).unwrap();
                 release.take().unwrap().await.unwrap();
