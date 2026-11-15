@@ -443,6 +443,8 @@ impl Engine {
             Command::Status
                 | Command::SearchKnowledge { .. }
                 | Command::ListDecisions { .. }
+                | Command::GetGraph { .. }
+                | Command::GetGraphPage { .. }
                 | Command::SearchKnowledgePage { .. }
                 | Command::SearchKnowledgeVector { .. }
                 | Command::GetKnowledgeSource { .. }
@@ -569,6 +571,14 @@ impl Engine {
             Command::ExportRunPackage { run_id, destination } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 package_export::export_run(&db, &run_id, Path::new(&destination))
+            }
+            Command::GetGraph { project_id } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::graph(&db, &project_id, None)
+            }
+            Command::GetGraphPage { project_id, offset, limit } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::graph(&db, &project_id, Some((offset, limit)))
             }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;

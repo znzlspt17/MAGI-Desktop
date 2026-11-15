@@ -282,6 +282,17 @@ async fn damaged_checkpoint_is_rebuilt_from_durable_original() {
         .unwrap(),
     );
     assert_eq!(source["source"], "original");
+    let graph = data(
+        send(
+            &engine,
+            Command::GetGraph {
+                project_id: id.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(graph["edges"][0]["source"], "original");
     send(
         &engine,
         Command::PutKnowledge {
@@ -368,7 +379,7 @@ async fn text_search_caps_pages_at_one_hundred_documents() {
         send(
             &engine,
             Command::SearchKnowledgePage {
-                project_id: id,
+                project_id: id.clone(),
                 query: "needle".into(),
                 offset: 100,
                 limit: 1000,
@@ -378,6 +389,41 @@ async fn text_search_caps_pages_at_one_hundred_documents() {
         .unwrap(),
     );
     assert_eq!(tail["results"].as_array().unwrap().len(), 5);
+    let error = send(
+        &engine,
+        Command::GetGraph {
+            project_id: id.clone(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("GetGraphPage"), "{error}");
+    let first = data(
+        send(
+            &engine,
+            Command::GetGraphPage {
+                project_id: id.clone(),
+                offset: 0,
+                limit: 1000,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(first["edges"].as_array().unwrap().len(), 100);
+    let last = data(
+        send(
+            &engine,
+            Command::GetGraphPage {
+                project_id: id,
+                offset: 100,
+                limit: 1000,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(last["edges"].as_array().unwrap().len(), 5);
 }
 
 #[tokio::test]
@@ -603,4 +649,91 @@ async fn damaged_vector_checkpoint_is_not_overwritten_by_embedding_update() {
         .open_table(TableDefinition::<&str, &str>::new("integration_knowledge"))
         .unwrap();
     assert_eq!(table.get(id.as_str()).unwrap().unwrap().value(), "damaged");
+}
+
+#[tokio::test]
+async fn graph_deduplicates_source_even_when_document_id_matches() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let project_id = fixture.project(&engine, "project");
+    for id in ["x", "y"] {
+        send(
+            &engine,
+            Command::PutKnowledge {
+                project_id: project_id.clone(),
+                document: doc(id, 1, "x", "text"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let graph = data(
+        send(&engine, Command::GetGraph { project_id })
+            .await
+            .unwrap(),
+    );
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node["kind"] == "source" && node["id"] == "x")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn graph_exposes_only_persisted_source_edges_with_stable_pages() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let a = fixture.project(&engine, "a");
+    let b = fixture.project(&engine, "b");
+    for (id, source) in [("b", "file-b"), ("a", "file-a")] {
+        send(
+            &engine,
+            Command::PutKnowledge {
+                project_id: a.clone(),
+                document: doc(id, 1, source, "text"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    drop(engine);
+    let engine = fixture.engine();
+    let graph = data(
+        send(
+            &engine,
+            Command::GetGraph {
+                project_id: a.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 2);
+    assert_eq!(graph["edges"][0]["source"], "file-a");
+    assert_eq!(graph["edges"][0]["document_id"], "a");
+    assert_eq!(graph["edges"][0]["document_version"], 1);
+    let page = data(
+        send(
+            &engine,
+            Command::GetGraphPage {
+                project_id: a,
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(page["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(page["edges"][0]["document_id"], "b");
+    let other = data(
+        send(&engine, Command::GetGraph { project_id: b })
+            .await
+            .unwrap(),
+    );
+    assert!(other["edges"].as_array().unwrap().is_empty());
 }
