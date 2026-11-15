@@ -1,0 +1,49 @@
+name: Windows Rust
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: 도구 및 workspace 확인
+        id: workspace
+        shell: pwsh
+        run: |
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Test-Path -LiteralPath Cargo.toml -PathType Leaf) {
+            'present=true' >> $env:GITHUB_OUTPUT
+          } else {
+            'present=false' >> $env:GITHUB_OUTPUT
+            Write-Host 'Cargo workspace가 없어 앱 검사와 빌드를 실행하지 않았습니다.'
+          }
+      - name: 형식 검사
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+      - name: 테스트
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo test --locked --workspace
+      - name: Clippy
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Release 빌드
+        if: steps.workspace.outputs.present == 'true'
+        run: cargo build --release --locked --workspace
+
