@@ -182,7 +182,7 @@ fn call_identity_rejects_different_arguments_role_or_task() {
 
 #[test]
 fn denied_and_cancelled_durable_calls_cannot_be_resubmitted() {
-    for cancelled in [false, true] {
+    for cancelled in [true, false] {
         let f = Fixture::new();
         let db = Database::open(&f.db).unwrap();
         let args = serde_json::json!({"path":"src/file.txt","content":"after"});
@@ -213,7 +213,10 @@ fn denied_and_cancelled_durable_calls_cannot_be_resubmitted() {
             true
         )
         .is_err());
-        assert!(submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).is_err());
+        assert_eq!(
+            submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).unwrap_err(),
+            "approval is no longer pending"
+        );
         let run = get(&db, &f.run_id).unwrap();
         assert!(run["pending"].is_null());
         assert_eq!(
@@ -279,7 +282,10 @@ fn stale_file_marks_call_uncertain_and_does_not_allow_reexecution() {
     assert_eq!(record["status"], "uncertain");
     drop(calls);
     drop(tx);
-    assert!(submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).is_err());
+    assert_eq!(
+        submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).unwrap_err(),
+        "previous tool outcome uncertain"
+    );
     assert_eq!(fs::read_to_string(f.file()).unwrap(), "external");
 }
 
@@ -337,7 +343,10 @@ fn restart_after_interrupted_patch_never_reexecutes_ambiguous_call() {
     assert_eq!(record["status"], "uncertain");
     drop(calls);
     drop(tx);
-    assert!(submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).is_err());
+    assert_eq!(
+        submit_bound_patch(&db, &f.run_id, "implementer", "task", "call-1", args).unwrap_err(),
+        "previous tool outcome uncertain"
+    );
     assert_eq!(fs::read_to_string(f.file()).unwrap(), "unknown-effect");
 }
 

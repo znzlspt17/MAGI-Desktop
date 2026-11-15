@@ -810,7 +810,6 @@ pub(crate) fn submit_bound_patch(
         };
         // 2026-11-16: 이전 Run 형식의 선택 필드는 기존 조회와 동일한 기본값으로 처리한다.
         normalize_run(&mut run)?;
-        validate_bound_patch(&tx, &run, role, task_id, &arguments)?;
         let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
         let existing = {
             calls
@@ -824,6 +823,9 @@ pub(crate) fn submit_bound_patch(
             if record["hash"] != hash {
                 return Err("call identity conflict".into());
             }
+            // 2026-11-16: 중단된 호출은 활동이 끝나도 같은 identity와 문맥에서 결과 불명을 알려준다.
+            let require_active = !(record["status"] == "uncertain" && run["status"] == "uncertain");
+            validate_bound_patch(&tx, &run, role, task_id, &arguments, require_active)?;
             match record["status"].as_str() {
                 Some("completed") => {
                     serde_json::json!({"status":"completed","result":record["result"]})
@@ -835,9 +837,19 @@ pub(crate) fn submit_bound_patch(
                 {
                     serde_json::json!({"status":"waiting","approval_id":record["approval_id"]})
                 }
-                _ => return Err("previous tool outcome uncertain".into()),
+                Some("waiting")
+                    if ["executing", "cancelling", "uncertain"]
+                        .contains(&run["status"].as_str().unwrap_or("")) =>
+                {
+                    return Err("previous tool outcome uncertain".into())
+                }
+                Some("waiting") => return Err("approval is no longer pending".into()),
+                Some("uncertain") => return Err("previous tool outcome uncertain".into()),
+                Some("planned") => return Err("call is not ready for approval".into()),
+                _ => return Err("invalid call state".into()),
             }
         } else {
+            validate_bound_patch(&tx, &run, role, task_id, &arguments, true)?;
             if run["status"] != "awaiting_implementation"
                 || !run["pending"].is_null()
                 || [
@@ -894,8 +906,9 @@ fn validate_bound_patch(
     role: &str,
     task_id: &str,
     arguments: &serde_json::Value,
+    require_active: bool,
 ) -> Result<(), String> {
-    if run["agent_active"] != true {
+    if require_active && run["agent_active"] != true {
         return Err("run not ready for call".into());
     }
     let configs = run["agent_configs"]
@@ -1108,7 +1121,7 @@ pub(crate) fn approve_patch(
                 }
                 drop(value);
                 drop(projects);
-                validate_bound_patch(&tx, &current, role, task, &pending["arguments"])?;
+                validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
             }
             current["status"] = "executing".into();
             append_event(
