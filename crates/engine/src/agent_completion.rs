@@ -182,12 +182,9 @@ pub(crate) fn finish_agent(
         }
     }
     let verified_snapshot = if success {
-        let (run, project_json) = {
+        let run = {
             let read = db.begin_read().map_err(|e| e.to_string())?;
             let runs = read.open_table(RUNS).map_err(|e| e.to_string())?;
-            let projects = read
-                .open_table(crate::PROJECTS)
-                .map_err(|e| e.to_string())?;
             let run: serde_json::Value = serde_json::from_str(
                 runs.get(id)
                     .map_err(|e| e.to_string())?
@@ -195,32 +192,43 @@ pub(crate) fn finish_agent(
                     .value(),
             )
             .map_err(|e| e.to_string())?;
-            let project_json = projects
-                .get(project_id)
-                .map_err(|e| e.to_string())?
-                .ok_or("project not found")?
-                .value()
-                .to_owned();
-            (run, project_json)
+            run
         };
-        let project: domain::Project =
-            serde_json::from_str(&project_json).map_err(|e| e.to_string())?;
-        let current_spec = project.approved.as_ref().is_some_and(|spec| {
-            run["spec_hash"] == spec.hash
-                && run["spec_version"] == spec.version
-                && project.draft_hash == spec.hash
-                && run["context_version"] == project.context_version
-        });
         let eligible = run["project_id"] == project_id
             && run["agent_active"] == true
             && run["agent_attempt"] == attempt
             && run["status"] == "awaiting_implementation";
-        let proof = if current_spec && eligible {
-            review_proof(db, id, &run, &project)?
+        if eligible {
+            let project_json = {
+                let read = db.begin_read().map_err(|e| e.to_string())?;
+                let projects = read
+                    .open_table(crate::PROJECTS)
+                    .map_err(|e| e.to_string())?;
+                let json = projects
+                    .get(project_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("project not found")?
+                    .value()
+                    .to_owned();
+                json
+            };
+            let project: domain::Project =
+                serde_json::from_str(&project_json).map_err(|e| e.to_string())?;
+            let current_spec = project.approved.as_ref().is_some_and(|spec| {
+                run["spec_hash"] == spec.hash
+                    && run["spec_version"] == spec.version
+                    && project.draft_hash == spec.hash
+                    && run["context_version"] == project.context_version
+            });
+            let proof = if current_spec {
+                review_proof(db, id, &run, &project)?
+            } else {
+                None
+            };
+            Some((run, project_json, current_spec, proof))
         } else {
             None
-        };
-        Some((run, project_json, current_spec, proof))
+        }
     } else {
         None
     };
@@ -267,11 +275,23 @@ pub(crate) fn finish_agent(
                 .ok_or("run not found")?;
             serde_json::from_str(value.value()).map_err(|e| e.to_string())?
         };
+        // 2026-11-16: 완료된 동일 시도의 자원 표시만 정리하고 취소 상태와 이벤트는 보존한다.
+        let cancelled_cleanup = run["project_id"] == project_id
+            && run["agent_active"] == true
+            && run["agent_attempt"] == attempt
+            && run["status"] == "cancelled";
+        if cancelled_cleanup {
+            run["agent_active"] = false.into();
+            table
+                .insert(id, run.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+        }
         let mut applied = run["project_id"] == project_id
             && run["agent_active"] == true
             && run["agent_attempt"] == attempt
             && run["status"] != "cancelled"
-            && (!success || run["status"] == "awaiting_implementation");
+            && (!success
+                || (verified_snapshot.is_some() && run["status"] == "awaiting_implementation"));
         if applied && !success {
             let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
             let project = projects.get(project_id).map_err(|e| e.to_string())?;
@@ -379,7 +399,7 @@ pub(crate) fn finish_agent(
                     .map_err(|e| e.to_string())?;
             }
         }
-        applied
+        applied || cancelled_cleanup
     };
     {
         let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
@@ -605,9 +625,10 @@ mod tests {
         }
         tx.commit().unwrap();
         proceed_tx.send(()).unwrap();
-        assert!(!worker.join().unwrap());
+        assert!(worker.join().unwrap());
         let cancelled = crate::runs::get(&db, &racing_id).unwrap();
         assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["agent_active"], false);
         assert!(cancelled["events"].as_array().unwrap().is_empty());
         let stale_id = uuid::Uuid::new_v4().to_string();
         let mut stale = run.clone();

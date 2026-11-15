@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod agent_completion;
 pub mod agent_loop;
+// 2026-11-16: StartAgent 연동 전 내구 runtime bridge를 독립 검증한다.
+mod agent_runtime;
 mod completion;
 mod runs;
 mod storage;

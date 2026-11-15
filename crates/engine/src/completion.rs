@@ -1557,6 +1557,94 @@ mod agent_journal_tests {
     use super::*;
     #[cfg(windows)]
     #[test]
+    fn cancelled_success_clears_worker_even_if_project_is_unavailable() {
+        let root =
+            std::env::temp_dir().join(format!("agent-cancel-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"cancelled","agent_active":true,"agent_attempt":1,"events":[]}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        manager.preserve_failed_handoff(CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            true,
+            1,
+        ));
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "cancelled");
+        assert_eq!(run["agent_active"], false);
+        assert!(run["events"].as_array().unwrap().is_empty());
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_after_worker_finished_clears_same_attempt_on_retry() {
+        use std::sync::Arc;
+        let root =
+            std::env::temp_dir().join(format!("agent-cancel-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let engine = crate::Engine::open(&root.join("state.redb")).unwrap();
+        let db = engine.db.get().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1,"custom":"preserved"}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        crate::save_agent_result(Arc::clone(&engine.completions), None, record).await;
+        engine
+            .handle(domain::Request {
+                id: "cancel".into(),
+                command: domain::Command::CancelRun {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let before = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(before["status"], "cancelled");
+        assert_eq!(before["agent_active"], true);
+        let response = engine
+            .handle(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let domain::ResponseData::Data(value) = response else {
+            panic!("retry")
+        };
+        assert_eq!(value["state"], "saved");
+        let after = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(after["status"], "cancelled");
+        assert_eq!(after["agent_active"], false);
+        assert_eq!(after["events"], before["events"]);
+        assert_eq!(after["custom"], "preserved");
+    }
+    #[cfg(windows)]
+    #[test]
     fn older_agent_attempt_is_superseded_without_changes() {
         let root = std::env::temp_dir().join(format!("agent-old-attempt-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
@@ -1588,6 +1676,29 @@ mod agent_journal_tests {
         assert_eq!(run["agent_attempt"], 2);
         assert_eq!(run["agent_active"], true);
         assert!(run["events"].as_array().unwrap().is_empty());
+        let mut cancelled = run;
+        cancelled["status"] = "cancelled".into();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), cancelled.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        manager.preserve_failed_handoff(CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            false,
+            1,
+        ));
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        let newer = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(newer["status"], "cancelled");
+        assert_eq!(newer["agent_active"], true);
+        assert_eq!(newer["agent_attempt"], 2);
     }
     #[cfg(windows)]
     #[test]
@@ -2034,10 +2145,10 @@ mod agent_journal_tests {
         );
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"agent","result":{"success":false,"attempt":1}}});
         manager.preserve_failed_handoff(record);
-        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
         let stored = crate::runs::get(&db, &run_id).unwrap();
         assert_eq!(stored["status"], "cancelled");
-        assert_eq!(stored["agent_active"], true);
+        assert_eq!(stored["agent_active"], false);
         assert!(stored["events"].as_array().unwrap().is_empty());
     }
     #[cfg(windows)]
