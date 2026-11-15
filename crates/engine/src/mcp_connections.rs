@@ -41,7 +41,10 @@ pub(crate) fn configure(
 }
 
 // 2026-11-16: 동일 주소를 다시 설정한 경우도 새 세대로 구분해 늦은 목록 응답을 폐기한다.
-fn endpoint(db: &Database, project_id: &str) -> Result<(String, Option<String>), String> {
+pub(crate) fn endpoint(
+    db: &Database,
+    project_id: &str,
+) -> Result<(String, Option<String>), String> {
     let tx = db.begin_read().map_err(err)?;
     {
         let projects = tx.open_table(PROJECTS).map_err(err)?;

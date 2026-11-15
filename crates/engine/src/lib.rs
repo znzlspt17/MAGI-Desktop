@@ -9,6 +9,7 @@ mod agent_runtime;
 mod completion;
 mod knowledge_text;
 mod mcp_connections;
+mod mcp_oauth;
 mod mcp_runtime;
 mod package_export;
 mod project_decisions;
@@ -40,6 +41,7 @@ pub struct Engine {
     >,
     credentials:
         std::sync::Mutex<std::collections::HashMap<String, (String, domain::SecretString)>>,
+    oauth: std::sync::Mutex<std::collections::HashMap<String, mcp_oauth::Session>>,
 }
 
 type PreparedGeneration = (
@@ -135,6 +137,7 @@ impl Engine {
             completions: Arc::new(completions),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -171,6 +174,17 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if matches!(
+            &request.command,
+            Command::DiscoverMcpOAuth { .. }
+                | Command::BeginMcpOAuth { .. }
+                | Command::CompleteMcpOAuth { .. }
+        ) {
+            return Response {
+                id: request_id,
+                result: mcp_oauth::handle(Arc::clone(&self), request.command).await,
+            };
+        }
         if let Command::ListMcpTools { project_id } = &request.command {
             return Response {
                 id: request_id,
@@ -599,7 +613,9 @@ impl Engine {
             }
             Command::ConfigureMcp { project_id, endpoint } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
-                mcp_connections::configure(&db, &project_id, &endpoint)
+                let result = mcp_connections::configure(&db, &project_id, &endpoint)?;
+                self.oauth.lock().map_err(|_| "OAuth state unavailable")?.remove(&project_id);
+                Ok(result)
             }
             Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
                 let db = self.db.get().ok_or("storage unavailable")?;

@@ -944,6 +944,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -1175,6 +1176,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -1935,6 +1937,7 @@ mod agent_journal_tests {
             completions: Arc::clone(&manager),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
         crate::save_agent_result(Arc::clone(&manager), engine.db.get(), record.clone()).await;
