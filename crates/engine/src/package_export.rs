@@ -11,7 +11,7 @@ fn list(items: &[String]) -> String {
 fn package(
     spec: &ApprovedSpec,
     readme: String,
-    evidence: &[VerificationEvidence],
+    evidence: &[serde_json::Value],
     test_status: &str,
 ) -> Result<PackageInput, String> {
     let tasks = spec
@@ -35,7 +35,7 @@ fn package(
     } else {
         format!(
             "# 검증 결과\n\n```json\n{}\n```\n",
-            serde_json::to_string_pretty(&evidence.iter().map(|entry| serde_json::json!({"verification_id":entry.verification_id,"revision":entry.revision,"spec_hash":entry.spec_hash,"worktree_hash":entry.worktree_hash,"passed":entry.passed,"requirement_ids":entry.requirement_ids,"acceptance_ids":entry.acceptance_ids})).collect::<Vec<_>>()).map_err(err)?
+            serde_json::to_string_pretty(evidence).map_err(err)?
         )
     };
     Ok(PackageInput {
@@ -135,6 +135,7 @@ pub(crate) fn export_run(
         .find(|spec| spec.hash == hash && spec.version == version && spec.base_revision == revision)
         .ok_or("run approval snapshot missing")?;
     let mut evidence = Vec::new();
+    let mut exported_evidence = Vec::new();
     let mut total_evidence = 0usize;
     if let Some(items) = run["evidence"].as_array() {
         total_evidence = items.len();
@@ -153,6 +154,21 @@ pub(crate) fn export_run(
                 && context["agent_attempt"] == run["agent_attempt"]
                 && context["task_id"].as_str().is_some_and(|v| !v.is_empty())
             {
+                // 2026-11-16: 명령과 저장된 맥락을 함께 남겨 각 결과의 출처를 추적한다. 출력 원문은 포함하지 않는다.
+                exported_evidence.push(serde_json::json!({
+                    "verification_id": entry.verification_id,
+                    "command": entry.command,
+                    "passed": entry.passed,
+                    "spec_hash": entry.spec_hash,
+                    "spec_version": context["spec_version"],
+                    "context_version": context["context_version"],
+                    "agent_attempt": context["agent_attempt"],
+                    "task_id": context["task_id"],
+                    "revision": entry.revision,
+                    "worktree_hash": entry.worktree_hash,
+                    "requirement_ids": entry.requirement_ids,
+                    "acceptance_ids": entry.acceptance_ids,
+                }));
                 evidence.push(entry);
             }
         }
@@ -215,7 +231,7 @@ pub(crate) fn export_run(
             revision,
             run["status"].as_str().ok_or("invalid run status")?
         ),
-        &evidence,
+        &exported_evidence,
         status,
     )?;
     publish(&input, destination)

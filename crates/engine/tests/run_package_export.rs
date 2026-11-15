@@ -131,7 +131,21 @@ async fn export_run_uses_recorded_approved_version_and_real_evidence() {
     );
     let verification = std::fs::read_to_string(destination.join("VERIFICATION.md")).unwrap();
     assert!(!verification.contains("real result"));
-    assert!(!verification.contains("fixture check"));
+    let json = verification
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let entries: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(entries[0]["command"], "fixture check");
+    assert_eq!(entries[0]["passed"], true);
+    assert_eq!(entries[0]["spec_version"], 2);
+    assert_eq!(entries[0]["context_version"], 3);
+    assert_eq!(entries[0]["agent_attempt"], 1);
+    assert_eq!(entries[0]["task_id"], "t");
+    assert_eq!(entries[0]["revision"], "fixture-rev");
     drop(engine);
     let db = Database::open(&fixture.db).unwrap();
     let tx = db.begin_write().unwrap();
@@ -256,6 +270,18 @@ async fn export_run_uses_recorded_approved_version_and_real_evidence() {
         ResponseData::Data(v) => v,
         _ => panic!("manifest"),
     };
+    let verification = std::fs::read_to_string(valid.join("VERIFICATION.md")).unwrap();
+    let json = verification
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let entries: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(entries[0]["requirement_ids"], serde_json::json!(["r"]));
+    assert_eq!(entries[0]["acceptance_ids"], serde_json::json!(["a"]));
+    assert_eq!(entries[0]["spec_hash"], "fixture-spec");
     assert_eq!(manifest["test_status"], "passed");
     assert_eq!(manifest["completeness"], "limited");
     drop(engine);
