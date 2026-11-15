@@ -252,9 +252,13 @@ pub fn validate_draft_structure(draft: &magi_core::SpecDraft) -> Result<Vec<usiz
 
 // 2026-11-14: rubric 판정은 지정된 초안 섹션의 인용과 원문 근거, 연결된 결함을 확인한 뒤 점수를 제한한다.
 pub fn parse_candidate(raw: &str, input: &SpecInput) -> Result<SpecResult, ProviderError> {
-    let mut c: SpecResult = serde_json::from_str(raw).map_err(|_| bad())?;
-    // 2026-11-15: 병합 이력은 이 실행에서만 만들고 모델이 제공한 이력은 신뢰하지 않는다.
-    c.question_review = None;
+    // 2026-11-15: 모델 이력은 타입과 무관하게 제거하되 저장된 결과의 역직렬화는 유지한다.
+    let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|_| bad())?;
+    value
+        .as_object_mut()
+        .ok_or_else(bad)?
+        .remove("question_review");
+    let mut c: SpecResult = serde_json::from_value(value).map_err(|_| bad())?;
     if c.policy_version != POLICY_VERSION
         || input.request.trim().is_empty()
         || input.base_revision.trim().is_empty()

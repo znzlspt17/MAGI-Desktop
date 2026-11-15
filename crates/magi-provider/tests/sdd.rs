@@ -421,6 +421,11 @@ async fn merged_core_failure_keeps_cap_and_source_review() {
     );
     assert_eq!(saved["question_review"]["verdicts"][0]["passed"], false);
     assert_eq!(saved["question_review"]["issues"][0]["checklist_id"], "i1");
+    let restored: magi_provider::sdd::SpecResult = serde_json::from_value(saved).unwrap();
+    assert_eq!(
+        restored.question_review.unwrap().draft.title,
+        "question candidate"
+    );
 }
 
 #[test]
@@ -429,4 +434,9 @@ fn model_supplied_question_review_is_not_accepted_as_history() {
     raw["question_review"] = candidate();
     let result = parse_candidate(&raw.to_string(), &input("core")).unwrap();
     assert!(result.question_review.is_none());
+    for untrusted in [json!("unexpected"), json!({}), json!([1, 2])] {
+        raw["question_review"] = untrusted;
+        let result = parse_candidate(&raw.to_string(), &input("core")).unwrap();
+        assert!(result.question_review.is_none());
+    }
 }
