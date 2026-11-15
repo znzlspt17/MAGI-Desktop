@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 async fn reads_and_searches_owned_text_with_line_numbers() {
     let root = std::env::temp_dir().join(format!("magi-read-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(
         root.join("src/example.txt"),
         "hello\ntarget\ntarget again\n",
@@ -49,6 +50,7 @@ async fn reads_and_searches_owned_text_with_line_numbers() {
 async fn rejects_unsafe_or_unlisted_requests_and_invalid_arguments() {
     let root = std::env::temp_dir().join(format!("magi-read-policy-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/a.txt"), "safe text").unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
@@ -149,6 +151,7 @@ async fn rejects_unsafe_or_unlisted_requests_and_invalid_arguments() {
 async fn enforces_utf8_file_and_search_output_limits() {
     let root = std::env::temp_dir().join(format!("magi-read-limit-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/a.txt"), "a\na\na\na\n").unwrap();
     fs::write(root.join("src/b.txt"), [0xff]).unwrap();
     let mut ctx = ToolContext {
@@ -198,6 +201,7 @@ async fn rejects_junction_and_hardlink_targets() {
     use std::process::Command;
     let root = std::env::temp_dir().join(format!("magi-read-links-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::create_dir_all(root.join("target")).unwrap();
     fs::write(root.join("target/a.txt"), "fixture").unwrap();
     fs::hard_link(root.join("target/a.txt"), root.join("src/hard.txt")).unwrap();
