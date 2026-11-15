@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
 // 2026-11-16: 시작 호출이 연결되기 전 CAS 경계를 독립적으로 검증한다.
-#[allow(dead_code)]
 pub(crate) fn begin_agent(
     db: &Database,
     id: &str,
@@ -159,6 +158,38 @@ struct DiffTestHook {
 static TEST_DIFF_HOOK: std::sync::Mutex<Option<DiffTestHook>> = std::sync::Mutex::new(None);
 const CHECKPOINTS: TableDefinition<&str, &str> = TableDefinition::new("checkpoints");
 const CALLS: TableDefinition<&str, &str> = TableDefinition::new("calls");
+const MOCK_CALLS: TableDefinition<&str, u64> = TableDefinition::new("mock_calls");
+// 2026-11-16: 같은 mock 입력의 재개는 이전 script 인덱스를 재사용한다.
+pub(crate) fn mock_index(db: &Database, run: &str, fingerprint: &str) -> Result<u64, String> {
+    let key = format!("{run}:request:{fingerprint}");
+    let cursor = format!("{run}:cursor");
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let index = {
+        let mut table = tx.open_table(MOCK_CALLS).map_err(|e| e.to_string())?;
+        let found = table
+            .get(key.as_str())
+            .map_err(|e| e.to_string())?
+            .map(|v| v.value());
+        if let Some(index) = found {
+            index
+        } else {
+            let index = table
+                .get(cursor.as_str())
+                .map_err(|e| e.to_string())?
+                .map_or(0, |v| v.value());
+            let next = index.checked_add(1).ok_or("mock cursor exhausted")?;
+            table
+                .insert(key.as_str(), index)
+                .map_err(|e| e.to_string())?;
+            table
+                .insert(cursor.as_str(), next)
+                .map_err(|e| e.to_string())?;
+            index
+        }
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(index)
+}
 const MAX_DURABLE_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
 fn append_event(

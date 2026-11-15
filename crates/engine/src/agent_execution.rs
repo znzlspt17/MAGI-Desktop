@@ -1,5 +1,4 @@
 // 2026-11-16: 실행 연결 전 사전 검증은 독립 테스트하며 StartAgent 성공 응답을 만들지 않는다.
-#[allow(dead_code)]
 fn preflight(
     spec: &domain::ApprovedSpec,
     configs: &[domain::AgentConfig],
@@ -62,6 +61,17 @@ fn preflight(
             return Err("invalid output limit".into());
         }
     }
+    let coordinator = configs
+        .iter()
+        .find(|c| c.role == "coordinator")
+        .ok_or("coordinator missing")?;
+    if coordinator
+        .limits
+        .get("max_parallel_tasks")
+        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=8).contains(&n)))
+    {
+        return Err("invalid parallel limit".into());
+    }
     let implementer = configs
         .iter()
         .find(|c| c.role == "implementer")
@@ -94,7 +104,6 @@ fn preflight(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn register_token(
     engine: &crate::Engine,
     run_id: &str,
@@ -110,7 +119,6 @@ fn register_token(
     tokens.insert(run_id.to_owned(), std::sync::Arc::clone(&token));
     Ok(token)
 }
-#[allow(dead_code)]
 fn release_token(
     engine: &crate::Engine,
     run_id: &str,
@@ -126,6 +134,685 @@ fn release_token(
     {
         tokens.remove(run_id);
     }
+}
+struct AgentLease {
+    engine: std::sync::Arc<crate::Engine>,
+    run_id: String,
+    token: std::sync::Arc<tokio_util::sync::CancellationToken>,
+}
+impl Drop for AgentLease {
+    fn drop(&mut self) {
+        release_token(&self.engine, &self.run_id, &self.token);
+        self.engine
+            .slots
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+type StartHook = (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+static TEST_AFTER_REGISTER: std::sync::Mutex<Option<StartHook>> = std::sync::Mutex::new(None);
+#[cfg(all(test, windows))]
+static TEST_HANDOFF_NONE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+fn prepare_start(
+    engine: std::sync::Arc<crate::Engine>,
+    run_id: &str,
+    expected: &serde_json::Value,
+) -> Result<(AgentLease, serde_json::Value), String> {
+    use std::sync::atomic::Ordering;
+    engine
+        .slots
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < 4).then_some(n + 1)
+        })
+        .map_err(|_| "run capacity reached")?;
+    let token = match register_token(&engine, run_id) {
+        Ok(token) => token,
+        Err(error) => {
+            engine.slots.fetch_sub(1, Ordering::AcqRel);
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut hook = TEST_AFTER_REGISTER.lock().unwrap();
+            if hook.as_ref().is_some_and(|h| h.0 == run_id) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, ready, proceed)) = hook {
+            ready.send(()).unwrap();
+            proceed.recv().unwrap();
+        }
+    }
+    let result = if token.is_cancelled() {
+        Err("cancelled".to_string())
+    } else {
+        engine
+            .db
+            .get()
+            .ok_or("storage unavailable".to_string())
+            .and_then(|db| crate::runs::begin_agent(&db, run_id, expected))
+    };
+    match result {
+        Ok(run) => Ok((
+            AgentLease {
+                engine,
+                run_id: run_id.to_owned(),
+                token,
+            },
+            run,
+        )),
+        Err(error) => {
+            release_token(&engine, run_id, &token);
+            engine.slots.fetch_sub(1, Ordering::AcqRel);
+            Err(error)
+        }
+    }
+}
+
+struct ScriptedMock {
+    engine: std::sync::Arc<crate::Engine>,
+    run_id: String,
+    script: Vec<serde_json::Value>,
+}
+impl crate::agent_loop::ModelDriver for ScriptedMock {
+    async fn generate(
+        &self,
+        role: &str,
+        input: serde_json::Value,
+        tools: Vec<serde_json::Value>,
+        cancel: tokio_util::sync::CancellationToken,
+        remaining_tokens: u64,
+    ) -> Result<provider::Generation, String> {
+        use sha2::{Digest, Sha256};
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        if remaining_tokens == 0 {
+            return Err("token budget exhausted".into());
+        }
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(role, &input, &tools)).map_err(|_| "invalid mock input")?
+            )
+        );
+        let db = self.engine.db.get().ok_or("storage unavailable")?;
+        let run = self.run_id.clone();
+        let index =
+            tokio::task::spawn_blocking(move || crate::runs::mock_index(&db, &run, &fingerprint))
+                .await
+                .map_err(|_| "mock worker failed")??;
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        let step = self
+            .script
+            .get(index as usize)
+            .ok_or("mock script exhausted")?;
+        let mut calls = Vec::new();
+        if let Some(items) = step.get("tool_calls").and_then(|v| v.as_array()) {
+            for item in items {
+                let id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("mock call ID required")?;
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("mock tool name required")?;
+                let args = item
+                    .get("arguments")
+                    .filter(|v| v.is_object())
+                    .ok_or("mock arguments required")?;
+                calls.push(provider::ToolCall {
+                    call_id: id.into(),
+                    name: name.into(),
+                    arguments: args.to_string(),
+                });
+            }
+        }
+        let output=calls.iter().map(|c|serde_json::json!({"type":"function_call","call_id":c.call_id,"name":c.name,"arguments":c.arguments})).collect();
+        Ok(provider::Generation {
+            text: step
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .into(),
+            tool_calls: calls,
+            output,
+            usage: Some(serde_json::json!({"total_tokens":1})),
+        })
+    }
+}
+
+#[cfg(windows)]
+enum ExecutionModel {
+    Mock(ScriptedMock),
+    OpenAi {
+        models: crate::agent_loop::OpenAiModels,
+        limits: std::collections::HashMap<String, u64>,
+        contexts: std::collections::HashMap<String, Option<u64>>,
+        secret: domain::SecretString,
+    },
+}
+#[cfg(windows)]
+fn bounded_output(
+    input: &serde_json::Value,
+    tools: &[serde_json::Value],
+    remaining: u64,
+    limit: u64,
+    context: Option<u64>,
+) -> Result<u64, String> {
+    let input_bound = (serde_json::to_vec(input)
+        .map_err(|_| "invalid input")?
+        .len()
+        + serde_json::to_vec(tools)
+            .map_err(|_| "invalid tools")?
+            .len()
+        + 64) as u64;
+    let available = match context {
+        Some(max) => max
+            .checked_sub(input_bound)
+            .filter(|n| *n > 0)
+            .ok_or("model context too small")?,
+        None => u64::MAX,
+    };
+    let output = remaining.min(limit).min(available);
+    if output == 0 {
+        return Err("token budget exhausted".into());
+    }
+    Ok(output)
+}
+#[cfg(windows)]
+impl crate::agent_loop::ModelDriver for ExecutionModel {
+    async fn generate(
+        &self,
+        role: &str,
+        input: serde_json::Value,
+        tools: Vec<serde_json::Value>,
+        cancel: tokio_util::sync::CancellationToken,
+        remaining_tokens: u64,
+    ) -> Result<provider::Generation, String> {
+        match self {
+            Self::Mock(model) => {
+                model
+                    .generate(role, input, tools, cancel, remaining_tokens)
+                    .await
+            }
+            Self::OpenAi {
+                models,
+                limits,
+                contexts,
+                secret,
+            } => {
+                let limit = *limits.get(role).ok_or("role model unavailable")?;
+                let context = *contexts.get(role).ok_or("role model unavailable")?;
+                let output = bounded_output(&input, &tools, remaining_tokens, limit, context)?;
+                let result = models
+                    .generate(role, input, tools, cancel, output)
+                    .await
+                    .map_err(|_| "provider request failed")?;
+                if result.text.contains(&secret.0)
+                    || serde_json::to_string(&result.output)
+                        .map_err(|_| "invalid provider output")?
+                        .contains(&secret.0)
+                    || result
+                        .tool_calls
+                        .iter()
+                        .any(|c| c.arguments.contains(&secret.0))
+                {
+                    return Err("provider output rejected".into());
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn tool_schema(name: &str) -> serde_json::Value {
+    let (properties, required) = match name {
+        "read" => (serde_json::json!({"path":{"type":"string"}}), vec!["path"]),
+        "search" => (
+            serde_json::json!({"path":{"type":"string"},"query":{"type":"string"}}),
+            vec!["path", "query"],
+        ),
+        "patch" => (
+            serde_json::json!({"path":{"type":"string"},"content":{"type":"string"}}),
+            vec!["path", "content"],
+        ),
+        _ => unreachable!("preflight filters tool names"),
+    };
+    serde_json::json!({"type":"function","name":name,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
+}
+
+#[cfg(windows)]
+type Prepared = (
+    AgentLease,
+    serde_json::Value,
+    domain::ApprovedSpec,
+    crate::agent_loop::LoopConfig,
+    ExecutionModel,
+    String,
+);
+// 2026-11-16: preflight, token 등록과 실행 세대 선점이 다른 명세 변경과 교차하지 않도록 한 gate에서 준비한다.
+#[cfg(windows)]
+fn prepare(
+    engine: std::sync::Arc<crate::Engine>,
+    run_id: &str,
+    script: Vec<serde_json::Value>,
+) -> Result<Prepared, String> {
+    use sha2::{Digest, Sha256};
+    let _gate = engine
+        .mutation_gate
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if engine
+        .startup_recovery_pending
+        .load(std::sync::atomic::Ordering::Acquire)
+        || engine.completions.blocks_global()
+        || engine.completions.blocks_run(run_id)
+    {
+        return Err("완료 결과 저장을 먼저 복구해야 합니다.".into());
+    }
+    let db = engine.db.get().ok_or("storage unavailable")?;
+    let run = crate::runs::get(&db, run_id)?;
+    let project: domain::Project = {
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        let table = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+        let row = table
+            .get(run["project_id"].as_str().ok_or("invalid project")?)
+            .map_err(|e| e.to_string())?
+            .ok_or("project not found")?;
+        serde_json::from_str(row.value()).map_err(|_| "invalid project")?
+    };
+    let spec = project.approved.clone().ok_or("approval required")?;
+    let configs: Vec<domain::AgentConfig> = serde_json::from_value(run["agent_configs"].clone())
+        .map_err(|_| "invalid role configuration")?;
+    let mode = run["autonomy_mode"]
+        .as_str()
+        .ok_or("invalid autonomy mode")?;
+    let selected = run["model_provider"].as_str().ok_or("invalid provider")?;
+    preflight(&spec, &configs, mode, selected, &script)?;
+    let caps: domain::ModelCapabilities = serde_json::from_value(run["model_capabilities"].clone())
+        .map_err(|_| "model capabilities missing")?;
+    let mut providers = std::collections::HashMap::new();
+    let mut limits = std::collections::HashMap::new();
+    let mut contexts = std::collections::HashMap::new();
+    let credential = if selected == "openai" {
+        Some(
+            engine
+                .credentials
+                .lock()
+                .map_err(|_| "credential storage unavailable")?
+                .get(&project.id)
+                .cloned()
+                .ok_or("runtime credential required")?,
+        )
+    } else {
+        None
+    };
+    for config in &configs {
+        let profile = match config.limits.get("capabilities") {
+            Some(v) => serde_json::from_value::<domain::ModelCapabilities>(v.clone())
+                .map_err(|_| "invalid role capabilities")?,
+            None => caps.clone(),
+        };
+        if (!config.tools.is_empty() && !profile.tools)
+            || (selected == "openai" && !profile.streaming)
+        {
+            return Err("configured model capability unavailable".into());
+        }
+        let limit = config
+            .limits
+            .get("max_output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(provider::DEFAULT_MAX_OUTPUT_TOKENS);
+        limits.insert(config.role.clone(), limit);
+        contexts.insert(config.role.clone(), profile.context_tokens);
+        if let Some((endpoint, secret)) = &credential {
+            let provider = provider::OpenAiProvider::new(provider::OpenAiConfig {
+                endpoint: endpoint.clone(),
+                model: config.model.clone(),
+                api_key: secret.0.clone(),
+                max_output_bytes: 2 * 1024 * 1024,
+            })
+            .map_err(|_| "invalid agent model configuration")?;
+            providers.insert(config.role.clone(), provider);
+        }
+    }
+    let endpoint = credential.as_ref().map(|v| v.0.as_str());
+    let identity = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(selected, &configs, &script, endpoint))
+                .map_err(|_| "invalid model configuration")?
+        )
+    );
+    let role = |name: &str| -> Result<crate::agent_loop::RoleConfig, String> {
+        let c = configs
+            .iter()
+            .find(|c| c.role == name)
+            .ok_or("role missing")?;
+        Ok(crate::agent_loop::RoleConfig {
+            name: name.into(),
+            tools: c.tools.iter().map(|v| tool_schema(v)).collect(),
+            max_rounds: c.limits["max_rounds"].as_u64().ok_or("invalid rounds")? as usize,
+        })
+    };
+    let total = configs
+        .iter()
+        .try_fold(0u64, |sum, c| {
+            sum.checked_add(c.limits["max_tokens"].as_u64()?)
+        })
+        .ok_or("invalid token budget")?;
+    let parallel = configs
+        .iter()
+        .find(|c| c.role == "coordinator")
+        .and_then(|c| c.limits.get("max_parallel_tasks"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let config = crate::agent_loop::LoopConfig {
+        coordinator: role("coordinator")?,
+        implementer: role("implementer")?,
+        reviewer: role("reviewer")?,
+        max_tokens: total,
+        max_parallel_tasks: parallel as usize,
+        timeout: std::time::Duration::from_secs(120),
+    };
+    let model = match credential {
+        Some((_, secret)) => ExecutionModel::OpenAi {
+            models: crate::agent_loop::OpenAiModels(providers),
+            limits,
+            contexts,
+            secret,
+        },
+        None => ExecutionModel::Mock(ScriptedMock {
+            engine: std::sync::Arc::clone(&engine),
+            run_id: run_id.into(),
+            script,
+        }),
+    };
+    drop(db);
+    let (lease, claimed) = prepare_start(std::sync::Arc::clone(&engine), run_id, &run)?;
+    Ok((lease, claimed, spec, config, model, identity))
+}
+
+// 2026-11-16: 마지막 reviewer는 전체 검증과 실제 snapshot에 귀속되며 완료 저장자와 같은 입력 digest를 사용한다.
+#[cfg(windows)]
+struct ReviewWork<'a> {
+    engine: &'a std::sync::Arc<crate::Engine>,
+    run_id: &'a str,
+    spec: &'a domain::ApprovedSpec,
+    context_version: u64,
+    attempt: u64,
+    model: &'a ExecutionModel,
+    runtime: &'a crate::agent_runtime::Runtime,
+    store: &'a crate::agent_runtime::Store,
+    config: &'a crate::agent_loop::LoopConfig,
+}
+#[cfg(windows)]
+async fn final_review(
+    work: ReviewWork<'_>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    use crate::agent_loop::{CheckpointStore, DurableToolDriver, ModelDriver, ToolDriver};
+    let ReviewWork {
+        engine,
+        run_id,
+        spec,
+        context_version,
+        attempt,
+        model,
+        runtime,
+        store,
+        config,
+    } = work;
+    let mut evidence = Vec::new();
+    let mut ids = Vec::new();
+    for task in &spec.tasks {
+        for (index, command) in task.validation.iter().enumerate() {
+            let id = serde_json::to_string(&(&task.id, "final_validation", index))
+                .map_err(|_| "invalid verification ID")?;
+            let result = runtime
+                .verify_durable(task, command, &id, cancel.clone())
+                .await?;
+            if !result.passed || result.verification_id != id {
+                return Err("final validation failed".into());
+            }
+            ids.push(id);
+            evidence.push(result);
+        }
+    }
+    if ids.is_empty() {
+        return Err("final validation missing".into());
+    }
+    runtime.fresh(spec).await?;
+    let diff = {
+        let engine = std::sync::Arc::clone(engine);
+        let id = run_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _gate = engine
+                .mutation_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let db = engine.db.get().ok_or("storage unavailable")?;
+            crate::runs::diff(&db, &id)
+        })
+        .await
+        .map_err(|_| "diff worker failed")??
+    };
+    let revision = diff["current_revision"]
+        .as_str()
+        .ok_or("invalid revision")?
+        .to_owned();
+    let worktree_hash = diff["worktree_hash"]
+        .as_str()
+        .ok_or("invalid snapshot")?
+        .to_owned();
+    if evidence.iter().any(|e| {
+        e.revision != revision || e.worktree_hash != worktree_hash || e.spec_hash != spec.hash
+    }) {
+        return Err("verification snapshot changed".into());
+    }
+    let binding = crate::agent_completion::ReviewBinding {
+        schema_version: 1,
+        spec_hash: spec.hash.clone(),
+        spec_version: spec.version,
+        context_version,
+        agent_attempt: attempt,
+        revision,
+        worktree_hash,
+        verification_ids: ids,
+    };
+    let (input, digest) = crate::agent_completion::review_input(spec, &evidence, &diff, &binding)?;
+    let record = {
+        let engine = std::sync::Arc::clone(engine);
+        let id = run_id.to_owned();
+        let hash = digest.clone();
+        tokio::task::spawn_blocking(move || {
+            let _gate = engine
+                .mutation_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let db = engine.db.get().ok_or("storage unavailable")?;
+            crate::runs::claim_call(&db, &id, "final-review", &hash)
+        })
+        .await
+        .map_err(|_| "review claim worker failed")??
+    };
+    if record["status"] == "completed" {
+        let saved: crate::agent_completion::ReviewBinding =
+            serde_json::from_value(record["result"]["binding"].clone())
+                .map_err(|_| "invalid saved review")?;
+        if record["result"]["approved"] == true && saved == binding {
+            return Ok(());
+        }
+        return Err("saved review mismatch".into());
+    }
+    if record["fresh"] != true {
+        return Err("final review outcome uncertain".into());
+    }
+    let mut state = store.load().await?.ok_or("checkpoint unavailable")?;
+    let input_bound = (serde_json::to_vec(&input)
+        .map_err(|_| "invalid review input")?
+        .len()
+        + 64) as u64;
+    let reservation = config.max_tokens.saturating_sub(state.tokens_used);
+    if reservation <= input_bound {
+        return Err("token budget insufficient for final review".into());
+    }
+    state.tokens_used += reservation;
+    state.reserved_tokens = reservation;
+    state.model_inflight = true;
+    let previous = state.revision;
+    state.revision = store.save(previous, state.clone()).await?;
+    let result = model
+        .generate(
+            &config.reviewer.name,
+            input,
+            vec![],
+            cancel,
+            reservation - input_bound,
+        )
+        .await?;
+    let usage = result
+        .usage
+        .as_ref()
+        .and_then(|v| v["total_tokens"].as_u64())
+        .ok_or("provider token usage missing")?;
+    if usage > reservation {
+        return Err("provider exceeded reserved token budget".into());
+    }
+    state.tokens_used = state.tokens_used - reservation + usage;
+    state.reserved_tokens = 0;
+    state.model_inflight = false;
+    let previous = state.revision;
+    store.save(previous, state).await?;
+    if !result.tool_calls.is_empty()
+        || serde_json::from_str::<serde_json::Value>(&result.text)
+            .ok()
+            .and_then(|v| v["approved"].as_bool())
+            != Some(true)
+    {
+        return Err("final review rejected or invalid".into());
+    }
+    runtime.fresh(spec).await?;
+    let engine = std::sync::Arc::clone(engine);
+    let id = run_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _gate = engine
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let db = engine.db.get().ok_or("storage unavailable")?;
+        crate::runs::complete_call(
+            &db,
+            &id,
+            "final-review",
+            serde_json::json!({"approved":true,"binding":binding}),
+        )
+    })
+    .await
+    .map_err(|_| "review save worker failed")??;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) async fn start(
+    engine: std::sync::Arc<crate::Engine>,
+    run_id: String,
+    script: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let prepared = {
+        let engine = std::sync::Arc::clone(&engine);
+        let id = run_id.clone();
+        tokio::task::spawn_blocking(move || prepare(engine, &id, script))
+            .await
+            .map_err(|_| "agent preparation failed")??
+    };
+    let (lease, claimed, spec, config, model, identity) = prepared;
+    let attempt = claimed["agent_attempt"].as_u64().ok_or("invalid attempt")?;
+    let context = claimed["context_version"]
+        .as_u64()
+        .ok_or("invalid context")?;
+    let project_id = claimed["project_id"]
+        .as_str()
+        .ok_or("invalid project")?
+        .to_owned();
+    let cancel = lease.token.as_ref().clone();
+    tokio::spawn(async move {
+        let _lease = lease;
+        let runtime = crate::agent_runtime::Runtime::new(
+            std::sync::Arc::clone(&engine),
+            run_id.clone(),
+            spec.clone(),
+            context,
+            attempt,
+        );
+        let store = crate::agent_runtime::Store::new(
+            std::sync::Arc::clone(&engine),
+            run_id.clone(),
+            spec.clone(),
+            context,
+            attempt,
+        );
+        let result = match crate::agent_loop::run_checkpointed_loop(
+            &model,
+            &runtime,
+            &store,
+            &spec,
+            &config,
+            &identity,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                final_review(
+                    ReviewWork {
+                        engine: &engine,
+                        run_id: &run_id,
+                        spec: &spec,
+                        context_version: context,
+                        attempt,
+                        model: &model,
+                        runtime: &runtime,
+                        store: &store,
+                        config: &config,
+                    },
+                    cancel,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let record = crate::completion::CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            result.is_ok(),
+            attempt,
+        );
+        let db = engine.db.get();
+        #[cfg(test)]
+        let db = if TEST_HANDOFF_NONE.lock().unwrap().take().as_deref() == Some(run_id.as_str()) {
+            None
+        } else {
+            db
+        };
+        crate::save_agent_result(std::sync::Arc::clone(&engine.completions), db, record).await;
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,6 +835,13 @@ mod tests {
             })
             .collect();
         (spec, configs)
+    }
+    #[cfg(windows)]
+    #[test]
+    fn output_limit_accounts_for_context_before_provider_call() {
+        let input = serde_json::json!([{"role":"user","content":"fixture"}]);
+        assert!(bounded_output(&input, &[], 1000, 100, Some(1)).is_err());
+        assert_eq!(bounded_output(&input, &[], 1000, 100, None).unwrap(), 100);
     }
     #[test]
     fn supports_only_explicit_initial_tool_and_validation_contract() {
@@ -176,6 +870,16 @@ mod tests {
         .is_err());
         assert!(preflight(&spec, &configs, "step", "mock", &[]).is_err());
         assert!(preflight(&spec, &configs, "step", "openai", &[serde_json::json!({})]).is_err());
+        let mut invalid_parallel = configs.clone();
+        invalid_parallel[0].limits["max_parallel_tasks"] = 0.into();
+        assert!(preflight(
+            &spec,
+            &invalid_parallel,
+            "step",
+            "mock",
+            &[serde_json::json!({})]
+        )
+        .is_err());
     }
     #[test]
     fn stale_worker_cannot_remove_replacement_cancellation_token() {
@@ -185,6 +889,8 @@ mod tests {
         let root = root.canonicalize().unwrap();
         let engine = Arc::new(crate::Engine::open(&root.join("test.redb")).unwrap());
         let old = register_token(&engine, "run").unwrap();
+        assert!(register_token(&engine, "run").is_err());
+        engine.slots.store(1, std::sync::atomic::Ordering::Release);
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let worker = {
@@ -194,7 +900,11 @@ mod tests {
             std::thread::spawn(move || {
                 entered.wait();
                 release.wait();
-                release_token(&engine, "run", &old);
+                drop(AgentLease {
+                    engine,
+                    run_id: "run".into(),
+                    token: old,
+                });
             })
         };
         entered.wait();
@@ -214,6 +924,7 @@ mod tests {
             .unwrap()
             .cancel();
         assert!(replacement.is_cancelled());
+        assert_eq!(engine.slots.load(std::sync::atomic::Ordering::Acquire), 0);
         release_token(&engine, "run", &replacement);
         assert!(!engine.cancellations.lock().unwrap().contains_key("run"));
         drop(engine);
@@ -232,7 +943,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("magi-agent-cas-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let engine = crate::Engine::open(&root.join("test.redb")).unwrap();
+        let engine = Arc::new(crate::Engine::open(&root.join("test.redb")).unwrap());
         let db = engine.db.get().unwrap();
         let (spec, configs) = fixture();
         let project = serde_json::json!({"id":"project","name":"fixture","path":"fake","draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":spec,"context_version":2,"agent_configs":configs});
@@ -249,6 +960,50 @@ mod tests {
             t.insert("run", run.to_string().as_str()).unwrap();
         }
         tx.commit().unwrap();
+        let cancel_run = {
+            let mut v = run.clone();
+            v["id"] = "cancel-run".into();
+            v
+        };
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            t.insert("cancel-run", cancel_run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let cancel_expected = crate::runs::get(&db, "cancel-run").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *TEST_AFTER_REGISTER.lock().unwrap() = Some(("cancel-run".into(), ready_tx, go_rx));
+        let worker = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || prepare_start(engine, "cancel-run", &cancel_expected))
+        };
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let response = engine.handle(domain::Request {
+            id: "test".into(),
+            command: domain::Command::CancelRun {
+                run_id: "cancel-run".into(),
+            },
+        });
+        assert!(response.result.is_ok());
+        go_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert!(!engine
+            .cancellations
+            .lock()
+            .unwrap()
+            .contains_key("cancel-run"));
+        assert_eq!(engine.slots.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(
+            crate::runs::get(&db, "cancel-run").unwrap()["agent_active"],
+            false
+        );
         let expected = crate::runs::get(&db, "run").unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let workers: Vec<_> = (0..2)
@@ -282,5 +1037,410 @@ mod tests {
             .to_string_lossy()
             .starts_with("magi-agent-cas-"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mock_request_index_is_durable_and_scoped_to_each_run() {
+        let root = std::env::temp_dir().join(format!("magi-mock-index-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("test.redb");
+        let db = redb::Database::create(&path).unwrap();
+        assert_eq!(crate::runs::mock_index(&db, "run-a", "first").unwrap(), 0);
+        assert_eq!(crate::runs::mock_index(&db, "run-a", "second").unwrap(), 1);
+        assert_eq!(crate::runs::mock_index(&db, "run-b", "first").unwrap(), 0);
+        drop(db);
+        let db = redb::Database::open(&path).unwrap();
+        assert_eq!(crate::runs::mock_index(&db, "run-a", "first").unwrap(), 0);
+        assert_eq!(crate::runs::mock_index(&db, "run-a", "third").unwrap(), 2);
+        drop(db);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-mock-index-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn scripted_model_reuses_input_and_returns_structured_tool_call() {
+        use crate::agent_loop::ModelDriver;
+        let root = std::env::temp_dir().join(format!("magi-mock-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let engine = std::sync::Arc::new(crate::Engine::open(&root.join("test.redb")).unwrap());
+        let model = ScriptedMock {
+            engine: std::sync::Arc::clone(&engine),
+            run_id: "run".into(),
+            script: vec![
+                serde_json::json!({"text":"first","tool_calls":[{"call_id":"call","name":"read","arguments":{"path":"src/a"}}]}),
+                serde_json::json!({"text":"second"}),
+            ],
+        };
+        let first = model
+            .generate(
+                "implementer",
+                serde_json::json!(["first"]),
+                vec![],
+                tokio_util::sync::CancellationToken::new(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.text, "first");
+        assert_eq!(first.tool_calls[0].name, "read");
+        let replay = model
+            .generate(
+                "implementer",
+                serde_json::json!(["first"]),
+                vec![],
+                tokio_util::sync::CancellationToken::new(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.text, "first");
+        let second = model
+            .generate(
+                "reviewer",
+                serde_json::json!(["second"]),
+                vec![],
+                tokio_util::sync::CancellationToken::new(),
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.text, "second");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(model
+            .generate(
+                "reviewer",
+                serde_json::json!(["third"]),
+                vec![],
+                cancelled,
+                100
+            )
+            .await
+            .is_err());
+        drop(model);
+        drop(engine);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-mock-model-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn start_agent_changes_worktree_verifies_and_completes_review() {
+        use std::{os::windows::process::CommandExt, sync::Arc};
+        fn git(root: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .creation_flags(0x08000000)
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "NUL")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().into()
+        }
+        let base = std::env::temp_dir().join(format!("magi-start-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.txt"), "before").unwrap();
+        git(&repo, &["add", "src/a.txt"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        let revision = git(&repo, &["rev-parse", "HEAD"]);
+        let work = base.join("work");
+        let target = work
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap_or(work.to_str().unwrap());
+        git(
+            &repo,
+            &["worktree", "add", "--detach", "--", target, &revision],
+        );
+        let engine = Arc::new(crate::Engine::open(&base.join("state.redb")).unwrap());
+        let db = engine.db.get().unwrap();
+        let (mut spec, mut configs) = fixture();
+        spec.base_revision = revision.clone();
+        spec.tasks[0].validation = vec!["read_contains:src/a.txt:after".into()];
+        configs[1].tools.push("patch".into());
+        let project = serde_json::json!({"id":"project","name":"fixture","path":repo,"draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":spec,"context_version":2,"agent_configs":configs,"autonomy_mode":"approved_scope","model_settings":{"provider":"mock","model":"mock","capabilities":{"streaming":false,"tools":true,"context_tokens":null}}});
+        let run = serde_json::json!({"id":"run","project_id":"project","spec_hash":"fixture","spec_version":1,"revision":revision,"scope":["src"],"worktree":work,"status":"awaiting_implementation","pending":null,"events":[],"context_version":2,"agent_active":false,"agent_attempt":0,"agent_configs":configs,"autonomy_mode":"approved_scope","model_provider":"mock","model_capabilities":{"streaming":false,"tools":true,"context_tokens":null},"used_calls":[],"evidence":[]});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(crate::PROJECTS).unwrap();
+            t.insert("project", project.to_string().as_str()).unwrap();
+        }
+        {
+            let mut t = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            t.insert("run", run.to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let script = vec![
+            serde_json::json!({"text":"coordinate"}),
+            serde_json::json!({"tool_calls":[{"call_id":"patch","name":"patch","arguments":{"path":"src/a.txt","content":"after"}}]}),
+            serde_json::json!({"text":"implemented"}),
+            serde_json::json!({"text":"{\"approved\":true}"}),
+            serde_json::json!({"text":"{\"approved\":true}"}),
+        ];
+        let mut unsupported = project.clone();
+        unsupported["approved"]["tasks"][0]["validation"] = serde_json::json!(["exec_json:{}"]);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(crate::PROJECTS).unwrap();
+            projects
+                .insert("project", unsupported.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let before = crate::runs::get(&db, "run").unwrap();
+        let rejected = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "unsupported".into(),
+                command: domain::Command::StartAgent {
+                    run_id: "run".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(rejected.result.is_err());
+        assert_eq!(crate::runs::get(&db, "run").unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/a.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(engine.slots.load(std::sync::atomic::Ordering::Acquire), 0);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(crate::PROJECTS).unwrap();
+            projects
+                .insert("project", project.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        *TEST_HANDOFF_NONE.lock().unwrap() = Some("run".into());
+        let response = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "start".into(),
+                command: domain::Command::StartAgent {
+                    run_id: "run".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let run = loop {
+            let v = crate::runs::get(&db, "run").unwrap();
+            if engine.slots.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                break v;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{v}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            engine.completions.for_run("run").is_object(),
+            "expected pending completion, run: {run}"
+        );
+        let cursor_before = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("mock_calls"))
+                .unwrap();
+            let value = table.get("run:cursor").unwrap().unwrap().value();
+            value
+        };
+        assert_eq!(cursor_before, 5);
+        let calls_before = run["used_calls"].clone();
+        let project_before = engine
+            .handle(domain::Request {
+                id: "project-before".into(),
+                command: domain::Command::GetProject {
+                    project_id: "project".into(),
+                },
+            })
+            .result
+            .unwrap();
+        let context_change = engine.handle(domain::Request {
+            id: "change-context".into(),
+            command: domain::Command::SetAutonomy {
+                project_id: "project".into(),
+                mode: "step".into(),
+            },
+        });
+        assert!(context_change.result.is_err());
+        let project_after = engine
+            .handle(domain::Request {
+                id: "project-after".into(),
+                command: domain::Command::GetProject {
+                    project_id: "project".into(),
+                },
+            })
+            .result
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(project_before).unwrap(),
+            serde_json::to_value(project_after).unwrap()
+        );
+        let rejected = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "retry-start".into(),
+                command: domain::Command::StartAgent {
+                    run_id: "run".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(rejected.result.is_err());
+        assert_eq!(crate::runs::get(&db, "run").unwrap(), run);
+        let retry = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: "run".into(),
+            },
+        });
+        assert!(retry.result.is_ok(), "{:?}", retry.result);
+        let run = crate::runs::get(&db, "run").unwrap();
+        let cursor_after = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("mock_calls"))
+                .unwrap();
+            let value = table.get("run:cursor").unwrap().unwrap().value();
+            value
+        };
+        assert_eq!(cursor_after, cursor_before);
+        assert_eq!(run["used_calls"], calls_before);
+        assert_eq!(run["agent_active"], false, "{run}");
+        assert_eq!(run["status"], "completed", "{run}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/a.txt")).unwrap(),
+            "after"
+        );
+        let evidence = run["evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|e| e["verification_id"]
+            == "[\"task\",\"final_validation\",0]"
+            && e["passed"] == true));
+        let tx = db.begin_read().unwrap();
+        let calls = tx
+            .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+            .unwrap();
+        let review: serde_json::Value =
+            serde_json::from_str(calls.get("run:final-review").unwrap().unwrap().value()).unwrap();
+        assert_eq!(review["result"]["approved"], true);
+        assert_eq!(review["result"]["binding"]["agent_attempt"], 1);
+        drop(calls);
+        drop(tx);
+        std::fs::write(work.join("src/a.txt"), "before").unwrap();
+        let mut second = before.clone();
+        second["id"] = "cancel-after".into();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut runs = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            runs.insert("cancel-after", second.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        *TEST_HANDOFF_NONE.lock().unwrap() = Some("cancel-after".into());
+        let response = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "start-second".into(),
+                command: domain::Command::StartAgent {
+                    run_id: "cancel-after".into(),
+                    mock_script: script,
+                },
+            })
+            .await;
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let second = loop {
+            let value = crate::runs::get(&db, "cancel-after").unwrap();
+            if engine.slots.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                break value;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{value}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            engine.completions.for_run("cancel-after").is_object(),
+            "{second}"
+        );
+        let cursor_before = {
+            let tx = db.begin_read().unwrap();
+            let t = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("mock_calls"))
+                .unwrap();
+            let value = t.get("cancel-after:cursor").unwrap().unwrap().value();
+            value
+        };
+        assert_eq!(cursor_before, 5);
+        let calls_before = second["used_calls"].clone();
+        let cancel = engine.handle(domain::Request {
+            id: "cancel".into(),
+            command: domain::Command::CancelRun {
+                run_id: "cancel-after".into(),
+            },
+        });
+        assert!(cancel.result.is_ok());
+        let retry = engine.handle(domain::Request {
+            id: "retry-cancelled".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: "cancel-after".into(),
+            },
+        });
+        assert!(retry.result.is_ok(), "{:?}", retry.result);
+        let second = crate::runs::get(&db, "cancel-after").unwrap();
+        let cursor_after = {
+            let tx = db.begin_read().unwrap();
+            let t = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("mock_calls"))
+                .unwrap();
+            let value = t.get("cancel-after:cursor").unwrap().unwrap().value();
+            value
+        };
+        assert_eq!(cursor_after, cursor_before);
+        assert_eq!(second["used_calls"], calls_before);
+        assert_eq!(second["agent_active"], false, "{second}");
+        assert_eq!(second["status"], "cancelled", "{second}");
+        drop(db);
+        drop(engine);
+        git(&repo, &["worktree", "remove", "--force", target]);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(base.parent(), Some(temp.as_path()));
+        assert!(base
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-start-agent-"));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

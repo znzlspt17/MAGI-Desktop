@@ -31,6 +31,18 @@ fn parse_completion_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
             let _: Result<provider::sdd::SpecResult, String> =
                 serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
         }
+        Some("agent") => {
+            let object = result.as_object().ok_or("invalid agent completion")?;
+            if object.len() != 2
+                || object.get("success").and_then(|v| v.as_bool()).is_none()
+                || object
+                    .get("attempt")
+                    .and_then(|v| v.as_u64())
+                    .is_none_or(|n| n == 0)
+            {
+                return Err("invalid agent completion".into());
+            }
+        }
         _ => return Err("unsupported completion journal".into()),
     }
     Ok(record)
@@ -233,6 +245,23 @@ impl CompletionManager {
         db: &redb::Database,
         record: serde_json::Value,
     ) {
+        self.register_record(db, record);
+    }
+
+    // 2026-11-16: 반환 오류에도 최초 완료 ID와 시도 번호를 그대로 재사용한다.
+    #[cfg(windows)]
+    #[allow(dead_code)] // 실행 생산자가 별도 변경에서 호출한다.
+    pub(crate) fn agent_record(
+        run_id: &str,
+        project_id: &str,
+        success: bool,
+        attempt: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"agent","result":{"success":success,"attempt":attempt}}})
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn register_agent_record(&self, db: &redb::Database, record: serde_json::Value) {
         self.register_record(db, record);
     }
 
@@ -528,6 +557,9 @@ impl CompletionManager {
                 .and_then(|result| {
                     crate::runs::finish_generation(db, run_id, result, completion_id)
                 }),
+                Some("agent") => {
+                    crate::agent_completion::finish_agent(db, &self.mutation_gate, record)
+                }
                 _ => Err("unsupported completion journal".into()),
             };
             let Ok(applied) = applied else { continue };
@@ -582,6 +614,10 @@ impl CompletionManager {
             .as_str()
             .expect("validated project id")
             .to_owned();
+        let stage = record["outcome"]["stage"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
         let existing = self.directory.as_ref().and_then(|directory| {
             let parent = directory.parent()?;
             let name = directory.file_name()?;
@@ -607,10 +643,10 @@ impl CompletionManager {
                 item["message"] =
                     "저장 작업이 중단되었습니다. 완료 결과 저장을 다시 시도하세요.".into();
             } else if !entries.iter().any(|item| item["run_id"] == run_id) {
-                entries.push(serde_json::json!({"run_id":run_id,"project_id":project_id,"stage":"generation","state":"pending","attempts":0,"journaled":existing.is_some(),"message":"저장 작업이 중단되었습니다. 완료 결과 저장을 다시 시도하세요.","_path":existing.map(|p|p.to_string_lossy().to_string()),"_record":record}));
+                entries.push(serde_json::json!({"run_id":run_id,"project_id":project_id,"stage":stage,"state":"pending","attempts":0,"journaled":existing.is_some(),"message":"저장 작업이 중단되었습니다. 완료 결과 저장을 다시 시도하세요.","_path":existing.map(|p|p.to_string_lossy().to_string()),"_record":record}));
             }
         }
-        self.log_event(&run_id, "generation", "storage_handoff_failed");
+        self.log_event(&run_id, &stage, "storage_handoff_failed");
     }
     pub(crate) fn for_run(&self, run_id: &str) -> serde_json::Value {
         self.status()["failures"]
@@ -785,7 +821,7 @@ mod tests {
         let fixture = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let bytes = serde_json::to_vec(&fixture).unwrap();
         assert_eq!(parse_completion_record(&bytes).unwrap(), fixture);
-        for stage in ["generation", "agent", "unknown"] {
+        for stage in ["generation", "unknown"] {
             let mut unsupported = fixture.clone();
             unsupported["outcome"]["stage"] = stage.into();
             let encoded = serde_json::to_vec(&unsupported).unwrap();
@@ -1513,5 +1549,719 @@ mod tests {
         std::fs::remove_file(journal.join("events.log")).unwrap();
         std::fs::remove_dir(journal).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod agent_journal_tests {
+    use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn interrupted_completion_preserves_second_attempt_on_retry() {
+        let root =
+            std::env::temp_dir().join(format!("agent-attempt-event-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":2,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 2);
+        manager.preserve_failed_handoff(record.clone());
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["events"][0]["attempt"], 2);
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_success_clears_worker_even_if_project_is_unavailable() {
+        let root =
+            std::env::temp_dir().join(format!("agent-cancel-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"cancelled","agent_active":true,"agent_attempt":1,"events":[]}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        manager.preserve_failed_handoff(CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            true,
+            1,
+        ));
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "cancelled");
+        assert_eq!(run["agent_active"], false);
+        assert!(run["events"].as_array().unwrap().is_empty());
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_after_worker_finished_clears_same_attempt_on_retry() {
+        use std::sync::Arc;
+        let root =
+            std::env::temp_dir().join(format!("agent-cancel-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let engine = crate::Engine::open(&root.join("state.redb")).unwrap();
+        let db = engine.db.get().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1,"custom":"preserved"}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        crate::save_agent_result(Arc::clone(&engine.completions), None, record).await;
+        engine
+            .handle(domain::Request {
+                id: "cancel".into(),
+                command: domain::Command::CancelRun {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let before = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(before["status"], "cancelled");
+        assert_eq!(before["agent_active"], true);
+        let response = engine
+            .handle(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let domain::ResponseData::Data(value) = response else {
+            panic!("retry")
+        };
+        assert_eq!(value["state"], "saved");
+        let after = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(after["status"], "cancelled");
+        assert_eq!(after["agent_active"], false);
+        assert_eq!(after["events"], before["events"]);
+        assert_eq!(after["custom"], "preserved");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn older_agent_attempt_is_superseded_without_changes() {
+        let root = std::env::temp_dir().join(format!("agent-old-attempt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":2,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        manager.preserve_failed_handoff(CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            false,
+            1,
+        ));
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["agent_attempt"], 2);
+        assert_eq!(run["agent_active"], true);
+        assert!(run["events"].as_array().unwrap().is_empty());
+        let mut cancelled = run;
+        cancelled["status"] = "cancelled".into();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), cancelled.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        manager.preserve_failed_handoff(CompletionManager::agent_record(
+            &run_id,
+            &project_id,
+            false,
+            1,
+        ));
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        let newer = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(newer["status"], "cancelled");
+        assert_eq!(newer["agent_active"], true);
+        assert_eq!(newer["agent_attempt"], 2);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_failure_does_not_duplicate_agent_completion_event() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("agent-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let journal = root.join("journal");
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        let path = publish_completion_record(&journal, &record).unwrap();
+        let manager =
+            CompletionManager::load(&journal, std::sync::Arc::new(std::sync::Mutex::new(())))
+                .unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "cleanup_pending");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(locked);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_worker_panics_keep_same_agent_id_before_and_after_commit() {
+        use std::sync::Arc;
+        for after_commit in [false, true] {
+            let root = std::env::temp_dir().join(format!("agent-panic-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let db = Arc::new(redb::Database::create(root.join("state.redb")).unwrap());
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let project_id = uuid::Uuid::new_v4().to_string();
+            seed_approved_project(&db, &project_id);
+            let tx = db.begin_write().unwrap();
+            {
+                let mut table = tx
+                    .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                    .unwrap();
+                table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+            }
+            tx.commit().unwrap();
+            let manager = Arc::new(CompletionManager::empty(
+                root.join("journal"),
+                Arc::new(std::sync::Mutex::new(())),
+            ));
+            let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+            crate::save_agent_result_with(
+                Arc::clone(&manager),
+                Some(Arc::clone(&db)),
+                record.clone(),
+                move |manager, db, record| {
+                    if after_commit {
+                        manager.register_agent_record(&db.unwrap(), record);
+                    }
+                    panic!("fixture handoff failure");
+                },
+            )
+            .await;
+            assert_eq!(manager.for_run(&run_id)["stage"], "agent");
+            assert_eq!(
+                manager.pending.lock().unwrap()[0]["_record"]["id"],
+                record["id"]
+            );
+            assert_eq!(manager.status()["log_entries"].as_array().unwrap().len(), 1);
+            assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+            assert_eq!(
+                crate::runs::get(&db, &run_id).unwrap()["events"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct FailingBackend {
+        file: redb::backends::FileBackend,
+        broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[cfg(windows)]
+    impl redb::StorageBackend for FailingBackend {
+        fn len(&self) -> std::io::Result<u64> {
+            self.file.len()
+        }
+        fn read(&self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+            self.file.read(offset, length)
+        }
+        fn set_len(&self, length: u64) -> std::io::Result<()> {
+            self.file.set_len(length)
+        }
+        fn sync_data(&self, eventual: bool) -> std::io::Result<()> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("fixture"));
+            }
+            self.file.sync_data(eventual)
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("fixture"));
+            }
+            self.file.write(offset, data)
+        }
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn previous_io_journals_agent_and_same_retry_reopens_original() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let root = std::env::temp_dir().join(format!("agent-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = redb::Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("fixture"))
+                .unwrap();
+            table.insert("x", 1).unwrap();
+        }
+        broken.store(true, Ordering::SeqCst);
+        assert!(tx.commit().is_err());
+        assert!(matches!(
+            db.begin_write(),
+            Err(redb::TransactionError::Storage(
+                redb::StorageError::PreviousIo
+            ))
+        ));
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let manager = Arc::new(CompletionManager::empty(
+            root.join("state.redb.completion-journal"),
+            Arc::clone(&gate),
+        ));
+        let engine = crate::Engine {
+            db: crate::storage::StorageSlot::new(path.clone(), db),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+            completions: Arc::clone(&manager),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        crate::save_agent_result(Arc::clone(&manager), engine.db.get(), record.clone()).await;
+        assert_eq!(manager.for_run(&run_id)["journaled"], true);
+        assert_eq!(
+            manager.pending.lock().unwrap()[0]["_record"]["id"],
+            record["id"]
+        );
+        broken.store(false, Ordering::SeqCst);
+        let response = engine
+            .handle(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let domain::ResponseData::Data(value) = response else {
+            panic!("retry")
+        };
+        assert_eq!(value["state"], "saved");
+        let reopened = engine.db.get().unwrap();
+        let run = crate::runs::get(&reopened, &run_id).unwrap();
+        assert_eq!(run["status"], "interrupted");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+    }
+    #[cfg(windows)]
+    fn seed_approved_project(db: &redb::Database, id: &str) {
+        let project = serde_json::json!({"id":id,"name":"fixture","path":"fixture","draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":{"version":1,"hash":"fixture","base_revision":"base","scope":[],"requirements":[],"acceptance":[]},"context_version":1});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(crate::PROJECTS).unwrap();
+            table.insert(id, project.to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn published_agent_journal_replays_before_interruption_on_restart() {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::temp_dir().join(format!("agent-crash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        drop(crate::Engine::open(&path).unwrap());
+        let db = redb::Database::open(&path).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        std::fs::write(
+            root.join("record.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .creation_flags(0x08000000)
+            .env("MAGI_TEST_CRASH_DIRECTORY", &root)
+            .args(["--exact", "completion::tests::crash_after_publish_child"])
+            .status()
+            .unwrap();
+        assert_eq!(child.code(), Some(86));
+        let engine = crate::Engine::open(&path).unwrap();
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "interrupted");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+        assert!(engine.completions.status()["failures"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn changed_project_context_supersedes_failed_agent_completion() {
+        let root = std::env::temp_dir().join(format!("agent-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let project = serde_json::json!({"id":project_id,"name":"fixture","path":"fixture","draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":{"version":1,"hash":"fixture","base_revision":"base","scope":[],"requirements":[],"acceptance":[]},"context_version":2});
+        let run = serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(crate::PROJECTS).unwrap();
+            table
+                .insert(project_id.as_str(), project.to_string().as_str())
+                .unwrap();
+        }
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        manager.preserve_failed_handoff(record.clone());
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["agent_active"],
+            false
+        );
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["agent_active"],
+            false
+        );
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        drop(db);
+        let reopened = redb::Database::open(root.join("state.redb")).unwrap();
+        let stored = crate::runs::get(&reopened, &run_id).unwrap();
+        assert_eq!(stored["agent_active"], false);
+        assert_eq!(stored["status"], "awaiting_implementation");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn agent_retry_reopens_locked_existing_database() {
+        let root = std::env::temp_dir().join(format!("agent-locked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        drop(crate::Engine::open(&path).unwrap());
+        let db = redb::Database::open(&path).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".completion-journal");
+        let journal = std::path::PathBuf::from(name);
+        std::fs::create_dir(&journal).unwrap();
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        std::fs::write(
+            journal.join(format!("{run_id}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let engine = crate::Engine::open(&path).unwrap();
+        assert_eq!(engine.completions.for_run(&run_id)["stage"], "agent");
+        drop(db);
+        let result = engine
+            .handle(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let domain::ResponseData::Data(value) = result else {
+            panic!("retry response")
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "interrupted");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unavailable_database_keeps_agent_record_for_storage_only_retry() {
+        let root = std::env::temp_dir().join(format!("agent-no-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let run = serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = std::sync::Arc::new(CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        ));
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        crate::save_agent_result(std::sync::Arc::clone(&manager), None, record.clone()).await;
+        assert_eq!(manager.for_run(&run_id)["stage"], "agent");
+        assert_eq!(manager.status()["log_entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            manager.pending.lock().unwrap()[0]["_record"]["id"],
+            record["id"]
+        );
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_agent_is_not_revived_by_late_completion() {
+        let root = std::env::temp_dir().join(format!("agent-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let run = serde_json::json!({"id":run_id,"project_id":project_id,"status":"cancelled","agent_active":true,"agent_attempt":1,"events":[]});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"agent","result":{"success":false,"attempt":1}}});
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let stored = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(stored["status"], "cancelled");
+        assert_eq!(stored["agent_active"], false);
+        assert!(stored["events"].as_array().unwrap().is_empty());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn retry_saves_interrupted_agent_without_reexecuting_it() {
+        let root = std::env::temp_dir().join(format!("agent-replay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let run = serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":1,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1,"custom":"preserved"});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table
+                .insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"agent","result":{"success":false,"attempt":1}}});
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let stored = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(stored["status"], "interrupted");
+        assert_eq!(stored["agent_active"], false);
+        assert_eq!(stored["events"].as_array().unwrap().len(), 1);
+        assert_eq!(stored["custom"], "preserved");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn failed_agent_handoff_is_reported_as_agent_with_original_id() {
+        let directory =
+            std::env::temp_dir().join(format!("magi-agent-handoff-{}", uuid::Uuid::new_v4()));
+        let manager =
+            CompletionManager::empty(directory, std::sync::Arc::new(std::sync::Mutex::new(())));
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"agent","result":{"success":true,"attempt":1}}});
+        manager.preserve_failed_handoff(record.clone());
+        let pending = manager.pending.lock().unwrap();
+        assert_eq!(pending[0]["stage"], "agent");
+        assert_eq!(pending[0]["_record"]["id"], record["id"]);
+    }
+    #[test]
+    fn valid_agent_completion_is_accepted_but_invalid_payload_is_rejected() {
+        let value = serde_json::json!({
+            "version":1,
+            "id":uuid::Uuid::new_v4().to_string(),
+            "run_id":uuid::Uuid::new_v4().to_string(),
+            "project_id":uuid::Uuid::new_v4().to_string(),
+            "outcome":{"stage":"agent","result":{"success":true,"attempt":1}}
+        });
+        assert_eq!(
+            parse_completion_record(&serde_json::to_vec(&value).unwrap()).unwrap(),
+            value
+        );
+        let mut invalid = value;
+        invalid["outcome"]["result"]["attempt"] = serde_json::json!("invalid");
+        assert!(parse_completion_record(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 }

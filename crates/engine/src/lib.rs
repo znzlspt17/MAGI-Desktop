@@ -1,7 +1,11 @@
 //! 로컬 프로젝트와 명세 생성, 실행 결과 저장 및 복구를 제공한다.
 
+#[cfg(windows)]
+mod agent_completion;
 mod agent_execution;
 pub mod agent_loop;
+// 2026-11-16: StartAgent 연동 전 내구 runtime bridge를 독립 검증한다.
+mod agent_runtime;
 mod completion;
 mod runs;
 mod storage;
@@ -155,6 +159,23 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        #[cfg(windows)]
+        if let Command::StartAgent {
+            run_id,
+            mock_script,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: agent_execution::start(
+                    Arc::clone(&self),
+                    run_id.clone(),
+                    mock_script.clone(),
+                )
+                .await
+                .map(|_| ResponseData::Empty),
+            };
+        }
         if let Command::GenerateSpec { project_id } = &request.command {
             let engine = Arc::clone(&self);
             let project_id = project_id.clone();
@@ -458,7 +479,7 @@ impl Engine {
                 let mut state = if let Some(db) = self.db.get() {
                     if validate_existing_schema(&db).is_ok() {self.completions.retry(&db,&run_id)?} else {"pending"}
                 } else {"pending"};
-                if state == "pending" && matches!(self.completions.for_run(&run_id)["stage"].as_str(), Some("worktree" | "generation")) {
+                if state == "pending" && matches!(self.completions.for_run(&run_id)["stage"].as_str(), Some("worktree" | "generation" | "agent")) {
                     match self.db.reopen_when_idle() {
                         Ok(db) => {
                             if validate_existing_schema(&db).is_ok() {state=self.completions.retry(&db,&run_id)?;} else {self.completions.note_reopen_issue(&run_id,false);}
@@ -854,6 +875,45 @@ async fn save_generation_result<F>(
         eprintln!("명세 완료 결과의 저장 진단 작업이 중단되었습니다.");
     }
 }
+// 2026-11-16: 작업자 반환 오류에도 동일한 완료 ID를 진단에 남기고 저장만 다시 시도한다.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) async fn save_agent_result(
+    manager: Arc<completion::CompletionManager>,
+    db: Option<Arc<Database>>,
+    record: serde_json::Value,
+) {
+    save_agent_result_with(manager, db, record, |manager, db, record| match db {
+        Some(db) => manager.register_agent_record(&db, record),
+        None => manager.preserve_failed_handoff(record),
+    })
+    .await;
+}
+
+#[cfg(windows)]
+async fn save_agent_result_with<F>(
+    manager: Arc<completion::CompletionManager>,
+    db: Option<Arc<Database>>,
+    record: serde_json::Value,
+    save: F,
+) where
+    F: FnOnce(&completion::CompletionManager, Option<Arc<Database>>, serde_json::Value)
+        + Send
+        + 'static,
+{
+    let worker_record = record.clone();
+    let worker_manager = Arc::clone(&manager);
+    if tokio::task::spawn_blocking(move || save(&worker_manager, db, worker_record))
+        .await
+        .is_err()
+        && tokio::task::spawn_blocking(move || manager.preserve_failed_handoff(record))
+            .await
+            .is_err()
+    {
+        eprintln!("에이전트 완료 결과의 저장 진단 작업이 중단되었습니다.");
+    }
+}
+
 fn draft_hash(draft: &SpecDraft) -> Result<String, String> {
     Ok(format!(
         "{:x}",
