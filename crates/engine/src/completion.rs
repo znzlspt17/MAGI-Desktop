@@ -250,7 +250,6 @@ impl CompletionManager {
 
     // 2026-11-16: 반환 오류에도 최초 완료 ID와 시도 번호를 그대로 재사용한다.
     #[cfg(windows)]
-    #[allow(dead_code)] // 실행 생산자가 별도 변경에서 호출한다.
     pub(crate) fn agent_record(
         run_id: &str,
         project_id: &str,

@@ -17,7 +17,6 @@ struct RunIdentity {
 }
 
 // 2026-11-16: 같은 gate 아래 현재 승인과 시도를 확인한 뒤에만 쓰기를 수행한다.
-#[allow(dead_code)]
 fn check_identity(db: &Database, identity: &RunIdentity) -> Result<(), String> {
     let run = runs::get(db, &identity.run_id)?;
     let project_id = run["project_id"].as_str().ok_or("invalid run project")?;
@@ -55,8 +54,7 @@ fn check_identity(db: &Database, identity: &RunIdentity) -> Result<(), String> {
     Ok(())
 }
 
-// 2026-11-16: StartAgent 연결 전까지 라이브러리 bridge에서만 사용한다.
-#[allow(dead_code)]
+// 2026-11-16: 에이전트의 실행 세대에 귀속된 checkpoint를 보존한다.
 pub(crate) struct Store {
     engine: Arc<Engine>,
     identity: RunIdentity,
@@ -250,17 +248,14 @@ type ApprovalHook = (
 static TEST_AUTO_APPROVAL_HOOK: std::sync::Mutex<Option<ApprovalHook>> =
     std::sync::Mutex::new(None);
 // 2026-11-16: StartAgent 연결 시 이 진입점으로 승인과 실행 세대를 고정한다.
-#[allow(dead_code)]
 pub(crate) struct Runtime {
     engine: Arc<Engine>,
     identity: RunIdentity,
     spec: domain::ApprovedSpec,
 }
 
-// 2026-11-16: 후속 StartAgent 연결 전까지 runtime 내부 호출 경계를 보존한다.
-#[allow(dead_code)]
+// 2026-11-16: 현재 승인과 실행 세대에서만 도구와 검증을 실행한다.
 impl Runtime {
-    #[allow(dead_code)]
     pub(crate) fn new(
         engine: Arc<Engine>,
         run_id: String,
@@ -627,7 +622,6 @@ impl Runtime {
 }
 
 impl Store {
-    #[allow(dead_code)]
     pub(crate) fn new(
         engine: Arc<Engine>,
         run_id: String,

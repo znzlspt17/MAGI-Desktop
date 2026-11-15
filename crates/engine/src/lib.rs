@@ -2,8 +2,9 @@
 
 #[cfg(windows)]
 mod agent_completion;
+mod agent_execution;
 pub mod agent_loop;
-// 2026-11-16: StartAgent 연동 전 내구 runtime bridge를 독립 검증한다.
+// 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
 mod runs;
@@ -29,8 +30,9 @@ pub struct Engine {
     slots: Arc<std::sync::atomic::AtomicUsize>,
     startup_recovery_pending: std::sync::atomic::AtomicBool,
     completions: Arc<completion::CompletionManager>,
-    cancellations:
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    cancellations: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    >,
     credentials:
         std::sync::Mutex<std::collections::HashMap<String, (String, domain::SecretString)>>,
 }
@@ -157,6 +159,23 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        #[cfg(windows)]
+        if let Command::StartAgent {
+            run_id,
+            mock_script,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: agent_execution::start(
+                    Arc::clone(&self),
+                    run_id.clone(),
+                    mock_script.clone(),
+                )
+                .await
+                .map(|_| ResponseData::Empty),
+            };
+        }
         if let Command::GenerateSpec { project_id } = &request.command {
             let engine = Arc::clone(&self);
             let project_id = project_id.clone();
@@ -357,7 +376,7 @@ impl Engine {
         self.cancellations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(run_id.clone(), token.clone());
+            .insert(run_id.clone(), Arc::new(token.clone()));
         if let Err(error) = runs::begin_generation(
             db.as_ref(),
             &run_id,
@@ -858,7 +877,6 @@ async fn save_generation_result<F>(
 }
 // 2026-11-16: 작업자 반환 오류에도 동일한 완료 ID를 진단에 남기고 저장만 다시 시도한다.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) async fn save_agent_result(
     manager: Arc<completion::CompletionManager>,
     db: Option<Arc<Database>>,
