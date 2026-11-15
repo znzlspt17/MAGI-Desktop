@@ -2,6 +2,9 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
+const CHECKPOINTS: TableDefinition<&str, &str> = TableDefinition::new("checkpoints");
+const CALLS: TableDefinition<&str, &str> = TableDefinition::new("calls");
+const MAX_DURABLE_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
 fn append_event(
     run: &mut serde_json::Value,
@@ -86,6 +89,7 @@ pub(crate) fn initialize(db: &Database) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+    tx.open_table(CHECKPOINTS).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
 #[cfg(test)]
@@ -546,6 +550,146 @@ pub(crate) fn finish_generation(
     tx.commit().map_err(|e| e.to_string())?;
     Ok(applied)
 }
+// 2026-11-16: 재개 연결 전에도 원본 저장 형식과 CAS 계약을 보존한다.
+#[allow(dead_code)]
+pub(crate) fn save_checkpoint(
+    db: &Database,
+    id: &str,
+    expected: u64,
+    mut value: serde_json::Value,
+) -> Result<u64, String> {
+    let next = expected
+        .checked_add(1)
+        .ok_or("checkpoint revision overflow")?;
+    let object = value.as_object_mut().ok_or("invalid checkpoint")?;
+    object.insert("revision".into(), serde_json::json!(next));
+    let json = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    if json.len() > MAX_DURABLE_RECORD_BYTES {
+        return Err("checkpoint too large".into());
+    }
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = tx.open_table(CHECKPOINTS).map_err(|e| e.to_string())?;
+        let current = {
+            let existing = table.get(id).map_err(|e| e.to_string())?;
+            match existing {
+                Some(v) => serde_json::from_str::<serde_json::Value>(v.value())
+                    .map_err(|e| e.to_string())?["revision"]
+                    .as_u64()
+                    .ok_or("invalid checkpoint revision")?,
+                None => 0,
+            }
+        };
+        if current != expected {
+            return Err("checkpoint revision conflict".into());
+        }
+        table.insert(id, json.as_str()).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(next)
+}
+#[allow(dead_code)]
+pub(crate) fn load_checkpoint(
+    db: &Database,
+    id: &str,
+) -> Result<Option<(u64, serde_json::Value)>, String> {
+    let tx = db.begin_read().map_err(|e| e.to_string())?;
+    let table = tx.open_table(CHECKPOINTS).map_err(|e| e.to_string())?;
+    let value = table.get(id).map_err(|e| e.to_string())?;
+    match value {
+        None => Ok(None),
+        Some(v) => {
+            let value: serde_json::Value =
+                serde_json::from_str(v.value()).map_err(|e| e.to_string())?;
+            let rev = value["revision"]
+                .as_u64()
+                .ok_or("invalid checkpoint revision")?;
+            Ok(Some((rev, value)))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn claim_call(
+    db: &Database,
+    run: &str,
+    id: &str,
+    hash: &str,
+) -> Result<serde_json::Value, String> {
+    if run.len() > 128 || id.is_empty() || id.len() > 1024 || hash.len() != 64 {
+        return Err("invalid call identity".into());
+    }
+    let key = format!("{run}:{id}");
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let result;
+    {
+        let mut table = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        let existing = {
+            table
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .map(|v| v.value().to_owned())
+        };
+        result = if let Some(json) = existing {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            if record["hash"] != hash {
+                return Err("call identity conflict".into());
+            }
+            record["fresh"] = serde_json::json!(false);
+            record
+        } else {
+            let record = serde_json::json!({"status":"planned","hash":hash});
+            let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+            table
+                .insert(key.as_str(), json.as_str())
+                .map_err(|e| e.to_string())?;
+            let mut visible = record;
+            visible["fresh"] = serde_json::json!(true);
+            visible
+        };
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+#[allow(dead_code)]
+pub(crate) fn complete_call(
+    db: &Database,
+    run: &str,
+    id: &str,
+    result: serde_json::Value,
+) -> Result<(), String> {
+    let key = format!("{run}:{id}");
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        let mut record: serde_json::Value = {
+            let v = table
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .ok_or("call not found")?;
+            serde_json::from_str(v.value()).map_err(|e| e.to_string())?
+        };
+        if record["status"] != "planned" {
+            return Err("call not pending".into());
+        }
+        record["status"] = serde_json::json!("completed");
+        record["result"] = result;
+        let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+        if json.len() > MAX_DURABLE_RECORD_BYTES {
+            return Err("call result too large".into());
+        }
+        table
+            .insert(key.as_str(), json.as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[path = "checkpoint_storage_tests.rs"]
+mod checkpoint_storage_tests;
+
 #[cfg(test)]
 pub(crate) static TEST_FAIL_AFTER_PATCH: std::sync::Mutex<
     Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
