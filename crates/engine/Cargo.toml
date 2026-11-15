@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 domain = { package = "core", path = "../core" }
+provider = { path = "../provider" }
 transport = { path = "../transport" }
 redb = "2"
 serde_json.workspace = true
