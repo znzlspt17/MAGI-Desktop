@@ -345,7 +345,12 @@ mod directory_pin_tests {
             std::env::temp_dir().join(format!("magi-read-pin-child-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("a.txt"), "fixture").unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src")).unwrap_or_else(|error| {
+            panic!(
+                "pin: {error}; test root: {root:?}; canonical: {:?}",
+                root.canonicalize()
+            )
+        });
         std::fs::rename(
             root.join("src").join("a.txt"),
             root.join("src").join("b.txt"),
@@ -362,7 +367,12 @@ mod directory_pin_tests {
         let root =
             std::env::temp_dir().join(format!("magi-read-pin-delete-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src")).unwrap_or_else(|error| {
+            panic!(
+                "pin: {error}; test root: {root:?}; canonical: {:?}",
+                root.canonicalize()
+            )
+        });
         assert!(std::fs::remove_dir(root.join("src")).is_err());
         drop(pins);
         std::fs::remove_dir(root.join("src")).unwrap();
@@ -373,7 +383,12 @@ mod directory_pin_tests {
         let root = std::env::temp_dir().join(format!("magi-read-pin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("a.txt"), "fixture").unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src")).unwrap_or_else(|error| {
+            panic!(
+                "pin: {error}; test root: {root:?}; canonical: {:?}",
+                root.canonicalize()
+            )
+        });
         let attacker = root.clone();
         assert!(std::thread::spawn(move || {
             std::fs::rename(attacker.join("src"), attacker.join("moved"))
