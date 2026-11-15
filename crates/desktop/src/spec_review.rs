@@ -5,16 +5,16 @@ pub(crate) struct Form {
     draft: domain::SpecDraft,
     title: String,
     revision: String,
-    scope: String,
-    requirements: String,
-    acceptance: String,
-    questions: String,
-    failures: String,
-    optional: String,
+    scope: Vec<String>,
+    requirements: Vec<String>,
+    acceptance: Vec<String>,
+    questions: Vec<String>,
+    failures: Vec<String>,
+    optional: Vec<String>,
     markdown: String,
-    constraints: String,
-    sources: String,
-    reused: String,
+    constraints: Vec<String>,
+    sources: Vec<String>,
+    reused: Vec<String>,
     tasks: String,
     bindings: String,
     accepted: std::collections::HashSet<String>,
@@ -26,42 +26,35 @@ impl Form {
             draft: d.clone(),
             title: d.title.clone(),
             revision: d.base_revision.clone(),
-            scope: d.scope.join("\n"),
-            requirements: d.requirements.join("\n"),
-            acceptance: d.acceptance.join("\n"),
-            questions: d.mandatory_questions.join("\n"),
-            failures: d.required_failures.join("\n"),
-            optional: d.optional_issues.join("\n"),
+            scope: d.scope.clone(),
+            requirements: d.requirements.clone(),
+            acceptance: d.acceptance.clone(),
+            questions: d.mandatory_questions.clone(),
+            failures: d.required_failures.clone(),
+            optional: d.optional_issues.clone(),
             markdown: d.markdown.clone(),
-            constraints: d.constraints.join("\n"),
-            sources: d.source_links.join("\n"),
-            reused: d.reused_decisions.join("\n"),
+            constraints: d.constraints.clone(),
+            sources: d.source_links.clone(),
+            reused: d.reused_decisions.clone(),
             tasks: serde_json::to_string_pretty(&d.tasks).unwrap_or_default(),
             bindings: serde_json::to_string_pretty(&d.task_bindings).unwrap_or_default(),
             accepted: Default::default(),
         }
     }
     fn draft(&self) -> Result<domain::SpecDraft, String> {
-        fn lines(s: &str) -> Vec<String> {
-            s.lines()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-                .collect()
-        }
         let mut d = self.draft.clone();
         d.title = self.title.clone();
         d.base_revision = self.revision.clone();
-        d.scope = lines(&self.scope);
-        d.requirements = lines(&self.requirements);
-        d.acceptance = lines(&self.acceptance);
-        d.mandatory_questions = lines(&self.questions);
-        d.required_failures = lines(&self.failures);
-        d.optional_issues = lines(&self.optional);
+        d.scope = self.scope.clone();
+        d.requirements = self.requirements.clone();
+        d.acceptance = self.acceptance.clone();
+        d.mandatory_questions = self.questions.clone();
+        d.required_failures = self.failures.clone();
+        d.optional_issues = self.optional.clone();
         d.markdown = self.markdown.clone();
-        d.constraints = lines(&self.constraints);
-        d.source_links = lines(&self.sources);
-        d.reused_decisions = lines(&self.reused);
+        d.constraints = self.constraints.clone();
+        d.source_links = self.sources.clone();
+        d.reused_decisions = self.reused.clone();
         d.tasks = serde_json::from_str(&self.tasks).map_err(|e| format!("작업 JSON: {e}"))?;
         d.task_bindings =
             serde_json::from_str(&self.bindings).map_err(|e| format!("작업 바인딩 JSON: {e}"))?;
@@ -146,18 +139,40 @@ pub(crate) fn render(
     }
     ui.label("제목");
     ui.text_edit_singleline(&mut form.title);
-    for (label, value) in [
-        ("기준 revision", &mut form.revision),
+    ui.label("기준 revision");
+    ui.text_edit_multiline(&mut form.revision);
+    for (label, values) in [
         ("범위", &mut form.scope),
         ("요구사항", &mut form.requirements),
         ("승인 기준", &mut form.acceptance),
         ("필수 질문", &mut form.questions),
         ("필수 검사 실패", &mut form.failures),
         ("선택 항목", &mut form.optional),
-        ("명세 원문", &mut form.markdown),
         ("제약", &mut form.constraints),
         ("출처", &mut form.sources),
         ("재사용 결정", &mut form.reused),
+    ] {
+        ui.push_id(label, |ui| {
+            ui.label(label);
+            let mut remove = None;
+            for (index, value) in values.iter_mut().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.text_edit_multiline(value);
+                    if ui.button("항목 삭제").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove {
+                values.remove(index);
+            }
+            if ui.button("항목 추가").clicked() {
+                values.push(String::new());
+            }
+        });
+    }
+    for (label, value) in [
+        ("명세 원문", &mut form.markdown),
         ("작업 JSON", &mut form.tasks),
         ("바인딩 JSON", &mut form.bindings),
     ] {
@@ -178,6 +193,202 @@ mod tests {
     use super::*;
     fn project() -> domain::Project {
         serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"old","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":null})).unwrap()
+    }
+    #[test]
+    fn list_items_round_trip_without_losing_newlines_or_whitespace() {
+        let mut p = project();
+        p.draft.requirements = vec!["  첫 줄\n둘째 줄  ".into(), "별도 항목".into()];
+        p.draft.acceptance = vec!["검사\n세부 내용".into()];
+        p.draft.constraints = vec!["  제약  ".into()];
+        p.draft.scope = vec!["  경로  ".into()];
+        p.draft.mandatory_questions = vec!["질문\n설명".into()];
+        p.draft.required_failures = vec!["실패\n근거".into()];
+        p.draft.optional_issues = vec!["선택\n설명".into()];
+        p.draft.source_links = vec![" 출처 ".into()];
+        p.draft.reused_decisions = vec!["결정\n상세".into()];
+        let actual = Form::new(&p).draft().unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(p.draft).unwrap()
+        );
+    }
+    #[test]
+    fn multiline_item_starts_clean_and_can_be_approved() {
+        let mut p = project();
+        p.draft.title = "명세".into();
+        p.draft.requirements = vec!["첫 줄\n두 번째 줄".into()];
+        p.draft.acceptance = vec!["승인 기준".into()];
+        p.draft.scope = vec!["src".into()];
+        p.draft.base_revision = "rev".into();
+        let mut forms = std::collections::HashMap::new();
+        let ctx = egui::Context::default();
+        let frame = |forms: &mut std::collections::HashMap<String, Form>, events| {
+            let mut action = None;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000., 2200.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = render(ui, &p, forms, false);
+                    });
+                },
+            );
+            (out, action)
+        };
+        let (out, _) = frame(&mut forms, vec![]);
+        assert!(!out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="저장되지 않은 편집이 있습니다.")));
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut forms,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, action) = frame(
+            &mut forms,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(matches!(action, Some(Action::Approve(_))));
+    }
+
+    #[test]
+    fn explicit_list_edit_preserves_other_item_boundaries_on_save() {
+        let mut p = project();
+        p.draft.requirements = vec!["원래\n두 줄".into(), "  다른 항목  ".into()];
+        p.draft.constraints = vec!["제약\n세부".into()];
+        let ctx = egui::Context::default();
+        let mut forms = std::collections::HashMap::new();
+        let frame = |forms: &mut std::collections::HashMap<String, Form>, events| {
+            let mut action = None;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000., 2200.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = render(ui, &p, forms, false);
+                    });
+                },
+            );
+            (out, action)
+        };
+        let (initial, _) = frame(&mut forms, vec![]);
+        let text_pos = initial
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "원래\n두 줄" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut forms,
+            vec![
+                egui::Event::PointerMoved(text_pos),
+                egui::Event::PointerButton {
+                    pos: text_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut forms,
+            vec![egui::Event::PointerButton {
+                pos: text_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(
+            &mut forms,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        ..egui::Modifiers::NONE
+                    },
+                },
+                egui::Event::Text("수정\n두 줄".into()),
+            ],
+        );
+        let (out, _) = frame(&mut forms, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "초안 저장" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut forms,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, action) = frame(
+            &mut forms,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let Some(Action::Save(Ok(draft))) = action else {
+            panic!("저장 요청 누락")
+        };
+        assert_eq!(draft.requirements, vec!["수정\n두 줄", "  다른 항목  "]);
+        assert_eq!(draft.constraints, vec!["제약\n세부"]);
     }
     #[test]
     fn newly_loaded_draft_updates_unedited_form() {
