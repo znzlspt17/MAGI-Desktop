@@ -1,0 +1,45 @@
+{
+  "repository": "znzlspt17/MAGI-Desktop",
+  "roles": {
+    "pm": {
+      "app_slug": "magi-ieum",
+      "app_id": 5769277,
+      "installation_id": 182198624
+    },
+    "dev": {
+      "app_slug": "magi-daon",
+      "app_id": 5769298,
+      "installation_id": 182199475
+    },
+    "designer": {
+      "app_slug": "magi-garam",
+      "app_id": 5769306,
+      "installation_id": 182199755
+    },
+    "devops": {
+      "app_slug": "magi-jian",
+      "app_id": 5769319,
+      "installation_id": 182199841
+    },
+    "intern": {
+      "app_slug": "magi-nayoon",
+      "app_id": 5769321,
+      "installation_id": 182199881
+    },
+    "rust_desktop": {
+      "app_slug": "magi-seoyun",
+      "app_id": 5769325,
+      "installation_id": 182199960
+    },
+    "rust_inference": {
+      "app_slug": "magi-byeori",
+      "app_id": 5769329,
+      "installation_id": 182200002
+    },
+    "cto": {
+      "app_slug": "magi-seojin",
+      "app_id": 5769340,
+      "installation_id": 182200036
+    }
+  }
+}

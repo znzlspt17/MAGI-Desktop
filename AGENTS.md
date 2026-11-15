@@ -32,7 +32,15 @@
 
 - `pm`: 이음 (Ieum), `dev`: 다온 (Daon), `designer`: 가람 (Garam), `devops`: 지안 (Jian)
 - `intern`: 나윤 (Nayoon), `rust_desktop`: 서윤 (Seoyun), `rust_inference`: 벼리 (Byeori), `cto`: 서진 (Seojin)
-- PR 본문, 리뷰와 작업 보고에는 실제 수행한 에이전트만 `이름(role)` 형식으로 서명한다. 사용자나 다른 에이전트의 수행을 대신 주장하지 않는다. 서명은 GitHub 표시 계정과 별개이며 계정이나 Git identity를 변경하지 않는다.
+- PR 본문, 리뷰와 작업 보고에는 실제 수행한 에이전트만 `이름(role)` 형식으로 서명한다. 사용자나 다른 에이전트의 수행을 대신 주장하지 않는다. GitHub 게시 명의는 아래 전용 App 연결을 따르며, Git 커밋 identity는 별도 승인 없이 변경하지 않는다.
+
+## GitHub App 게시 연결
+
+- 사용자가 승인한 MAGI-Desktop의 PR 및 리뷰 게시는 `scripts/github-agent.ps1`과 `.codex/github-apps.json`을 이용한다. 역할 ID에 대응하는 `magi-<이름>[bot]` 명의로 게시하고 실제 반환된 작성자를 확인한다.
+- 예: `pwsh -NoProfile -File D:/Repos/MAGI-Desktop/scripts/github-agent.ps1 -Role dev -Operation CreatePullRequest -InputPath <PR입력.json>`. PM 리뷰는 `-Role pm -Operation CreateReview -PullNumber <번호> -InputPath <리뷰입력.json>`을 사용한다.
+- 게시 실패 시 사용자 계정 커넥터, `gh` 또는 브라우저로 대체 게시하지 않는다. 오류 후 재시도 전에 실제 게시 여부를 확인한다.
+- 원문 개인키와 토큰 접근 금지는 유지한다. 사용자 승인 게시에는 인증값을 반환하지 않는 지정 헬퍼만 사용할 수 있다. 키 생성, 교체, 폐기 및 접근 권한 확대는 별도 사용자 승인을 받는다.
+- `intern`은 읽기 작업만 허용한다. 앱 설치 범위는 `znzlspt17/MAGI-Desktop` 한 곳이며 다른 저장소로 자동 확대하지 않는다. 기존 PR 작성자와 제출된 승인 기록의 명의는 변경할 수 없다.
 
 ## 구현과 검증
 
@@ -70,4 +78,3 @@
 - PM이 실제 PR 변경과 관련 검사 결과를 검토하고 승인한 뒤 `dev`에 병합한다. 구현 담당자가 자신의 작업을 PM 승인으로 대신 처리하지 않는다.
 - `main` 병합은 사용자가 결과를 판단하고 승인하는 별도 단계다. 에이전트가 자동으로 병합하지 않는다.
 - 새 GitHub 리포지터리 주소와 초기 브랜치가 준비되기 전에는 원격 연결, push 또는 PR 생성을 수행한 것으로 주장하지 않는다. 현재 누적 로컬 변경을 보존한다.
-
