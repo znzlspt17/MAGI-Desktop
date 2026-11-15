@@ -192,6 +192,7 @@ pub async fn execute_tool(
             tokio::select! { _=cancel.cancelled()=>Err("cancelled".into()), result=worker=>result.map_err(|_|"read worker failed".to_owned())? }
         }
 
+        "exec" => run_exec(context, args, cancel).await,
         _ => Err("unsupported tool".into()),
     }
 }
@@ -428,4 +429,359 @@ mod journal_pin_tests {
         std::fs::remove_dir(root.join("one")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecArguments {
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+}
+
+// 2026-11-16: 명령 실행은 승인 스냅샷이 있을 때만 허용하고 프로세스를 시작 전에 Job에 묶는다.
+async fn run_exec(
+    context: ToolContext,
+    args: Value,
+    cancel: CancellationToken,
+) -> Result<ToolResult, String> {
+    if !context.side_effect_authorized {
+        return Err("command approval required".into());
+    }
+    let args: ExecArguments =
+        serde_json::from_value(args).map_err(|_| "invalid command arguments")?;
+    if args.program.is_empty()
+        || args.program.contains('\0')
+        || args.args.iter().any(|a| a.contains('\0'))
+        || args.args.len() > 128
+        || context.timeout.is_zero()
+        || context.timeout > Duration::from_secs(600)
+        || context.max_output_bytes > 4 * 1024 * 1024
+        || context.max_output_bytes == 0
+    {
+        return Err("invalid command limits".into());
+    }
+    // 2026-11-16: 명백하게 보호 저장소를 지정하는 인자는 승인된 일반 명령에서도 실행하지 않는다.
+    if std::iter::once(&args.program)
+        .chain(args.args.iter())
+        .any(|arg| {
+            arg.split(['=', ':'])
+                .any(|part| crate::worktree::protected(&part.replace('\\', "/")))
+        })
+    {
+        return Err("protected command target".into());
+    }
+    if !crate::worktree::safe_relative(&args.cwd)
+        || crate::worktree::protected(&args.cwd.replace('\\', "/"))
+        || args
+            .cwd
+            .split(['/', '\\'])
+            .any(|s| s.eq_ignore_ascii_case(".git"))
+    {
+        return Err("unsafe working directory".into());
+    }
+    let normalized = args.cwd.replace('\\', "/").to_lowercase();
+    for scopes in [&context.allowed_paths, &context.owned_paths] {
+        if !scopes.iter().any(|s| {
+            let s = s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+            !s.is_empty() && (normalized == s || normalized.starts_with(&(s + "/")))
+        }) {
+            return Err("working directory outside scope".into());
+        }
+    }
+    let root = checked_root(&context.worktree)?;
+    let mut cwd = root.clone();
+    for component in Path::new(&args.cwd).components() {
+        cwd.push(component);
+        let meta = std::fs::symlink_metadata(&cwd).map_err(|_| "working directory unavailable")?;
+        if meta.file_type().is_symlink() {
+            return Err("links are not allowed".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err("reparse points are not allowed".into());
+            }
+        }
+    }
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|_| "working directory unavailable")?;
+    if !cwd.starts_with(&root) || !cwd.is_dir() {
+        return Err("invalid working directory".into());
+    }
+    #[cfg(windows)]
+    {
+        let pins = pin_directories(&context.worktree, Path::new(&args.cwd), false)?;
+        if pins.root.join(&args.cwd) != cwd || pins.root != root {
+            return Err("working directory changed".into());
+        }
+        tokio::task::spawn_blocking(move || {
+            exec_windows(
+                args,
+                cwd,
+                context.timeout,
+                context.max_output_bytes,
+                cancel,
+                pins,
+            )
+        })
+        .await
+        .map_err(|_| "command worker failed".to_owned())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (args, cwd, context, cancel);
+        Err("safe command execution unsupported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+fn exec_windows(
+    args: ExecArguments,
+    cwd: PathBuf,
+    timeout: Duration,
+    limit: usize,
+    cancel: CancellationToken,
+    _pins: DirectoryPins,
+) -> Result<ToolResult, String> {
+    use std::{
+        ffi::c_void,
+        os::windows::{
+            ffi::OsStrExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        },
+        ptr,
+        time::Instant,
+    };
+    use windows_sys::Win32::{
+        Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0},
+        Security::SECURITY_ATTRIBUTES,
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Pipes::CreatePipe,
+            Threading::*,
+        },
+    };
+    fn quote(s: &str) -> String {
+        let mut out = String::from("\"");
+        let mut slashes = 0;
+        for ch in s.chars() {
+            if ch == '\\' {
+                slashes += 1;
+            } else if ch == '"' {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            } else {
+                out.push_str(&"\\".repeat(slashes));
+                slashes = 0;
+                out.push(ch);
+            }
+        }
+        out.push_str(&"\\".repeat(slashes * 2));
+        out.push('"');
+        out
+    }
+    unsafe fn own(h: HANDLE) -> Result<OwnedHandle, String> {
+        if h.is_null() {
+            Err("handle creation failed".into())
+        } else {
+            Ok(OwnedHandle::from_raw_handle(h as _))
+        }
+    }
+    fn raw(h: &OwnedHandle) -> HANDLE {
+        h.as_raw_handle() as HANDLE
+    }
+    unsafe fn pipe() -> Result<(OwnedHandle, OwnedHandle), String> {
+        let mut r = ptr::null_mut();
+        let mut w = ptr::null_mut();
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        if CreatePipe(&mut r, &mut w, &sa, 0) == 0 {
+            return Err("pipe creation failed".into());
+        }
+        Ok((own(r)?, own(w)?))
+    }
+    let (stdin_r, stdin_w) = unsafe { pipe()? };
+    let (stdout_r, stdout_w) = unsafe { pipe()? };
+    let (stderr_r, stderr_w) = unsafe { pipe()? };
+    for h in [&stdin_w, &stdout_r, &stderr_r] {
+        if unsafe { SetHandleInformation(raw(h), HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err("pipe setup failed".into());
+        }
+    }
+    let job = unsafe { own(CreateJobObjectW(ptr::null(), ptr::null()))? };
+    let mut job_info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            raw(&job),
+            JobObjectExtendedLimitInformation,
+            &job_info as *const _ as *const c_void,
+            std::mem::size_of_val(&job_info) as u32,
+        )
+    } == 0
+    {
+        return Err("job configuration failed".into());
+    }
+    let mut size = 0usize;
+    unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size) };
+    let mut storage =
+        vec![0usize; (size + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>()];
+    let attrs = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    if unsafe { InitializeProcThreadAttributeList(attrs, 1, 0, &mut size) } == 0 {
+        return Err("process attributes failed".into());
+    }
+    struct Attr(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for Attr {
+        fn drop(&mut self) {
+            unsafe { DeleteProcThreadAttributeList(self.0) }
+        }
+    }
+    let _attr = Attr(attrs);
+    let handles = [raw(&stdin_r), raw(&stdout_w), raw(&stderr_w)];
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attrs,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr() as *const c_void,
+            std::mem::size_of_val(&handles),
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    } == 0
+    {
+        return Err("process handle list failed".into());
+    }
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = raw(&stdin_r);
+    startup.StartupInfo.hStdOutput = raw(&stdout_w);
+    startup.StartupInfo.hStdError = raw(&stderr_w);
+    startup.lpAttributeList = attrs;
+    let mut command = std::iter::once(&args.program)
+        .chain(args.args.iter())
+        .map(|s| quote(s))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // 2026-11-16: 승인한 명령에 부모 프로세스의 임의 환경 변수와 인증 정보가 전달되지 않게 한다.
+    let mut environment = Vec::<u16>::new();
+    for name in ["PATH", "SystemRoot", "TEMP", "TMP", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            environment.extend(std::ffi::OsStr::new(name).encode_wide());
+            environment.push('=' as u16);
+            environment.extend(value.encode_wide());
+            environment.push(0);
+        }
+    }
+    environment.push(0);
+    let cwd: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe {
+        CreateProcessW(
+            ptr::null(),
+            command.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+            CREATE_SUSPENDED
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr() as *const c_void,
+            cwd.as_ptr(),
+            &startup.StartupInfo,
+            &mut pi,
+        )
+    } == 0
+    {
+        return Err("command start failed".into());
+    }
+    let process = unsafe { own(pi.hProcess)? };
+    let thread = unsafe { own(pi.hThread)? };
+    if unsafe { AssignProcessToJobObject(raw(&job), raw(&process)) } == 0 {
+        unsafe { TerminateProcess(raw(&process), 1) };
+        return Err("cannot contain command".into());
+    }
+    if cancel.is_cancelled() {
+        unsafe { TerminateProcess(raw(&process), 1) };
+        return Err("cancelled before command start".into());
+    }
+    if unsafe { ResumeThread(raw(&thread)) } == u32::MAX {
+        unsafe { TerminateProcess(raw(&process), 1) };
+        return Err("cannot resume command".into());
+    }
+    drop(thread);
+    drop(stdin_r);
+    drop(stdin_w);
+    drop(stdout_w);
+    drop(stderr_w);
+    let read = move |h: OwnedHandle| {
+        std::thread::spawn(move || {
+            let mut f = std::fs::File::from(h);
+            let mut out = Vec::new();
+            f.by_ref()
+                .take(limit as u64 + 1)
+                .read_to_end(&mut out)
+                .map_err(|_| "command output failed")?;
+            Ok::<_, &str>(out)
+        })
+    };
+    let stdout = read(stdout_r);
+    let stderr = read(stderr_r);
+    let deadline = Instant::now() + timeout;
+    let error = loop {
+        if cancel.is_cancelled() {
+            break Some("command cancelled; result uncertain");
+        }
+        if Instant::now() >= deadline {
+            break Some("command timed out; result uncertain");
+        }
+        let state = unsafe { WaitForSingleObject(raw(&process), 20) };
+        if state == WAIT_OBJECT_0 {
+            break None;
+        }
+        if state != 258 {
+            break Some("command wait failed; result uncertain");
+        }
+    };
+    if error.is_some() {
+        drop(job);
+        let _ = unsafe { WaitForSingleObject(raw(&process), 5000) };
+    } else {
+        drop(job);
+    }
+    let mut code = 0u32;
+    let code_ok = unsafe { GetExitCodeProcess(raw(&process), &mut code) } != 0;
+    let out = stdout.join().map_err(|_| "output worker failed")??;
+    let err = stderr.join().map_err(|_| "output worker failed")??;
+    if let Some(e) = error {
+        return Err(e.into());
+    }
+    if !code_ok {
+        return Err("command exit unavailable".into());
+    }
+    if out.len() > limit || err.len() > limit || out.len() + err.len() > limit {
+        return Err("command output exceeds limit; result uncertain".into());
+    }
+    let stdout = String::from_utf8(out).map_err(|_| "command output not UTF-8")?;
+    let stderr = String::from_utf8(err).map_err(|_| "command output not UTF-8")?;
+    Ok(ToolResult {
+        content: json!({"stdout":stdout,"stderr":stderr}),
+        exit_code: Some(code as i32),
+    })
 }
