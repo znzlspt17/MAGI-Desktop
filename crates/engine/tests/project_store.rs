@@ -56,11 +56,12 @@ fn completion_journal_prevents_opening_or_modifying_existing_database() {
     let journal_record = journal.join("fake-pending.json");
     fs::write(&journal_record, b"fake pending record").unwrap();
 
-    let result = Engine::open(&path);
+    let engine = Engine::open(&path).unwrap();
+    let status = call(&engine, "status", Command::ListStorageFailures).unwrap();
     assert!(
-        result.is_err(),
-        "completion journal must block partial engine"
+        matches!(status,ResponseData::Data(value) if !value["failures"].as_array().unwrap().is_empty())
     );
+    drop(engine);
     assert_eq!(fs::read(&path).unwrap(), original_database);
     assert_eq!(fs::read(&journal_record).unwrap(), b"fake pending record");
 }
@@ -71,7 +72,11 @@ fn completion_journal_prevents_creating_a_missing_database() {
     let path = dir.path().join("missing.redb");
     fs::create_dir(dir.path().join("missing.redb.completion-journal")).unwrap();
 
-    assert!(Engine::open(&path).is_err());
+    let engine = Engine::open(&path).unwrap();
+    let status = call(&engine, "status", Command::ListStorageFailures).unwrap();
+    assert!(
+        matches!(status,ResponseData::Data(value) if !value["failures"].as_array().unwrap().is_empty())
+    );
     assert!(!path.exists(), "a missing database must not be recreated");
 }
 

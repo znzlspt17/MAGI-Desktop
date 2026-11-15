@@ -95,6 +95,7 @@ fn read_checked(ctx: &ToolContext, name: &str) -> Result<String, String> {
     let pins = pin_directories(
         &ctx.worktree,
         Path::new(name).parent().ok_or("invalid parent")?,
+        false,
     )?;
     #[cfg(windows)]
     let root = pins.root.clone();
@@ -244,7 +245,7 @@ struct SearchArguments {
     query: String,
 }
 #[cfg(windows)]
-struct DirectoryPins {
+pub(crate) struct DirectoryPins {
     _handles: Vec<std::os::windows::io::OwnedHandle>,
     root: PathBuf,
 }
@@ -252,7 +253,11 @@ struct DirectoryPins {
 // 2026-11-15: 속성 전용 핸들은 공유 제한이 적용되지 않으므로 목록 접근을 요청해 교체를 막는다.
 // 각 핸들의 실제 경로와 reparse 여부도 검증한다.
 #[cfg(windows)]
-fn pin_directories(root: &Path, relative_parent: &Path) -> Result<DirectoryPins, String> {
+pub(crate) fn pin_directories(
+    root: &Path,
+    relative_parent: &Path,
+    create_allowed: bool,
+) -> Result<DirectoryPins, String> {
     use std::{
         os::windows::{
             ffi::OsStrExt,
@@ -328,6 +333,16 @@ fn pin_directories(root: &Path, relative_parent: &Path) -> Result<DirectoryPins,
     let mut parent = root.clone();
     for part in relative_parent.components() {
         parent.push(part);
+        // 2026-11-15: 고정된 부모 아래에서만 새 디렉터리를 만들고 다시 핸들로 검증한다.
+        if create_allowed
+            && matches!(std::fs::symlink_metadata(&parent), Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            match std::fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err("cannot create directory".into()),
+            }
+        }
         handles.push(open_checked(&parent)?);
     }
     Ok(DirectoryPins {
@@ -346,7 +361,8 @@ mod directory_pin_tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("src").join("a.txt"), "fixture").unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src"), false).unwrap();
+
         std::fs::rename(
             root.join("src").join("a.txt"),
             root.join("src").join("b.txt"),
@@ -364,7 +380,8 @@ mod directory_pin_tests {
             std::env::temp_dir().join(format!("magi-read-pin-delete-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         let root = root.canonicalize().unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src"), false).unwrap();
+
         assert!(std::fs::remove_dir(root.join("src")).is_err());
         drop(pins);
         std::fs::remove_dir(root.join("src")).unwrap();
@@ -376,7 +393,8 @@ mod directory_pin_tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("src").join("a.txt"), "fixture").unwrap();
-        let pins = pin_directories(&root, Path::new("src")).unwrap();
+        let pins = pin_directories(&root, Path::new("src"), false).unwrap();
+
         let attacker = root.clone();
         assert!(std::thread::spawn(move || {
             std::fs::rename(attacker.join("src"), attacker.join("moved"))
@@ -389,6 +407,24 @@ mod directory_pin_tests {
         std::fs::rename(root.join("src"), root.join("moved")).unwrap();
         std::fs::remove_file(root.join("moved").join("a.txt")).unwrap();
         std::fs::remove_dir(root.join("moved")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod journal_pin_tests {
+    use super::pin_directories;
+    use std::path::Path;
+    #[test]
+    fn pin_can_create_missing_parents_only_when_allowed() {
+        let root = std::env::temp_dir().join(format!("journal-pins-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        assert!(pin_directories(&root, Path::new("one/two"), false).is_err());
+        let pins = pin_directories(&root, Path::new("one/two"), true).unwrap();
+        assert!(root.join("one/two").is_dir());
+        drop(pins);
+        std::fs::remove_dir(root.join("one/two")).unwrap();
+        std::fs::remove_dir(root.join("one")).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 }
