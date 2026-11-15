@@ -366,3 +366,104 @@ fn publish_package(
 ) -> Result<(), String> {
     Err("package export is only supported on Windows".into())
 }
+
+// 2026-11-14: 디렉터리와 같은 manifest를 사용하고 완성된 ZIP만 새 이름에 연결한다.
+pub fn export_zip(
+    input: &PackageInput,
+    destination: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    export_zip_with_nonce(input, destination, nonce)
+}
+
+fn export_zip_with_nonce(
+    input: &PackageInput,
+    destination: &std::path::Path,
+    nonce: u128,
+) -> Result<serde_json::Value, String> {
+    use std::io::Write;
+    let parent = destination.parent().ok_or("destination needs parent")?;
+    let name = destination
+        .file_name()
+        .ok_or("invalid destination")?
+        .to_string_lossy();
+    let scratch = parent.join(format!(".{name}.{}.{}.files", std::process::id(), nonce));
+    let tmp = parent.join(format!(".{name}.{}.{}.zip", std::process::id(), nonce));
+    let manifest = export_package(input, &scratch)?;
+    let mut owns_tmp = false;
+    let result = (|| -> Result<(), String> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        owns_tmp = true;
+        let mut zip = zip::ZipWriter::new(file);
+        for name in [
+            "README.ko.md",
+            "SPEC.ko.md",
+            "TASKS.md",
+            "CONSTRAINTS.md",
+            "VERIFICATION.md",
+            "manifest.json",
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&std::fs::read(scratch.join(name)).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        }
+        zip.finish()
+            .map_err(|e| e.to_string())?
+            .sync_all()
+            .map_err(|e| e.to_string())?;
+        std::fs::hard_link(&tmp, destination).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    // 2026-11-15: 생성에 실패한 임시 파일은 이 실행의 소유가 아니므로 삭제하지 않는다.
+    if owns_tmp {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    result?;
+    Ok(manifest)
+}
+
+#[cfg(all(test, windows))]
+mod zip_tests {
+    use super::*;
+
+    #[test]
+    fn failed_temporary_file_creation_does_not_delete_an_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-zip-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dest = root.join("bundle.zip");
+        let collision = root.join(format!(".bundle.zip.{}.42.zip", std::process::id()));
+        std::fs::write(&collision, "sentinel").unwrap();
+        let input = PackageInput {
+            completed_id: "approved".into(),
+            readme: "r".into(),
+            spec: "s".into(),
+            tasks: "t".into(),
+            constraints: "c".into(),
+            verification: "v".into(),
+            completeness: "complete".into(),
+            test_status: "passed".into(),
+        };
+        assert!(export_zip_with_nonce(&input, &dest, 42).is_err());
+        assert_eq!(std::fs::read_to_string(&collision).unwrap(), "sentinel");
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_file(collision).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+}
