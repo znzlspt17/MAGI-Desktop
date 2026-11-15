@@ -176,3 +176,34 @@ pub(crate) fn search_vector(
         serde_json::json!({"mode":"semantic","results":results}),
     ))
 }
+
+// 2026-11-16: 원문 출처에서만 관계를 만들고 단일 응답 상한 초과는 페이지 조회로 명시한다.
+pub(crate) fn graph(
+    db: &Database,
+    project_id: &str,
+    page: Option<(usize, usize)>,
+) -> Result<ResponseData, String> {
+    let index = read(db, project_id)?;
+    let (offset, limit) = page.unwrap_or((0, 100));
+    if page.is_none() && !index.graph(100, 1).is_empty() {
+        return Err("graph exceeds one page; use GetGraphPage".into());
+    }
+    let edges = index.graph(offset, limit);
+    let mut nodes = Vec::new();
+    for edge in &edges {
+        nodes.push(serde_json::json!({"id":edge.source,"kind":"source"}));
+        nodes.push(serde_json::json!({"id":edge.document_id,"kind":"document","version":edge.document_version}));
+    }
+    // 2026-11-16: 출처와 문서의 ID가 같아도 동일 노드가 인접해야 중복 제거가 정확하다.
+    nodes.sort_by(|a, b| {
+        (a["id"].as_str(), a["kind"].as_str(), a["version"].as_u64()).cmp(&(
+            b["id"].as_str(),
+            b["kind"].as_str(),
+            b["version"].as_u64(),
+        ))
+    });
+    nodes.dedup();
+    Ok(ResponseData::Data(
+        serde_json::json!({"nodes":nodes,"edges":edges}),
+    ))
+}
