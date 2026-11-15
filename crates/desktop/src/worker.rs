@@ -7,16 +7,64 @@ use std::sync::{
 };
 
 pub enum Kind {
+    HistoryPage {
+        project_id: String,
+        request: u64,
+        offset: usize,
+    },
+    HistoryDetail {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
+    HistoryEvents {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
+    SaveDraft {
+        project_id: String,
+        base_hash: String,
+        context: u64,
+        generation: u64,
+    },
+    ApproveDraft {
+        project_id: String,
+        context: u64,
+        generation: u64,
+    },
     Storage,
-    RetrySave { run_id: String },
+    RetrySave {
+        run_id: String,
+    },
     Starting,
     Status,
     List,
-    Get { generation: u64 },
-    Interview { project_id: String, message: String },
-    GenerateSpec { project_id: String },
-    SpecRun { project_id: String, run_id: String },
-    Create { name: String, path: String },
+    Get {
+        generation: u64,
+    },
+    Interview {
+        project_id: String,
+        message: String,
+    },
+    GenerateSpec {
+        project_id: String,
+    },
+    SpecRun {
+        project_id: String,
+        run_id: String,
+    },
+    ModelSettings {
+        project_id: String,
+        submitted: crate::model_settings::Form,
+    },
+    Credential {
+        project_id: String,
+    },
+    Create {
+        name: String,
+        path: String,
+    },
 }
 
 pub struct Work {

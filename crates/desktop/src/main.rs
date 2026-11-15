@@ -4,6 +4,9 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod model_settings;
+mod run_history;
+mod spec_review;
 mod storage;
 mod worker;
 
@@ -28,7 +31,16 @@ struct State {
     spec_runs: std::collections::HashMap<String, String>,
     spec_starting: std::collections::HashSet<String>,
     spec_notices: std::collections::HashMap<String, String>,
+    model_forms: std::collections::HashMap<String, model_settings::Form>,
+    model_baselines: std::collections::HashMap<String, model_settings::Form>,
+    model_pending: std::collections::HashSet<String>,
+    credential_forms: std::collections::HashMap<String, model_settings::CredentialForm>,
+    credential_pending: std::collections::HashSet<String>,
     spec_poll_at: std::collections::HashMap<String, std::time::Instant>,
+    spec_forms: std::collections::HashMap<String, spec_review::Form>,
+    spec_review_pending: std::collections::HashSet<String>,
+    spec_submitted: std::collections::HashMap<String, domain::SpecDraft>,
+    history: run_history::History,
 }
 
 impl State {
@@ -39,6 +51,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.history.project(id);
         self.selected = Some(id.to_owned());
         self.project = None;
         self.generation = self.generation.wrapping_add(1);
@@ -388,6 +401,217 @@ impl App {
                     }
                 }
             }
+            Kind::ModelSettings {
+                project_id,
+                submitted,
+            } => {
+                self.state.model_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project)) if project.id == project_id => {
+                        if self.state.project.as_ref().is_some_and(|current| {
+                            current.id == project_id
+                                && current.context_version > project.context_version
+                        }) {
+                            return;
+                        }
+                        if self.state.model_forms.get(&project_id) == Some(&submitted) {
+                            self.state.model_forms.insert(
+                                project_id.clone(),
+                                model_settings::Form::from_project(&project),
+                            );
+                        }
+                        if self.state.selected.as_deref() == Some(&project_id) {
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.project = Some(project);
+                            self.state.status = "모델 설정을 저장했습니다.".into();
+                        }
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("모델 설정 저장 실패: {error}")
+                    }
+                    _ if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = "모델 설정 응답이 올바르지 않습니다".into()
+                    }
+                    _ => {}
+                }
+            }
+            Kind::Credential { project_id } => {
+                self.state.credential_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Empty) => {
+                        self.state.credential_forms.remove(&project_id);
+                        if self.state.selected.as_deref() == Some(&project_id) {
+                            self.state.status = "런타임 키를 설정했습니다.".into();
+                        }
+                    }
+                    _ if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = "런타임 키 설정에 실패했습니다.".into()
+                    }
+                    _ => {}
+                }
+            }
+            Kind::SaveDraft {
+                project_id,
+                base_hash,
+                context,
+                generation,
+            } => {
+                self.state.spec_review_pending.remove(&project_id);
+                let submitted = self.state.spec_submitted.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project))
+                        if project.id == project_id
+                            && self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                            && self.state.project.as_ref().is_some_and(|p| {
+                                p.draft_hash == base_hash && p.context_version == context
+                            }) =>
+                    {
+                        if submitted.as_ref().is_some_and(|d| {
+                            serde_json::to_value(d).ok()
+                                == serde_json::to_value(&project.draft).ok()
+                        }) {
+                            if let Some(form) = self.state.spec_forms.get_mut(&project_id) {
+                                form.acknowledge_saved(&project.draft);
+                            }
+                        }
+                        self.state.generation = self.state.generation.wrapping_add(1);
+                        self.state.project = Some(project);
+                        self.state.status =
+                            "명세 초안을 저장했습니다. 승인이 해제되었습니다.".into();
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("명세 저장 실패: {error}")
+                    }
+                    Ok(_) if self.state.selected.as_deref() == Some(&project_id) => self.state.status = "명세 상태가 변경되어 저장 결과를 적용하지 않았습니다. 프로젝트를 다시 확인하세요.".into(),
+                    _ => {}
+                }
+            }
+            Kind::ApproveDraft {
+                project_id,
+                context,
+                generation,
+            } => {
+                self.state.spec_review_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Approved(approved))
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation =>
+                    {
+                        if let Some(project) = self.state.project.as_mut().filter(|p| {
+                            p.id == project_id
+                                && p.draft_hash == approved.hash
+                                && p.context_version == context
+                                && p.approval_version < approved.version
+                        }) {
+                            project.approval_version = approved.version;
+                            project.approval_history.push(approved.clone());
+                            project.approved = Some(approved);
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.status = "저장된 명세를 승인했습니다.".into();
+                        }
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("명세 승인 실패: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            Kind::HistoryPage {
+                project_id,
+                request,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["offset"].as_u64() == Some(offset as u64)
+                                && data["limit"].as_u64()
+                                    == Some(run_history::PAGE_SIZE as u64)
+                                && data["total"].as_u64().is_some()
+                                && data["runs"].as_array().is_some_and(|runs| {
+                                    runs.len() <= run_history::PAGE_SIZE
+                                        && runs.iter().all(|run| {
+                                            run["project_id"] == project_id
+                                                && run["id"].as_str().is_some()
+                                                && run["status"].as_str().is_some()
+                                        })
+                                }) =>
+                        {
+                            self.state.history.runs = data["runs"].as_array().unwrap().clone();
+                            self.state.history.offset = offset;
+                            self.state.history.total = data["total"].as_u64().unwrap() as usize;
+                            self.state.history.loaded = true;
+                            self.state.history.error = None;
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 기록 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 기록 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryDetail {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["id"] == run_id
+                                && data["project_id"] == project_id
+                                && data["status"].as_str().is_some() =>
+                        {
+                            self.state.history.detail = Some(data);
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 상태 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 상태 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryEvents {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Events(events))
+                            if events.iter().all(|event| event.run_id == run_id) =>
+                        {
+                            self.state.history.events = events;
+                        }
+                        Err(error) => {
+                            self.state.history.error =
+                                Some(format!("실행 이벤트 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 이벤트 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -553,6 +777,55 @@ impl App {
                     if let Some(project) = self.state.project.clone() {
                         ui.heading(&project.name);
                         ui.label(&project.path);
+                        self.state.history.project(&project.id);
+                        if let Some(action) = run_history::render(ui, &self.state.history) {
+                            match action {
+                                run_history::Action::Page(offset) => {
+                                    let request = self.state.history.request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::HistoryPage {
+                                            project_id: project.id.clone(),
+                                            request,
+                                            offset,
+                                        },
+                                        Command::ListRuns {
+                                            project_id: project.id.clone(),
+                                            offset,
+                                            limit: run_history::PAGE_SIZE,
+                                        },
+                                    )) {
+                                        self.state.history.request = request;
+                                    }
+                                }
+                                run_history::Action::Select(run_id) => {
+                                    self.state.history.selected = Some(run_id.clone());
+                                    self.state.history.detail = None;
+                                    self.state.history.events.clear();
+                                    self.state.history.error = None;
+                                    self.state.history.selection_request =
+                                        self.state.history.selection_request.wrapping_add(1);
+                                    let request = self.state.history.selection_request;
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryDetail {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::GetRun {
+                                            run_id: run_id.clone(),
+                                        },
+                                    ));
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryEvents {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::ListEvents { run_id, after: 0 },
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(notice) = self.state.spec_notices.get(&project.id) {
                             ui.label(notice);
                         }
@@ -568,17 +841,16 @@ impl App {
                                 egui::Button::new("명세 초안 생성"),
                             )
                             .clicked()
-                        {
-                            if self.send(worker::Work::new(
+                            && self.send(worker::Work::new(
                                 worker::Kind::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
                                 Command::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
-                            )) {
-                                self.state.spec_starting.insert(project.id.clone());
-                            }
+                            ))
+                        {
+                            self.state.spec_starting.insert(project.id.clone());
                         }
                         ui.heading("인터뷰");
                         egui::ScrollArea::vertical()
@@ -619,7 +891,102 @@ impl App {
                             }
                         }
                         ui.label("답변을 저장하면 기존 명세 승인이 해제됩니다.");
+                        if let Some(result) = model_settings::render(
+                            ui,
+                            &project,
+                            &mut self.state.model_forms,
+                            &mut self.state.model_baselines,
+                            self.state.model_pending.contains(&project.id),
+                        ) {
+                            match result {
+                                Ok((submitted, command)) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::ModelSettings {
+                                            project_id: project.id.clone(),
+                                            submitted,
+                                        },
+                                        command,
+                                    )) {
+                                        self.state.model_pending.insert(project.id.clone());
+                                    }
+                                }
+                                Err(error) => self.state.status = error,
+                            }
+                        }
+                        if let Some(result) = model_settings::credentials(
+                            ui,
+                            &project,
+                            &mut self.state.credential_forms,
+                            self.state.credential_pending.contains(&project.id),
+                        ) {
+                            match result {
+                                Ok(command) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::Credential {
+                                            project_id: project.id.clone(),
+                                        },
+                                        command,
+                                    )) {
+                                        self.state.credential_pending.insert(project.id.clone());
+                                    }
+                                }
+                                Err(error) => self.state.status = error,
+                            }
+                        }
+
                         ui.heading("명세 초안");
+                        let review_busy = self.state.spec_review_pending.contains(&project.id)
+                            || self.state.interview_pending.contains(&project.id)
+                            || self.state.model_pending.contains(&project.id)
+                            || self.state.spec_starting.contains(&project.id)
+                            || self.state.spec_runs.contains_key(&project.id);
+                        if let Some(action) = spec_review::render(
+                            ui,
+                            &project,
+                            &mut self.state.spec_forms,
+                            review_busy,
+                        ) {
+                            match action {
+                                spec_review::Action::Save(Ok(draft)) => {
+                                    let draft = *draft;
+                                    let submitted = draft.clone();
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::SaveDraft {
+                                            project_id: project.id.clone(),
+                                            base_hash: project.draft_hash.clone(),
+                                            context: project.context_version,
+                                            generation: self.state.generation,
+                                        },
+                                        Command::SaveDraft {
+                                            project_id: project.id.clone(),
+                                            draft,
+                                        },
+                                    )) {
+                                        self.state.spec_review_pending.insert(project.id.clone());
+                                        self.state
+                                            .spec_submitted
+                                            .insert(project.id.clone(), submitted);
+                                    }
+                                }
+                                spec_review::Action::Save(Err(error)) => self.state.status = error,
+                                spec_review::Action::Approve(accepted_optional) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::ApproveDraft {
+                                            project_id: project.id.clone(),
+                                            context: project.context_version,
+                                            generation: self.state.generation,
+                                        },
+                                        Command::ApproveSpec {
+                                            project_id: project.id.clone(),
+                                            expected_draft_hash: project.draft_hash.clone(),
+                                            accepted_optional,
+                                        },
+                                    )) {
+                                        self.state.spec_review_pending.insert(project.id.clone());
+                                    }
+                                }
+                            }
+                        }
                         ui.label(format!("제목: {}", project.draft.title));
                         ui.label(format!("기준 revision: {}", project.draft.base_revision));
                         for (label, values) in [
@@ -2197,6 +2564,1130 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text.contains("일시 오류"))));
+    }
+
+    #[test]
+    fn model_settings_are_visible_for_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.model_settings = Some(domain::ModelSettings {
+            provider: "mock".into(),
+            model: "모델 예시".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(4096),
+            },
+        });
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "모델 설정 저장")));
+        for expected in ["모델 예시", "4096"] {
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == expected)), "{expected}");
+        }
+    }
+
+    #[test]
+    fn model_save_button_sends_explicit_capabilities() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.model_settings = Some(domain::ModelSettings {
+            provider: "mock".into(),
+            model: "model".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(4096),
+            },
+        });
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 800.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "모델 설정 저장" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::ConfigureModel { project_id, provider, model, capabilities } if project_id == "a" && provider == "mock" && model == "model" && capabilities.streaming && !capabilities.tools && capabilities.context_tokens == Some(4096))
+        );
+        app.state.model_pending.clear();
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        assert!(!app.state.model_pending.contains("a"));
+        let out = frame(&mut app, vec![]);
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "model")
+        ));
+    }
+
+    #[test]
+    fn saved_model_response_updates_matching_project_only() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let submitted = app.state.model_forms["a"].clone();
+        app.state.model_pending.insert("a".into());
+        let old = app.state.generation;
+        let mut updated = project("a");
+        updated.context_version = 4;
+        app.apply(worker::Reply {
+            kind: worker::Kind::ModelSettings {
+                project_id: "a".into(),
+                submitted,
+            },
+            result: Ok(ResponseData::Project(updated)),
+        });
+        app.state.receive_project(old, project("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().context_version, 4);
+        assert!(!app.state.model_pending.contains("a"));
+        assert!(app.state.status.contains("저장"));
+    }
+
+    #[test]
+    fn late_model_reply_preserves_newer_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut current = project("a");
+        current.context_version = 5;
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(current),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let submitted = app.state.model_forms["a"].clone();
+        let mut old = project("a");
+        old.context_version = 3;
+        app.apply(worker::Reply {
+            kind: worker::Kind::ModelSettings {
+                project_id: "a".into(),
+                submitted,
+            },
+            result: Ok(ResponseData::Project(old)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().context_version, 5);
+    }
+
+    #[test]
+    fn runtime_credential_entry_is_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "런타임 키 설정")));
+    }
+
+    #[test]
+    fn spec_editor_exposes_save_control() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "초안 저장")
+        ));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "작업 JSON")
+        ));
+    }
+
+    #[test]
+    fn spec_save_sends_current_draft() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "저장할 제목".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "초안 저장" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::SaveDraft {project_id,draft} if project_id == "a" && draft.title == "저장할 제목")
+        );
+        app.state.spec_review_pending.clear();
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        assert!(!app.state.spec_review_pending.contains("a"));
+        let out = frame(&mut app, vec![]);
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="저장할 제목")
+        ));
+    }
+
+    #[test]
+    fn spec_approval_sends_viewed_draft_identifier() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "제목".into();
+        p.draft.base_revision = "rev".into();
+        p.draft.scope = vec!["src".into()];
+        p.draft.requirements = vec!["요구".into()];
+        p.draft.acceptance = vec!["기준".into()];
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("승인 버튼");
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::ApproveSpec {project_id,expected_draft_hash,..} if project_id == "a" && expected_draft_hash == "h")
+        );
+    }
+
+    #[test]
+    fn approval_is_blocked_while_interview_is_saving() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "제목".into();
+        p.draft.base_revision = "rev".into();
+        p.draft.scope = vec!["src".into()];
+        p.draft.requirements = vec!["요구".into()];
+        p.draft.acceptance = vec!["기준".into()];
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.interview_pending.insert("a".into());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(work.try_recv().is_err());
+    }
+
+    #[test]
+    fn saved_draft_response_updates_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        let old = app.state.generation;
+        let mut saved = project("a");
+        saved.draft_hash = "new".into();
+        saved.draft.title = "저장된 명세".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::SaveDraft {
+                project_id: "a".into(),
+                base_hash: "h".into(),
+                context: 0,
+                generation: old,
+            },
+            result: Ok(ResponseData::Project(saved)),
+        });
+        app.state.receive_project(old, project("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "new");
+        assert!(!app.state.spec_review_pending.contains("a"));
+    }
+
+    #[test]
+    fn late_save_reply_does_not_replace_newer_draft() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut newer = project("a");
+        newer.draft_hash = "newer".into();
+        newer.draft.title = "새 버전".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(newer),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let mut older = project("a");
+        older.draft_hash = "saved-old".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::SaveDraft {
+                project_id: "a".into(),
+                base_hash: "h".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Project(older)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "newer");
+        assert!(app.state.status.contains("다시 확인"));
+    }
+
+    #[test]
+    fn approved_response_marks_reviewed_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        let approved: domain::ApprovedSpec=serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap();
+        app.apply(worker::Reply {
+            kind: worker::Kind::ApproveDraft {
+                project_id: "a".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Approved(approved)),
+        });
+        assert!(app.state.project.as_ref().unwrap().approved.is_some());
+        assert!(!app.state.spec_review_pending.contains("a"));
+    }
+
+    #[test]
+    fn late_approval_does_not_mark_a_newer_draft_approved() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut newer = project("a");
+        newer.draft_hash = "new".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(newer),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let approved:domain::ApprovedSpec=serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap();
+        app.apply(worker::Reply {
+            kind: worker::Kind::ApproveDraft {
+                project_id: "a".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Approved(approved)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "new");
+        assert!(app.state.project.as_ref().unwrap().approved.is_none());
+    }
+
+    #[test]
+    fn run_history_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록 조회")));
+    }
+
+    #[test]
+    fn history_button_requests_selected_project_page() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "실행 기록 조회" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let first = work.try_recv().unwrap();
+        assert!(
+            matches!(first.command,Command::ListRuns{project_id,offset:0,limit:20} if project_id=="a")
+        );
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        app.apply(worker::Reply{kind:first.kind,result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"kept","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        assert_eq!(app.state.history.runs[0]["id"], "kept");
+    }
+
+    #[test]
+    fn history_page_displays_runs_for_current_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"completed","persistence":null}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1"))));
+    }
+
+    #[test]
+    fn history_next_page_requests_next_offset() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":41,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "다음 페이지" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("다음 페이지");
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListRuns{project_id,offset:20,limit:20} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn selecting_run_requests_detail_and_events() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="run-1")
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListEvents{run_id,after:0} if run_id=="run-1")
+        );
+    }
+
+    #[test]
+    fn selected_run_shows_events_and_unsaved_completion() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let request = app.state.history.selection_request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryDetail{project_id:"a".into(),run_id:"r".into(),request},result:Ok(ResponseData::Data(serde_json::json!({"id":"r","project_id":"a","status":"completed","persistence":{"state":"pending"}})))});
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "r".into(),
+                request,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "r".into(),
+                attempt: 1,
+                kind: "progress".into(),
+                message: "이벤트 내용".into(),
+            }])),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("결과 저장 대기"))));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("이벤트 내용"))));
+    }
+
+    #[test]
+    fn project_switch_invalidates_old_history_response_even_when_switched_back() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.select("a");
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"old","project_id":"a","status":"completed"}],"total":1,"offset":0,"limit":20}))) });
+        assert!(app.state.history.runs.is_empty());
+    }
+
+    #[test]
+    fn selecting_another_run_clears_prior_error_and_detail() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"new","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        app.state.history.error = Some("기존 오류".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"old","status":"completed"}));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("new") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.error.is_none());
+    }
+
+    #[test]
+    fn late_run_detail_and_events_do_not_replace_current_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("new".into());
+        app.state.history.selection_request = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryDetail {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"old","project_id":"a","status":"completed"}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "old".into(),
+                attempt: 1,
+                kind: "test".into(),
+                message: "old".into(),
+            }])),
+        });
+        assert_eq!(app.state.history.selected.as_deref(), Some("new"));
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.events.is_empty());
+    }
+
+    #[test]
+    fn history_empty_page_and_failure_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":0,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록이 없습니다.")));
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Err("임시 오류".into()),
+        });
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("임시 오류"))));
+    }
+
+    #[test]
+    fn malformed_history_page_is_not_shown_as_valid() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"r","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":99}))) });
+        assert!(app.state.history.runs.is_empty());
+        assert!(app
+            .state
+            .history
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("올바르지"));
     }
 
     #[test]
