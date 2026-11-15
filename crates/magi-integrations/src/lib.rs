@@ -269,3 +269,75 @@ impl DecisionStore {
             .ok_or_else(|| "decision version not found".into())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct PackageInput {
+    pub completed_id: String,
+    pub readme: String,
+    pub spec: String,
+    pub tasks: String,
+    pub constraints: String,
+    pub verification: String,
+    pub completeness: String,
+    pub test_status: String,
+}
+// 2026-11-14: 임시 디렉터리를 완성한 다음 새 경로로 이동하여 부분 결과와 덮어쓰기를 방지한다.
+pub fn export_package(
+    input: &PackageInput,
+    destination: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    if input.completed_id.trim().is_empty() {
+        return Err("approval required".into());
+    }
+    let docs = [
+        ("README.ko.md", &input.readme),
+        ("SPEC.ko.md", &input.spec),
+        ("TASKS.md", &input.tasks),
+        ("CONSTRAINTS.md", &input.constraints),
+        ("VERIFICATION.md", &input.verification),
+    ];
+    if docs.iter().any(|(_, body)| body.len() > 8 * 1024 * 1024) {
+        return Err("package file too large".into());
+    }
+    let hash = |body: &[u8]| format!("{:x}", Sha256::digest(body));
+    let files: Vec<_> = docs.iter().map(|(name, body)| serde_json::json!({"name": name, "size": body.len(), "sha256": hash(body.as_bytes())})).collect();
+    let mut manifest = serde_json::json!({"format_version": 1, "completed_id": input.completed_id, "source_hash": hash(input.spec.as_bytes()), "files": files, "completeness": input.completeness});
+    let identity = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+    manifest["bundle_id"] = hash(&identity).into();
+    manifest["test_status"] = input.test_status.clone().into();
+    let parent = destination.parent().ok_or("destination needs parent")?;
+    let name = destination
+        .file_name()
+        .ok_or("invalid destination")?
+        .to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
+    std::fs::create_dir(&temporary).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        for (name, body) in docs {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temporary.join(name))
+                .map_err(|e| e.to_string())?;
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(
+            temporary.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::rename(&temporary, destination).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+    result?;
+    Ok(manifest)
+}
