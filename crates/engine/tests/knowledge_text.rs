@@ -652,6 +652,38 @@ async fn damaged_vector_checkpoint_is_not_overwritten_by_embedding_update() {
 }
 
 #[tokio::test]
+async fn graph_deduplicates_source_even_when_document_id_matches() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let project_id = fixture.project(&engine, "project");
+    for id in ["x", "y"] {
+        send(
+            &engine,
+            Command::PutKnowledge {
+                project_id: project_id.clone(),
+                document: doc(id, 1, "x", "text"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let graph = data(
+        send(&engine, Command::GetGraph { project_id })
+            .await
+            .unwrap(),
+    );
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node["kind"] == "source" && node["id"] == "x")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn graph_exposes_only_persisted_source_edges_with_stable_pages() {
     let fixture = Fixture::new();
     let engine = fixture.engine();

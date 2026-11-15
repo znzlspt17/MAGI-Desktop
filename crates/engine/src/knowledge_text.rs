@@ -194,7 +194,14 @@ pub(crate) fn graph(
         nodes.push(serde_json::json!({"id":edge.source,"kind":"source"}));
         nodes.push(serde_json::json!({"id":edge.document_id,"kind":"document","version":edge.document_version}));
     }
-    nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    // 2026-11-16: 출처와 문서의 ID가 같아도 동일 노드가 인접해야 중복 제거가 정확하다.
+    nodes.sort_by(|a, b| {
+        (a["id"].as_str(), a["kind"].as_str(), a["version"].as_u64()).cmp(&(
+            b["id"].as_str(),
+            b["kind"].as_str(),
+            b["version"].as_u64(),
+        ))
+    });
     nodes.dedup();
     Ok(ResponseData::Data(
         serde_json::json!({"nodes":nodes,"edges":edges}),
