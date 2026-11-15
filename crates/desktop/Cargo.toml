@@ -1,0 +1,15 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { package = "core", path = "../core" }
+transport = { path = "../transport" }
+eframe = "0.31"
+tokio.workspace = true
+
+[dev-dependencies]
+engine = { path = "../engine" }
+serde_json.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+futures-util = "0.3"
+jsonschema = { version = "0.29", default-features = false }
+domain = { package = "core", path = "../core" }
+serde.workspace = true
+sha2 = "0.10"
