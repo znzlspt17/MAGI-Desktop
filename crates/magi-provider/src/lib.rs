@@ -379,3 +379,115 @@ impl OpenAiProvider {
         Err(protocol())
     }
 }
+
+#[derive(Clone)]
+pub struct OpenAiEmbeddingConfig {
+    pub endpoint: String,
+    pub model: String,
+    pub api_key: String,
+    pub dimensions: usize,
+    pub max_response_bytes: usize,
+}
+impl fmt::Debug for OpenAiEmbeddingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiEmbeddingConfig")
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
+}
+pub struct OpenAiEmbeddingProvider {
+    config: OpenAiEmbeddingConfig,
+    client: reqwest::Client,
+}
+impl OpenAiEmbeddingProvider {
+    // 2026-11-14: 모델과 차원을 명시하여 서로 다른 임베딩 공간이 섞이지 않게 한다.
+    pub fn new(config: OpenAiEmbeddingConfig) -> Result<Self, ProviderError> {
+        validate_endpoint_and_key(&config.endpoint, &config.api_key)?;
+        if config.model.is_empty()
+            || !config
+                .model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            || config.dimensions == 0
+            || config.max_response_bytes == 0
+        {
+            return Err(invalid());
+        }
+        let client = provider_client()?;
+        Ok(Self { config, client })
+    }
+    // 2026-11-14: 응답 인덱스와 차원을 검증한 뒤 입력 순서대로 반환하여 검색 결과 오염을 막는다.
+    pub async fn embed(
+        &self,
+        input: Vec<String>,
+        cancel: CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, ProviderError> {
+        if input.is_empty() || input.iter().any(|s| s.is_empty()) {
+            return Err(invalid());
+        }
+        let count = input.len();
+        let request = self
+            .client
+            .post(&self.config.endpoint)
+            .bearer_auth(&self.config.api_key)
+            .json(&json!({
+                "model": self.config.model,
+                "input": input,
+                "dimensions": self.config.dimensions,
+                "encoding_format": "float",
+            }))
+            .send();
+        let response = tokio::select! {_=cancel.cancelled()=>return Err(ProviderError("Request cancelled")), r=request=>r.map_err(|_|ProviderError("OpenAI request failed"))?};
+        if !response.status().is_success() {
+            return Err(ProviderError("OpenAI returned an HTTP error"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = tokio::select! {_=cancel.cancelled()=>return Err(ProviderError("Request cancelled")),r=stream.next()=>r}
+        {
+            let chunk = chunk.map_err(|_| protocol())?;
+            if bytes
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|n| n > self.config.max_response_bytes)
+            {
+                return Err(ProviderError("OpenAI response exceeded limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let response: Value = serde_json::from_slice(&bytes).map_err(|_| protocol())?;
+        let data = response["data"].as_array().ok_or_else(protocol)?;
+        if data.len() != count {
+            return Err(protocol());
+        }
+        let mut ordered = vec![None; count];
+        for item in data {
+            let index = item["index"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n < count)
+                .ok_or_else(protocol)?;
+            if ordered[index].is_some() {
+                return Err(protocol());
+            }
+            let values = item["embedding"]
+                .as_array()
+                .filter(|v| v.len() == self.config.dimensions)
+                .ok_or_else(protocol)?;
+            let mut vector = Vec::with_capacity(values.len());
+            for value in values {
+                let number = value.as_f64().ok_or_else(protocol)? as f32;
+                if !number.is_finite() {
+                    return Err(protocol());
+                }
+                vector.push(number);
+            }
+            ordered[index] = Some(vector);
+        }
+        ordered
+            .into_iter()
+            .map(|v| v.ok_or_else(protocol))
+            .collect()
+    }
+}
