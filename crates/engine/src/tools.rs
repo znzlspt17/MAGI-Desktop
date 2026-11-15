@@ -489,35 +489,48 @@ async fn run_exec(
             return Err("working directory outside scope".into());
         }
     }
-    let root = checked_root(&context.worktree)?;
-    let mut cwd = root.clone();
-    for component in Path::new(&args.cwd).components() {
-        cwd.push(component);
-        let meta = std::fs::symlink_metadata(&cwd).map_err(|_| "working directory unavailable")?;
-        if meta.file_type().is_symlink() {
-            return Err("links are not allowed".into());
+    // 2026-11-16: 경로 조회와 핸들 고정도 디스크 대기일 수 있으므로 async 실행기를 점유하지 않는다.
+    tokio::task::spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            return Err("cancelled before command start".into());
+        }
+        #[cfg(test)]
+        if context
+            .worktree
+            .to_string_lossy()
+            .contains("magi-exec-preflight-delay-")
+        {
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        let root = checked_root(&context.worktree)?;
+        let mut cwd = root.clone();
+        for component in Path::new(&args.cwd).components() {
+            cwd.push(component);
+            let meta =
+                std::fs::symlink_metadata(&cwd).map_err(|_| "working directory unavailable")?;
+            if meta.file_type().is_symlink() {
+                return Err("links are not allowed".into());
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    return Err("reparse points are not allowed".into());
+                }
+            }
+        }
+        let cwd = cwd
+            .canonicalize()
+            .map_err(|_| "working directory unavailable")?;
+        if !cwd.starts_with(&root) || !cwd.is_dir() {
+            return Err("invalid working directory".into());
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            if meta.file_attributes() & 0x400 != 0 {
-                return Err("reparse points are not allowed".into());
+            let pins = pin_directories(&context.worktree, Path::new(&args.cwd), false)?;
+            if pins.root.join(&args.cwd) != cwd || pins.root != root {
+                return Err("working directory changed".into());
             }
-        }
-    }
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|_| "working directory unavailable")?;
-    if !cwd.starts_with(&root) || !cwd.is_dir() {
-        return Err("invalid working directory".into());
-    }
-    #[cfg(windows)]
-    {
-        let pins = pin_directories(&context.worktree, Path::new(&args.cwd), false)?;
-        if pins.root.join(&args.cwd) != cwd || pins.root != root {
-            return Err("working directory changed".into());
-        }
-        tokio::task::spawn_blocking(move || {
             exec_windows(
                 args,
                 cwd,
@@ -526,15 +539,15 @@ async fn run_exec(
                 cancel,
                 pins,
             )
-        })
-        .await
-        .map_err(|_| "command worker failed".to_owned())?
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (args, cwd, context, cancel);
-        Err("safe command execution unsupported on this platform".into())
-    }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (args, cwd, context, cancel);
+            Err("safe command execution unsupported on this platform".into())
+        }
+    })
+    .await
+    .map_err(|_| "command worker failed".to_owned())?
 }
 
 #[cfg(windows)]
@@ -689,7 +702,18 @@ fn exec_windows(
         }
     }
     environment.push(0);
+    // 2026-11-16: 큐와 경로 준비 중 취소된 명령의 프로세스를 늦게 생성하지 않는다.
+    if cancel.is_cancelled() {
+        return Err("cancelled before command start".into());
+    }
+    #[cfg(test)]
+    if cwd.to_string_lossy().contains("magi-exec-preflight-delay-") {
+        exec_preflight_tests::CREATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let cwd: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+    if cancel.is_cancelled() {
+        return Err("cancelled before command start".into());
+    }
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe {
         CreateProcessW(
@@ -784,4 +808,100 @@ fn exec_windows(
         content: json!({"stdout":stdout,"stderr":stderr}),
         exit_code: Some(code as i32),
     })
+}
+
+#[cfg(all(test, windows))]
+mod exec_preflight_tests {
+    use super::*;
+    use std::time::Instant;
+    pub(super) static CREATIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_preflight_does_not_block_runtime_or_start_cancelled_command() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-exec-preflight-delay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let context = ToolContext {
+            worktree: root.clone(),
+            allowed_paths: vec!["src".into()],
+            owned_paths: vec!["src".into()],
+            allowlist: vec!["exec".into()],
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 4096,
+            side_effect_authorized: true,
+        };
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        let worker = tokio::spawn(execute_tool(
+            context,
+            "exec",
+            json!({
+                "program":std::env::current_exe().unwrap().to_string_lossy(),
+                "args":["--exact", "nonexistent_test"], "cwd":"src"
+            }),
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let elapsed = started.elapsed();
+        cancel.cancel();
+        let result = worker.await.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "runtime stalled for {elapsed:?}"
+        );
+        assert!(result.is_err());
+        assert_eq!(CREATIONS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancellation_while_blocking_pool_is_queued_prevents_command_start() {
+        let root = std::env::temp_dir().join(format!("magi-exec-queue-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let context = ToolContext {
+            worktree: root.clone(),
+            allowed_paths: vec!["src".into()],
+            owned_paths: vec!["src".into()],
+            allowlist: vec!["exec".into()],
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 4096,
+            side_effect_authorized: true,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.block_on(async {
+            let cancel = CancellationToken::new();
+            let worker = tokio::spawn(execute_tool(
+                context,
+                "exec",
+                json!({
+                    "program":std::env::current_exe().unwrap().to_string_lossy(),
+                    "args":["--exact", "nonexistent_test"], "cwd":"src"
+                }),
+                cancel.clone(),
+            ));
+            tokio::task::yield_now().await;
+            cancel.cancel();
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                worker.await.unwrap().unwrap_err(),
+                "cancelled before command start"
+            );
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

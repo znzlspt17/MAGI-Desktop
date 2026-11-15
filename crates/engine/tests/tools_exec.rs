@@ -17,6 +17,7 @@ fn exec_fixture() {
 async fn only_approved_allowed_exec_starts_child() {
     let root = std::env::temp_dir().join(format!("magi-exec-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/enable"), "").unwrap();
     let mut ctx = ToolContext {
         worktree: root.clone(),
@@ -86,6 +87,7 @@ async fn timeout_terminates_process_and_descendant() {
     };
     let root = std::env::temp_dir().join(format!("magi-tools-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/enable"), "").unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
@@ -128,6 +130,7 @@ async fn timeout_terminates_process_and_descendant() {
 async fn rejects_obvious_secret_target_in_command_arguments() {
     let root = std::env::temp_dir().join(format!("magi-tools-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
         allowed_paths: vec!["src".into()],
@@ -157,6 +160,7 @@ async fn cancellation_terminates_process_and_descendant() {
     };
     let root = std::env::temp_dir().join(format!("magi-tools-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/enable"), "").unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
@@ -221,6 +225,7 @@ fn job_environment_helper() {
 async fn command_does_not_inherit_fake_secret_environment() {
     let root = std::env::temp_dir().join(format!("magi-tools-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/enable-env-test"), "").unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
@@ -247,6 +252,7 @@ async fn command_does_not_inherit_fake_secret_environment() {
 async fn rejects_bad_arguments_and_reports_output_limit() {
     let root = std::env::temp_dir().join(format!("magi-exec-limits-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(root.join("src")).unwrap();
+    let root = root.canonicalize().unwrap();
     fs::write(root.join("src/enable"), "").unwrap();
     let ctx = ToolContext {
         worktree: root.clone(),
