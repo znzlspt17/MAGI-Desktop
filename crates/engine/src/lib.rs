@@ -1,6 +1,4 @@
-//! 로컬 프로젝트의 생성 및 조회를 제공한다.
-//!
-//! 실행 복구와 모델 제공자 등 나머지 엔진 기능은 아직 연결되지 않았다.
+//! 로컬 프로젝트와 명세 생성, 실행 결과 저장 및 복구를 제공한다.
 
 pub mod agent_loop;
 mod completion;
@@ -26,8 +24,43 @@ pub struct Engine {
     slots: Arc<std::sync::atomic::AtomicUsize>,
     startup_recovery_pending: std::sync::atomic::AtomicBool,
     completions: Arc<completion::CompletionManager>,
+    cancellations:
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    credentials:
+        std::sync::Mutex<std::collections::HashMap<String, (String, domain::SecretString)>>,
 }
 
+type PreparedGeneration = (
+    String,
+    provider::OpenAiProvider,
+    provider::sdd::SpecInput,
+    tokio_util::sync::CancellationToken,
+    domain::SecretString,
+    u64,
+    Arc<Database>,
+    String,
+);
+// 2026-11-16: 취소 신호와 실제 작업 반환을 분리하고 오류 경로에서도 슬롯을 반환한다.
+struct GenerationLease {
+    engine: Arc<Engine>,
+    run_id: String,
+}
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        self.engine
+            .cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.run_id);
+        self.engine
+            .slots
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+#[cfg(all(test, windows))]
+static GENERATION_HANDOFF_TEST_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 impl Engine {
     pub fn open(path: &Path) -> Result<Self, String> {
         let parent = path
@@ -88,6 +121,8 @@ impl Engine {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(startup_pending),
             completions: Arc::new(completions),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -100,6 +135,7 @@ impl Engine {
                 | Command::SaveDraft { .. }
                 | Command::SubmitInterview { .. }
                 | Command::ConfigureModel { .. }
+                | Command::GenerateSpec { .. }
                 | Command::ConfigureAgents { .. }
                 | Command::SetAutonomy { .. }
                 | Command::ApproveSpec { .. }
@@ -114,6 +150,95 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if let Command::GenerateSpec { project_id } = &request.command {
+            let engine = Arc::clone(&self);
+            let project_id = project_id.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                let _gate = engine
+                    .mutation_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if engine
+                    .startup_recovery_pending
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || engine.completions.blocks_global()
+                    || engine.completions.blocks_project(&project_id)
+                {
+                    return Err("완료 결과 저장을 먼저 복구해야 합니다.".into());
+                }
+                engine.prepare_generation(&project_id)
+            })
+            .await;
+            match prepared {
+                Ok(Ok(Some((run_id, provider, input, token, secret, context, db, project_id)))) => {
+                    let worker_id = run_id.clone();
+                    let engine = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        let _lease = GenerationLease {
+                            engine: Arc::clone(&engine),
+                            run_id: worker_id.clone(),
+                        };
+                        let (events, mut rx) = tokio::sync::mpsc::channel(32);
+                        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                        let result = provider::sdd::generate_spec_with_context(
+                            &provider,
+                            input,
+                            token,
+                            events,
+                            context,
+                            provider::DEFAULT_MAX_OUTPUT_TOKENS,
+                        )
+                        .await
+                        .map_err(|_| "provider failed".to_owned())
+                        .and_then(|report| {
+                            let json = serde_json::to_string(&report)
+                                .map_err(|_| "invalid provider output")?;
+                            if json.contains(&secret.0) {
+                                return Err("provider output rejected".into());
+                            }
+                            Ok(report)
+                        });
+                        save_generation_result(
+                            Arc::clone(&engine.completions),
+                            db,
+                            worker_id,
+                            project_id,
+                            result,
+                            |manager, db, record| {
+                                #[cfg(test)]
+                                if GENERATION_HANDOFF_TEST_FAILURES
+                                    .lock()
+                                    .unwrap()
+                                    .remove(record["run_id"].as_str().unwrap())
+                                {
+                                    panic!("fake handoff failure");
+                                }
+                                manager.register_generation_record(db, record)
+                            },
+                        )
+                        .await;
+                        let _ = drain.await;
+                    });
+                    return Response {
+                        id: request_id,
+                        result: Ok(ResponseData::Run { run_id }),
+                    };
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    return Response {
+                        id: request_id,
+                        result: Err(error),
+                    }
+                }
+                Err(_) => {
+                    return Response {
+                        id: request_id,
+                        result: Err("engine worker failed".into()),
+                    }
+                }
+            }
+        }
         tokio::task::spawn_blocking(move || self.handle(request))
             .await
             .unwrap_or_else(|_| Response {
@@ -122,6 +247,141 @@ impl Engine {
             })
     }
 
+    fn prepare_generation(&self, project_id: &str) -> Result<Option<PreparedGeneration>, String> {
+        let db = self.db.get().ok_or("storage unavailable")?;
+        let p: Project = {
+            let tx = db.begin_read().map_err(err)?;
+            let table = tx.open_table(PROJECTS).map_err(err)?;
+            let value = table
+                .get(project_id)
+                .map_err(err)?
+                .ok_or("project not found")?;
+            serde_json::from_str(value.value()).map_err(err)?
+        };
+        let settings = p.model_settings.as_ref().ok_or("configure a model first")?;
+        if settings.provider != "openai" {
+            return Ok(None);
+        }
+        if !settings.capabilities.streaming {
+            return Err("selected model does not declare streaming capability".into());
+        }
+        let estimated = (serde_json::to_vec(&(&p.interview, &p.draft))
+            .map_err(err)?
+            .len() as u64)
+            .saturating_add(2048)
+            .saturating_add(provider::DEFAULT_MAX_OUTPUT_TOKENS);
+        if settings
+            .capabilities
+            .context_tokens
+            .is_some_and(|limit| limit < estimated)
+        {
+            return Err("configured model context is too small".into());
+        }
+        if p.interview.is_empty()
+            || p.draft.base_revision.trim().is_empty()
+            || p.draft.acceptance.is_empty()
+        {
+            return Err("interview, base revision and acceptance rubric are required".into());
+        }
+        let (endpoint, secret) = self
+            .credentials
+            .lock()
+            .map_err(|_| "credential storage unavailable")?
+            .get(project_id)
+            .cloned()
+            .ok_or("runtime credential required")?;
+        let provider = provider::OpenAiProvider::new(provider::OpenAiConfig {
+            endpoint,
+            model: settings.model.clone(),
+            api_key: secret.0.clone(),
+            max_output_bytes: 2 * 1024 * 1024,
+        })
+        .map_err(|_| "invalid provider configuration")?;
+        // 2026-11-15: 평가 항목은 직렬화 왕복 없이 실제 계약 필드로 생성한다.
+        let rubric = p
+            .draft
+            .acceptance
+            .iter()
+            .enumerate()
+            .map(|(index, requirement)| provider::sdd::RubricItem {
+                id: format!("criterion-{index}"),
+                requirement_id: format!("requirement-{index}"),
+                requirement: requirement.clone(),
+                importance: "critical".into(),
+                allowed_sections: [
+                    "## 7. 필수 요구사항",
+                    "## 20. 수용 기준",
+                    "### 4.1 범위 포함",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            })
+            .collect();
+        // 2026-11-14: 편집된 평가본을 사용자 근거로 전달해 재평가가 변경 내용을 놓치지 않게 한다.
+        let mut answers = p.interview[1..].to_vec();
+        if p.assessment
+            .as_ref()
+            .is_some_and(|a| a.draft_hash != p.draft_hash || a.context_version != p.context_version)
+        {
+            answers.push(format!(
+                "사용자가 편집한 명세 초안: {}",
+                serde_json::to_string(&p.draft).map_err(err)?
+            ));
+        }
+        let input = provider::sdd::SpecInput {
+            request: p.interview[0].clone(),
+            answers,
+            decisions: p.draft.reused_decisions.clone(),
+            base_revision: p.draft.base_revision.clone(),
+            rubric,
+            max_revisions: 2,
+        };
+        self.slots
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| if n < 4 { Some(n + 1) } else { None },
+            )
+            .map_err(|_| "run capacity reached")?;
+        // 2026-11-16: Run이 조회 가능해지기 전에 토큰을 등록해 취소 누락을 막는다.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.clone(), token.clone());
+        if let Err(error) = runs::begin_generation(
+            db.as_ref(),
+            &run_id,
+            project_id,
+            &p.draft_hash,
+            p.context_version,
+        ) {
+            self.cancellations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&run_id);
+            self.slots.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(Some((
+            run_id,
+            provider,
+            input,
+            token,
+            secret,
+            settings.capabilities.context_tokens.unwrap_or(u64::MAX),
+            db,
+            project_id.to_owned(),
+        )))
+    }
+    fn generation_active(&self, run_id: &str) -> bool {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(run_id)
+    }
     fn execute(&self, command: Command) -> Result<ResponseData, String> {
         let read_or_control = matches!(
             &command,
@@ -140,6 +400,7 @@ impl Engine {
             | Command::SaveDraft { project_id, .. }
             | Command::SubmitInterview { project_id, .. }
             | Command::ConfigureModel { project_id, .. }
+            | Command::GenerateSpec { project_id }
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. } => Some(project_id),
@@ -191,7 +452,7 @@ impl Engine {
                 let mut state = if let Some(db) = self.db.get() {
                     if validate_existing_schema(&db).is_ok() {self.completions.retry(&db,&run_id)?} else {"pending"}
                 } else {"pending"};
-                if state == "pending" && self.completions.for_run(&run_id)["stage"] == "worktree" {
+                if state == "pending" && matches!(self.completions.for_run(&run_id)["stage"].as_str(), Some("worktree" | "generation")) {
                     match self.db.reopen_when_idle() {
                         Ok(db) => {
                             if validate_existing_schema(&db).is_ok() {state=self.completions.retry(&db,&run_id)?;} else {self.completions.note_reopen_issue(&run_id,false);}
@@ -208,6 +469,8 @@ impl Engine {
                 Ok(ResponseData::Data(serde_json::json!({"state":state})))
             }
             Command::CancelRun { run_id } => {
+                // 2026-11-16: 저장 실패가 진행 중인 모델 작업의 취소 전달을 막지 않게 한다.
+                if let Some(token) = self.cancellations.lock().unwrap_or_else(|e| e.into_inner()).get(&run_id) { token.cancel(); }
                 let db = self.db.get().ok_or("storage unavailable")?;
                 runs::cancel(&db, &run_id)?;
                 Ok(ResponseData::Empty)
@@ -234,7 +497,7 @@ impl Engine {
                 if let Some(entries) = page["runs"].as_array_mut() {
                     for run in entries {
                         if let Some(id) = run["id"].as_str().map(str::to_owned) {
-                            run["resources_released"] = resources_released(run)?.into();
+                            run["resources_released"] = (resources_released(run)? && !self.generation_active(&id)).into();
                             run["persistence"] = self.completions.for_run(&id);
                         }
                     }
@@ -244,7 +507,7 @@ impl Engine {
             Command::GetRun { run_id } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 let mut run = runs::get(&db, &run_id)?;
-                let released = resources_released(&run)?;
+                let released = resources_released(&run)? && !self.generation_active(&run_id);
                 let object = run.as_object_mut().ok_or("invalid run")?;
                 object.insert("resources_released".into(), released.into());
                 object.remove("events");
@@ -256,7 +519,7 @@ impl Engine {
                 message: if self.completions.blocked() {
                     "engine storage recovery pending"
                 } else {
-                    "engine ready; worktree preparation and storage recovery available; generation and models unavailable"
+                    "engine ready; worktree preparation, spec generation and storage recovery available; agents and local inference unavailable"
                 }.into(),
             }),
             Command::CreateProject { name, path } => {
@@ -333,6 +596,14 @@ impl Engine {
                 )?;
                 Ok(ResponseData::Run { run_id })
             }
+            // 2026-11-16: 연결 자격은 영속 상태와 journal에 넣지 않고 프로세스 메모리에만 둔다.
+            Command::SetProviderCredential {project_id,endpoint,credential} => {
+                let db=self.db.get().ok_or("storage unavailable")?;let tx=db.begin_read().map_err(err)?;let table=tx.open_table(PROJECTS).map_err(err)?;
+                if table.get(project_id.as_str()).map_err(err)?.is_none(){return Err("project not found".into());}
+                if endpoint.trim().is_empty() || credential.0.trim().is_empty(){return Err("provider configuration incomplete".into());}
+                self.credentials.lock().map_err(|_|"credential storage unavailable")?.insert(project_id,(endpoint,credential));
+                Ok(ResponseData::Empty)
+            }
             // 2026-11-16: 실제 실행은 연결하지 않고 역할별 설정 계약과 기존 승인 근거를 보존한다.
             Command::ConfigureAgents { project_id, agents } => self.update(&project_id, |p| {
                 let roles = ["coordinator", "implementer", "reviewer"];
@@ -389,7 +660,15 @@ impl Engine {
                 project.context_version = next_context;
                 Ok(ResponseData::Project(project.clone()))
             }),
-            Command::SubmitInterview {
+            // 2026-11-16: mock은 사용자가 입력한 내용을 명시적 미완성 초안으로만 돌려준다.
+            Command::GenerateSpec { project_id } => self.update(&project_id, |project| {
+                let settings=project.model_settings.as_ref().ok_or("configure a model first")?;
+                if settings.provider!="mock" {return Err("selected provider is not available".into());}
+                if project.interview.is_empty(){return Err("interview is empty".into());}
+                let draft=SpecDraft {title:format!("[Mock 초안] {}",project.name),requirements:project.interview.clone(),mandatory_questions:vec!["범위와 수용 기준, 기준 Git revision을 확인하세요.".into()],..Default::default()};
+                project.draft_hash=draft_hash(&draft)?;project.draft=draft;project.approved=None;
+                Ok(ResponseData::Project(project.clone()))
+            }),            Command::SubmitInterview {
                 project_id,
                 message,
             } => self.update(&project_id, |project| {
@@ -532,6 +811,31 @@ impl Engine {
     }
 }
 
+// 2026-11-16: 완료 payload는 저장 작업자 외부에도 보존해 JoinError 때 같은 ID로 재시도한다.
+#[cfg(windows)]
+async fn save_generation_result<F>(
+    manager: Arc<completion::CompletionManager>,
+    db: Arc<Database>,
+    run_id: String,
+    project_id: String,
+    result: Result<provider::sdd::SpecResult, String>,
+    save: F,
+) where
+    F: FnOnce(&completion::CompletionManager, &Database, serde_json::Value) + Send + 'static,
+{
+    let record = completion::CompletionManager::generation_record(&run_id, &project_id, result);
+    let worker_record = record.clone();
+    let worker_manager = Arc::clone(&manager);
+    if tokio::task::spawn_blocking(move || save(&worker_manager, &db, worker_record))
+        .await
+        .is_err()
+        && tokio::task::spawn_blocking(move || manager.preserve_failed_handoff(record))
+            .await
+            .is_err()
+    {
+        eprintln!("명세 완료 결과의 저장 진단 작업이 중단되었습니다.");
+    }
+}
 fn draft_hash(draft: &SpecDraft) -> Result<String, String> {
     Ok(format!(
         "{:x}",

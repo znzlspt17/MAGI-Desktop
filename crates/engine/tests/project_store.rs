@@ -203,7 +203,7 @@ async fn projects_keep_original_contract_and_survive_reopening() {
         call(
             &engine,
             "unsupported",
-            Command::GenerateSpec {
+            Command::ListHistory {
                 project_id: first.id.clone()
             }
         )

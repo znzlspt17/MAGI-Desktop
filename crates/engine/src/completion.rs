@@ -1,5 +1,5 @@
 // 2026-11-15: 지원하지 않는 journal stage를 건너뛰지 않도록 복구 전에 구별한다.
-fn parse_worktree_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
+fn parse_completion_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("journal exceeds limit".into());
     }
@@ -15,27 +15,36 @@ fn parse_worktree_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
     {
         return Err("invalid completion journal".into());
     }
-    if record.pointer("/outcome/stage").and_then(|v| v.as_str()) != Some("worktree") {
-        return Err("unsupported completion journal".into());
-    }
     let result = record
         .pointer("/outcome/result")
         .cloned()
         .ok_or("invalid completion journal")?;
-    let _: Result<(), String> =
-        serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+    match record
+        .pointer("/outcome/stage")
+        .and_then(|value| value.as_str())
+    {
+        Some("worktree") => {
+            let _: Result<(), String> =
+                serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+        }
+        Some("generation") => {
+            let _: Result<provider::sdd::SpecResult, String> =
+                serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+        }
+        _ => return Err("unsupported completion journal".into()),
+    }
     Ok(record)
 }
 
 #[cfg(windows)]
-fn publish_worktree_record(
+fn publish_completion_record(
     directory: &std::path::Path,
     record: &serde_json::Value,
 ) -> Result<std::path::PathBuf, String> {
     use std::{io::Write, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
     let bytes = serde_json::to_vec(record).map_err(|_| "journal encoding failed")?;
-    let verified = parse_worktree_record(&bytes)?;
+    let verified = parse_completion_record(&bytes)?;
     let run_id = verified["run_id"]
         .as_str()
         .ok_or("invalid completion journal")?;
@@ -69,7 +78,7 @@ fn publish_worktree_record(
     Ok(target)
 }
 #[cfg(windows)]
-fn read_worktree_record(path: &std::path::Path) -> Result<serde_json::Value, String> {
+fn read_completion_record(path: &std::path::Path) -> Result<serde_json::Value, String> {
     use std::{
         io::Read,
         os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
@@ -97,7 +106,7 @@ fn read_worktree_record(path: &std::path::Path) -> Result<serde_json::Value, Str
     file.take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "journal unavailable")?;
-    parse_worktree_record(&bytes)
+    parse_completion_record(&bytes)
 }
 
 pub(crate) struct CompletionManager {
@@ -131,7 +140,7 @@ impl CompletionManager {
             } else {
                 uuid::Uuid::new_v4().to_string()
             };
-            let record = read_worktree_record(&path);
+            let record = read_completion_record(&path);
             let known = record
                 .as_ref()
                 .is_ok_and(|record| valid_id && record["run_id"].as_str() == Some(id.as_str()));
@@ -148,7 +157,7 @@ impl CompletionManager {
             pending.push(serde_json::json!({
                 "run_id": id,
                 "project_id": project_id,
-                "stage": if known { "worktree" } else { "unknown" },
+                "stage": if known { record.as_ref().ok().and_then(|item|item.pointer("/outcome/stage")).and_then(|value|value.as_str()).unwrap_or("unknown") } else { "unknown" },
                 "state": "pending",
                 "attempts": 0,
                 "journaled": known,
@@ -188,14 +197,81 @@ impl CompletionManager {
         project_id: &str,
         result: Result<(), String>,
     ) {
-        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":result}});
+        self.register_outcome(
+            db,
+            run_id,
+            project_id,
+            "worktree",
+            serde_json::json!(result),
+        );
+    }
+
+    // 2026-11-16: 완료 ID와 결과를 handoff 전에 고정해 작업자 반환 오류에도 재사용한다.
+    #[cfg(windows)]
+    pub(crate) fn generation_record(
+        run_id: &str,
+        project_id: &str,
+        result: Result<provider::sdd::SpecResult, String>,
+    ) -> serde_json::Value {
+        serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"generation","result":result}})
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn register_generation(
+        &self,
+        db: &redb::Database,
+        run_id: &str,
+        project_id: &str,
+        result: Result<provider::sdd::SpecResult, String>,
+    ) {
+        self.register_generation_record(db, Self::generation_record(run_id, project_id, result));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn register_generation_record(
+        &self,
+        db: &redb::Database,
+        record: serde_json::Value,
+    ) {
+        self.register_record(db, record);
+    }
+
+    #[cfg(windows)]
+    fn register_outcome(
+        &self,
+        db: &redb::Database,
+        run_id: &str,
+        project_id: &str,
+        stage: &str,
+        result: serde_json::Value,
+    ) {
+        self.register_record(db, serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":stage,"result":result}}));
+    }
+
+    #[cfg(windows)]
+    fn register_record(&self, db: &redb::Database, record: serde_json::Value) {
+        let run_id = record["run_id"]
+            .as_str()
+            .expect("validated run id")
+            .to_owned();
+        let project_id = record["project_id"]
+            .as_str()
+            .expect("validated project id")
+            .to_owned();
+        let stage = record["outcome"]["stage"]
+            .as_str()
+            .expect("validated stage")
+            .to_owned();
+        let run_id = run_id.as_str();
+        let project_id = project_id.as_str();
+        let stage = stage.as_str();
         {
             let _gate = self.mutation_gate.lock().unwrap_or_else(|e| e.into_inner());
             let mut entries = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             entries.push(serde_json::json!({
                 "run_id": run_id,
                 "project_id": project_id,
-                "stage": "worktree",
+                "stage": stage,
                 "state": "retrying",
                 "attempts": 0,
                 "journaled": false,
@@ -204,7 +280,7 @@ impl CompletionManager {
             }));
         }
         if let Some(dir) = &self.directory {
-            if let Ok(path) = publish_worktree_record(dir, &record) {
+            if let Ok(path) = publish_completion_record(dir, &record) {
                 if let Some(item) = self
                     .pending
                     .lock()
@@ -248,12 +324,12 @@ impl CompletionManager {
             }
         }
         if !self.for_run(run_id).is_null() {
-            self.log_event(run_id, "storage_pending");
+            self.log_event(run_id, stage, "storage_pending");
         }
     }
     // 2026-11-15: DB와 별도로 제한된 진단을 유지하며 로그 실패도 메모리에 표시한다.
     #[cfg(windows)]
-    fn log_event(&self, run_id: &str, action: &str) {
+    fn log_event(&self, run_id: &str, stage: &str, action: &str) {
         use std::{
             io::Write,
             os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
@@ -265,7 +341,7 @@ impl CompletionManager {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
-        let entry = serde_json::json!({"version":1,"timestamp_ms":timestamp,"run_id":run_id,"stage":"worktree","event":action});
+        let entry = serde_json::json!({"version":1,"timestamp_ms":timestamp,"run_id":run_id,"stage":stage,"event":action});
         {
             let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
             if logs.len() == 256 {
@@ -423,11 +499,6 @@ impl CompletionManager {
             {
                 continue;
             }
-            let Ok(result) =
-                serde_json::from_value::<Result<(), String>>(record["outcome"]["result"].clone())
-            else {
-                continue;
-            };
             let journaled = entry["journaled"].as_bool().unwrap_or(false);
             // 2026-11-15: 게시되지 않은 결과는 기존 기록이나 접근 불가 상태를 덮지 않는다.
             if !journaled {
@@ -439,10 +510,27 @@ impl CompletionManager {
                     _ => continue,
                 }
             }
-            let Ok(applied) = crate::runs::finish_worktree(db, run_id, &result, completion_id)
-            else {
-                continue;
+            let applied = match record
+                .pointer("/outcome/stage")
+                .and_then(|value| value.as_str())
+            {
+                Some("worktree") => serde_json::from_value::<Result<(), String>>(
+                    record["outcome"]["result"].clone(),
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|result| {
+                    crate::runs::finish_worktree(db, run_id, &result, completion_id)
+                }),
+                Some("generation") => serde_json::from_value::<
+                    Result<provider::sdd::SpecResult, String>,
+                >(record["outcome"]["result"].clone())
+                .map_err(|e| e.to_string())
+                .and_then(|result| {
+                    crate::runs::finish_generation(db, run_id, result, completion_id)
+                }),
+                _ => Err("unsupported completion journal".into()),
             };
+            let Ok(applied) = applied else { continue };
             if let Some(item) = self
                 .pending
                 .lock()
@@ -482,6 +570,47 @@ impl CompletionManager {
             completed.push((run_id.to_owned(), applied));
         }
         completed
+    }
+    // 2026-11-16: 저장 작업자 반환 오류는 같은 완료 ID의 결과와 진단을 메모리에 남긴다.
+    #[cfg(windows)]
+    pub(crate) fn preserve_failed_handoff(&self, record: serde_json::Value) {
+        let run_id = record["run_id"]
+            .as_str()
+            .expect("validated run id")
+            .to_owned();
+        let project_id = record["project_id"]
+            .as_str()
+            .expect("validated project id")
+            .to_owned();
+        let existing = self.directory.as_ref().and_then(|directory| {
+            let parent = directory.parent()?;
+            let name = directory.file_name()?;
+            let _pins =
+                crate::tools::pin_directories(parent, std::path::Path::new(name), false).ok()?;
+            let path = directory.join(format!("{run_id}.json"));
+            (read_completion_record(&path).ok()? == record).then_some(path)
+        });
+        {
+            let _gate = self.mutation_gate.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entries = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(item) = entries
+                .iter_mut()
+                .find(|item| item["run_id"] == run_id && item["_record"]["id"] == record["id"])
+            {
+                if item["state"] == "retrying" {
+                    item["state"] = "pending".into();
+                }
+                if let Some(path) = &existing {
+                    item["journaled"] = true.into();
+                    item["_path"] = path.to_string_lossy().to_string().into();
+                }
+                item["message"] =
+                    "저장 작업이 중단되었습니다. 완료 결과 저장을 다시 시도하세요.".into();
+            } else if !entries.iter().any(|item| item["run_id"] == run_id) {
+                entries.push(serde_json::json!({"run_id":run_id,"project_id":project_id,"stage":"generation","state":"pending","attempts":0,"journaled":existing.is_some(),"message":"저장 작업이 중단되었습니다. 완료 결과 저장을 다시 시도하세요.","_path":existing.map(|p|p.to_string_lossy().to_string()),"_record":record}));
+            }
+        }
+        self.log_event(&run_id, "generation", "storage_handoff_failed");
     }
     pub(crate) fn for_run(&self, run_id: &str) -> serde_json::Value {
         self.status()["failures"]
@@ -528,7 +657,7 @@ impl CompletionManager {
                 .cloned()
         };
         if let (Some(directory), Some(record)) = (&self.directory, record) {
-            if let Ok(path) = publish_worktree_record(directory, &record) {
+            if let Ok(path) = publish_completion_record(directory, &record) {
                 if let Some(item) = self
                     .pending
                     .lock()
@@ -581,8 +710,13 @@ impl CompletionManager {
             }
             .into();
         }
+        let stage = self.for_run(run_id)["stage"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
         self.log_event(
             run_id,
+            &stage,
             if busy {
                 "storage_busy"
             } else {
@@ -650,12 +784,12 @@ mod tests {
     fn recognizes_worktree_and_rejects_other_stages_without_rewriting() {
         let fixture = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let bytes = serde_json::to_vec(&fixture).unwrap();
-        assert_eq!(parse_worktree_record(&bytes).unwrap(), fixture);
+        assert_eq!(parse_completion_record(&bytes).unwrap(), fixture);
         for stage in ["generation", "agent", "unknown"] {
             let mut unsupported = fixture.clone();
             unsupported["outcome"]["stage"] = stage.into();
             let encoded = serde_json::to_vec(&unsupported).unwrap();
-            assert!(parse_worktree_record(&encoded).is_err());
+            assert!(parse_completion_record(&encoded).is_err());
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
                 unsupported
@@ -670,16 +804,16 @@ mod tests {
         let root = root.canonicalize().unwrap();
         let dir = root.join("state.redb.completion-journal");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
-        let path = publish_worktree_record(&dir, &record).unwrap();
+        let path = publish_completion_record(&dir, &record).unwrap();
         assert_eq!(
-            parse_worktree_record(&std::fs::read(&path).unwrap()).unwrap(),
+            parse_completion_record(&std::fs::read(&path).unwrap()).unwrap(),
             record
         );
         let mut changed = record.clone();
         changed["id"] = uuid::Uuid::new_v4().to_string().into();
-        assert!(publish_worktree_record(&dir, &changed).is_err());
+        assert!(publish_completion_record(&dir, &changed).is_err());
         assert_eq!(
-            parse_worktree_record(&std::fs::read(&path).unwrap()).unwrap(),
+            parse_completion_record(&std::fs::read(&path).unwrap()).unwrap(),
             record
         );
         std::fs::remove_file(path).unwrap();
@@ -697,9 +831,9 @@ mod tests {
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let bytes = serde_json::to_vec(&record).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read_worktree_record(&path).unwrap(), record);
+        assert_eq!(read_completion_record(&path).unwrap(), record);
         std::fs::hard_link(&path, &alias).unwrap();
-        assert!(read_worktree_record(&path).is_err());
+        assert!(read_completion_record(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(std::fs::read(&alias).unwrap(), bytes);
         std::fs::remove_file(path).unwrap();
@@ -727,11 +861,11 @@ mod tests {
         tx.commit().unwrap();
         let dir = root.join("state.redb.completion-journal");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":{"Ok":null}}});
-        let path = publish_worktree_record(&dir, &record).unwrap();
+        let path = publish_completion_record(&dir, &record).unwrap();
         let manager =
             CompletionManager::empty(dir.clone(), std::sync::Arc::new(std::sync::Mutex::new(())));
         manager.register(&db, &run_id, &project_id, Err("different result".into()));
-        assert_eq!(read_worktree_record(&path).unwrap(), record);
+        assert_eq!(read_completion_record(&path).unwrap(), record);
         assert_eq!(
             crate::runs::get(&db, &run_id).unwrap()["status"],
             "preparing"
@@ -774,6 +908,8 @@ mod tests {
             slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
             .handle(domain::Request {
@@ -805,7 +941,7 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         let record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("record.json")).unwrap()).unwrap();
-        publish_worktree_record(&root.join("state.redb.completion-journal"), &record).unwrap();
+        publish_completion_record(&root.join("state.redb.completion-journal"), &record).unwrap();
         std::process::exit(86);
     }
     #[cfg(windows)]
@@ -879,6 +1015,503 @@ mod tests {
         std::fs::remove_file(root.join("record.json")).unwrap();
         std::fs::remove_dir(root.join("state.redb.completion-journal")).unwrap();
         std::fs::remove_file(dbpath).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn generation_child_exit_replays_report_before_interruption_without_credentials() {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::temp_dir().join(format!("magi-crash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let dbpath = root.join("state.redb");
+        let engine = crate::Engine::open(&dbpath).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let project_id = project.id.clone();
+        let draft_hash = project.draft_hash.clone();
+        drop(engine);
+        let db = redb::Database::open(&dbpath).unwrap();
+        let tx = db.begin_write().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let data=serde_json::json!({"id":run_id,"project_id":project_id,"status":"generating","events":[],"spec_hash":draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), data.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report = serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null});
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"generation","result":{"Ok":report}}});
+        std::fs::write(
+            root.join("record.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "completion::tests::crash_after_publish_child",
+                "--nocapture",
+            ])
+            .env("MAGI_TEST_CRASH_DIRECTORY", &root)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(86));
+        let engine = crate::Engine::open(&dbpath).unwrap();
+        let result = engine
+            .handle(domain::Request {
+                id: "run".into(),
+                command: domain::Command::GetRun {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let run = match result {
+            domain::ResponseData::Data(v) => v,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        let events = engine
+            .handle(domain::Request {
+                id: "events".into(),
+                command: domain::Command::ListEvents { run_id, after: 0 },
+            })
+            .result
+            .unwrap();
+        let events = match events {
+            domain::ResponseData::Events(v) => v,
+            _ => panic!("events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "generated");
+        drop(engine);
+        std::fs::remove_file(root.join("record.json")).unwrap();
+        std::fs::remove_dir(root.join("state.redb.completion-journal")).unwrap();
+        std::fs::remove_file(dbpath).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn generation_journal_and_storage_failure_remain_memory_only_and_visible() {
+        let root = std::env::temp_dir().join(format!("journal-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let dbpath = root.join("state.redb");
+        let db = redb::Database::create(&dbpath).unwrap();
+        let directory = root.join("blocked");
+        std::fs::write(&directory, b"fixture").unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let manager = CompletionManager::empty(
+            directory.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        manager.register_generation(&db, &run_id, &project_id, Err("fake failure".into()));
+        let gate = std::sync::Arc::clone(&manager.mutation_gate);
+        let engine = crate::Engine {
+            db: crate::storage::StorageSlot::new(dbpath.clone(), db),
+            run_root: root.clone(),
+            git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+            completions: std::sync::Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        let response = engine
+            .handle(domain::Request {
+                id: "diagnostic".into(),
+                command: domain::Command::ListStorageFailures,
+            })
+            .result
+            .unwrap();
+        let status = match response {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("diagnostic"),
+        };
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        assert_eq!(status["log_available"], false);
+        assert_eq!(status["log_entries"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read(&directory).unwrap(), b"fixture");
+        drop(engine);
+        std::fs::remove_file(directory).unwrap();
+        std::fs::remove_file(dbpath).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_panic_before_registration_keeps_result_for_retry() {
+        let root =
+            std::env::temp_dir().join(format!("magi-handoff-panic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run=serde_json::json!({"id":run_id,"project_id":project.id,"status":"generating","events":[],"spec_hash":project.draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), run.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report: provider::sdd::SpecResult = serde_json::from_value(serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null})).unwrap();
+        let captured_id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let worker_id = std::sync::Arc::clone(&captured_id);
+        crate::save_generation_result(
+            std::sync::Arc::clone(&engine.completions),
+            std::sync::Arc::clone(&db),
+            run_id.clone(),
+            project.id.clone(),
+            Ok(report),
+            move |_, _, record| {
+                *worker_id.lock().unwrap() = record["id"].as_str().unwrap().to_owned();
+                panic!("fake handoff failure")
+            },
+        )
+        .await;
+        drop(db);
+        let status = engine.completions.status();
+        assert_eq!(
+            status["failures"].as_array().unwrap().len(),
+            1,
+            "completed result lost after handoff failure"
+        );
+        let completion_id = captured_id.lock().unwrap().clone();
+        assert_eq!(
+            engine.completions.pending.lock().unwrap()[0]["_record"]["id"],
+            completion_id
+        );
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        let response = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: run_id.clone(),
+            },
+        });
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+        {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, u8>::new(
+                    "completion_commits_v1",
+                ))
+                .unwrap();
+            assert_eq!(
+                table.get(completion_id.as_str()).unwrap().unwrap().value(),
+                1
+            );
+        }
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_panic_after_journal_keeps_same_record_for_retry() {
+        let root =
+            std::env::temp_dir().join(format!("magi-handoff-panic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run=serde_json::json!({"id":run_id,"project_id":project.id,"status":"generating","events":[],"spec_hash":project.draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), run.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report: provider::sdd::SpecResult = serde_json::from_value(serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null})).unwrap();
+        crate::save_generation_result(
+            std::sync::Arc::clone(&engine.completions),
+            std::sync::Arc::clone(&db),
+            run_id.clone(),
+            project.id.clone(),
+            Ok(report),
+            |manager, _, record| {
+                publish_completion_record(manager.directory.as_ref().unwrap(), &record).unwrap();
+                panic!("fake failure after journal")
+            },
+        )
+        .await;
+        drop(db);
+        let status = engine.completions.status();
+        assert_eq!(
+            status["failures"].as_array().unwrap().len(),
+            1,
+            "completed result lost after handoff failure"
+        );
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], true);
+        assert_eq!(status["log_attempted"], true);
+        let response = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: run_id.clone(),
+            },
+        });
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_panic_after_commit_never_duplicates_event() {
+        let root =
+            std::env::temp_dir().join(format!("magi-handoff-panic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run=serde_json::json!({"id":run_id,"project_id":project.id,"status":"generating","events":[],"spec_hash":project.draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), run.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report: provider::sdd::SpecResult = serde_json::from_value(serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null})).unwrap();
+        crate::save_generation_result(
+            std::sync::Arc::clone(&engine.completions),
+            std::sync::Arc::clone(&db),
+            run_id.clone(),
+            project.id.clone(),
+            Ok(report),
+            |manager, db, record| {
+                manager.register_generation_record(db, record);
+                panic!("fake failure after commit")
+            },
+        )
+        .await;
+        drop(db);
+        let status = engine.completions.status();
+        assert_eq!(
+            status["failures"].as_array().unwrap().len(),
+            1,
+            "completed result lost after handoff failure"
+        );
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        let response = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: run_id.clone(),
+            },
+        });
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_panic_after_pending_registration_does_not_duplicate() {
+        let root =
+            std::env::temp_dir().join(format!("magi-handoff-panic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run=serde_json::json!({"id":run_id,"project_id":project.id,"status":"generating","events":[],"spec_hash":project.draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), run.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report: provider::sdd::SpecResult = serde_json::from_value(serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null})).unwrap();
+        crate::save_generation_result(std::sync::Arc::clone(&engine.completions), std::sync::Arc::clone(&db), run_id.clone(), project.id.clone(), Ok(report), |manager,_,record| { manager.pending.lock().unwrap().push(serde_json::json!({"run_id":record["run_id"],"project_id":record["project_id"],"stage":"generation","state":"retrying","attempts":0,"journaled":false,"message":"fixture","_record":record})); panic!("fake failure after pending") }).await;
+        drop(db);
+        let status = engine.completions.status();
+        assert_eq!(
+            status["failures"].as_array().unwrap().len(),
+            1,
+            "completed result lost after handoff failure"
+        );
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        let response = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: run_id.clone(),
+            },
+        });
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        assert_eq!(run["events"].as_array().unwrap().len(), 1);
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 }

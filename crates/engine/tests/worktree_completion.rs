@@ -148,7 +148,7 @@ fn unsupported_journal_stage_is_reported_and_preserved() {
     std::fs::create_dir(&journal).unwrap();
     let run_id = uuid::Uuid::new_v4().to_string();
     let file = journal.join(format!("{run_id}.json"));
-    let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"generation","result":{"Err":"fixture"}}})).unwrap();
+    let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"agent","result":{"Err":"fixture"}}})).unwrap();
     std::fs::write(&file, &bytes).unwrap();
     let engine = Engine::open(&fixture.database).unwrap();
     let status = call(&engine, Command::ListStorageFailures).unwrap();
@@ -843,5 +843,85 @@ fn journal_with_missing_schema_is_rejected_without_modifying_database() {
     let result = Engine::open(&fixture.database);
     assert!(result.is_err());
     assert_eq!(std::fs::read(&fixture.database).unwrap(), before);
+    std::fs::remove_dir(journal).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn generation_cleanup_retry_does_not_duplicate_generated_event() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let engine = Engine::open(&fixture.database).unwrap();
+    let project = match call(
+        &engine,
+        Command::CreateProject {
+            name: "fake".into(),
+            path: "not-created".into(),
+        },
+    )
+    .unwrap()
+    {
+        ResponseData::Project(p) => p,
+        _ => panic!("project"),
+    };
+    drop(engine);
+    let db = redb::Database::open(&fixture.database).unwrap();
+    let tx = db.begin_write().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut t = tx
+            .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+            .unwrap();
+        let json =
+            serde_json::json!({"id":id,"project_id":project.id,"status":"generating","events":[],"spec_hash":project.draft_hash,"context_version":project.context_version})
+                .to_string();
+        t.insert(id.as_str(), json.as_str()).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let mut name = fixture.database.as_os_str().to_os_string();
+    name.push(".completion-journal");
+    let journal = PathBuf::from(name);
+    std::fs::create_dir(&journal).unwrap();
+    let file = journal.join(format!("{id}.json"));
+    let draft = domain::SpecDraft {
+        title: "생성됨".into(),
+        ..Default::default()
+    };
+    let report = serde_json::json!({"policy_version":1,"draft":draft,"assumptions":[],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null});
+    let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":id,"project_id":project.id,"outcome":{"stage":"generation","result":{"Ok":report}}});
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&file)
+        .unwrap();
+    let engine = Engine::open(&fixture.database).unwrap();
+    let status = match call(&engine, Command::ListStorageFailures).unwrap() {
+        ResponseData::Data(v) => v,
+        _ => panic!("data"),
+    };
+    assert_eq!(status["failures"][0]["state"], "cleanup_pending");
+    drop(locked);
+    let retry = match call(&engine, Command::RetryCompletionSave { run_id: id.clone() }).unwrap() {
+        ResponseData::Data(v) => v,
+        _ => panic!("data"),
+    };
+    assert_eq!(retry["state"], "saved");
+    let events = match call(
+        &engine,
+        Command::ListEvents {
+            run_id: id,
+            after: 0,
+        },
+    )
+    .unwrap()
+    {
+        ResponseData::Events(v) => v,
+        _ => panic!("events"),
+    };
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "generated");
+    drop(engine);
     std::fs::remove_dir(journal).unwrap();
 }
