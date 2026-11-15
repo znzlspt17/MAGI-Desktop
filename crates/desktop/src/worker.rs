@@ -14,6 +14,8 @@ pub enum Kind {
     List,
     Get { generation: u64 },
     Interview { project_id: String, message: String },
+    GenerateSpec { project_id: String },
+    SpecRun { project_id: String, run_id: String },
     Create { name: String, path: String },
 }
 
