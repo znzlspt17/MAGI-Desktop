@@ -693,26 +693,101 @@ pub async fn discover_oauth_automatically(endpoint: &str) -> Result<OAuthMetadat
         .get_all(reqwest::header::WWW_AUTHENTICATE)
     {
         let value = header.to_str().map_err(|_| "invalid OAuth challenge")?;
-        for part in value.split(',') {
-            let part = part
-                .trim()
-                .strip_prefix("Bearer ")
-                .unwrap_or(part.trim())
-                .trim();
-            if let Some(raw) = part.strip_prefix("resource_metadata=") {
-                let candidate = raw
-                    .strip_prefix('"')
-                    .and_then(|x| x.strip_suffix('"'))
-                    .ok_or("invalid OAuth metadata challenge")?;
-                if candidate.contains('\\') || metadata.replace(candidate.to_owned()).is_some() {
-                    return Err("ambiguous OAuth metadata challenge".into());
-                }
-            }
-        }
+        oauth_metadata_from_challenges(value, &mut metadata)?;
     }
     discover_oauth(
         endpoint,
         &metadata.ok_or("OAuth metadata challenge missing")?,
     )
     .await
+}
+// 2026-11-16: 인증 방식의 경계와 quoted-string을 구분해 다른 challenge의 값을 신뢰하지 않는다.
+fn oauth_metadata_from_challenges(
+    value: &str,
+    metadata: &mut Option<String>,
+) -> Result<(), String> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            pieces.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    if quoted || escaped {
+        return Err("invalid OAuth challenge".into());
+    }
+    pieces.push(&value[start..]);
+    let mut bearer = false;
+    for piece in pieces {
+        let mut part = piece.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(end) = part.find(char::is_whitespace) {
+            let prefix = &part[..end];
+            let rest = part[end..].trim_start();
+            if !prefix.contains('=') && !rest.starts_with('=') {
+                bearer = prefix.eq_ignore_ascii_case("bearer");
+                part = rest;
+            }
+        } else if !part.contains('=') {
+            bearer = part.eq_ignore_ascii_case("bearer");
+            continue;
+        }
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        if !bearer || !name.trim().eq_ignore_ascii_case("resource_metadata") {
+            continue;
+        }
+        let raw = raw.trim();
+        let raw = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or("invalid OAuth metadata challenge")?;
+        let mut candidate = String::new();
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                candidate.push(chars.next().ok_or("invalid OAuth metadata challenge")?);
+            } else if ch == '"' || ch.is_control() {
+                return Err("invalid OAuth metadata challenge".into());
+            } else {
+                candidate.push(ch);
+            }
+        }
+        if metadata.replace(candidate).is_some() {
+            return Err("ambiguous OAuth metadata challenge".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod oauth_challenge_tests {
+    use super::oauth_metadata_from_challenges;
+
+    #[test]
+    fn quoted_pair_is_decoded_before_metadata_url_validation() {
+        let mut metadata = None;
+        oauth_metadata_from_challenges(
+            r#"Bearer resource_metadata="https://example.test/a\,b""#,
+            &mut metadata,
+        )
+        .unwrap();
+        assert_eq!(metadata.as_deref(), Some("https://example.test/a,b"));
+    }
 }

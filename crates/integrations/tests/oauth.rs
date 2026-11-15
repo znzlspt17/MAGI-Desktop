@@ -169,3 +169,93 @@ async fn oauth_reads_metadata_location_from_unauthorized_challenge() {
     assert_eq!(m.resource, format!("http://{addr}/mcp"));
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn oauth_discovery_handles_quoted_commas_and_escapes_across_challenges() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for step in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut b = [0; 4096];
+            let n = socket.read(&mut b).await.unwrap();
+            if step == 1 {
+                assert!(String::from_utf8_lossy(&b[..n]).starts_with("GET /metadata,variant "));
+            }
+            let body = match step {
+                1 => format!(
+                    r#"{{"resource":"http://{addr}/mcp","authorization_servers":["http://{addr}"]}}"#
+                ),
+                2 => format!(
+                    r#"{{"issuer":"http://{addr}","authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token","code_challenge_methods_supported":["S256"]}}"#
+                ),
+                _ => String::new(),
+            };
+            let challenge = if step == 0 {
+                format!("WWW-Authenticate: Basic realm=\"other,realm\", Bearer realm=\"escaped\\\"quote\", resource_metadata=\"http://{addr}/metadata,variant\"\r\n")
+            } else {
+                String::new()
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        if step == 0 {
+                            "401 Unauthorized"
+                        } else {
+                            "200 OK"
+                        },
+                        challenge,
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let result =
+        integrations::mcp::discover_oauth_automatically(&format!("http://{addr}/mcp")).await;
+    assert!(result.is_ok(), "{result:?}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn oauth_ignores_metadata_in_other_authentication_schemes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut b = [0; 4096];
+        socket.read(&mut b).await.unwrap();
+        let challenge = format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic resource_metadata=\"http://{addr}/metadata\", Bearer realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        socket.write_all(challenge.as_bytes()).await.unwrap();
+    });
+    let err = integrations::mcp::discover_oauth_automatically(&format!("http://{addr}/mcp"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("metadata challenge missing"), "{err}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn oauth_rejects_malformed_or_duplicate_metadata_challenges() {
+    for header in [
+        "Bearer resource_metadata=\"http://localhost/unfinished",
+        "Bearer resource_metadata=\"http://localhost/one\", resource_metadata=\"http://localhost/two\"",
+        "Bearer resource_metadata=http://localhost/unquoted",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut b = [0; 4096];
+            socket.read(&mut b).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: {header}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let err = integrations::mcp::discover_oauth_automatically(&format!("http://{addr}/mcp")).await.unwrap_err();
+        assert!(err.contains("challenge"), "{err}");
+        server.await.unwrap();
+    }
+}
