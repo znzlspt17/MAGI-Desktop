@@ -87,3 +87,28 @@ fn export_requires_completed_identifier_before_creating_output() {
     assert!(!dest.exists());
     std::fs::remove_dir(root).unwrap();
 }
+
+#[test]
+fn export_refuses_existing_empty_directory_and_cleans_temporary_output() {
+    let root = create_test_root();
+    let dest = root.join("empty");
+    std::fs::create_dir(&dest).unwrap();
+    assert!(export_package(&input(), &dest).is_err());
+    assert!(dest.is_dir());
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    std::fs::remove_dir(dest).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn export_refuses_existing_file_and_preserves_contents() {
+    let root = create_test_root();
+    let dest = root.join("existing");
+    std::fs::write(&dest, "sentinel").unwrap();
+    assert!(export_package(&input(), &dest).is_err());
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "sentinel");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    std::fs::remove_file(dest).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}

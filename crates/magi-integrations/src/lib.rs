@@ -332,7 +332,7 @@ pub fn export_package(
             serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary, destination).map_err(|e| e.to_string())?;
+        publish_package(&temporary, destination)?;
         Ok(())
     })();
     if result.is_err() {
@@ -340,4 +340,29 @@ pub fn export_package(
     }
     result?;
     Ok(manifest)
+}
+
+// 2026-11-15: 존재 검사와 이동 사이에 생긴 빈 목적지도 교체하지 않도록 OS 이동에서 덮어쓰기를 금지한다.
+#[cfg(windows)]
+fn publish_package(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_package(
+    _source: &std::path::Path,
+    _destination: &std::path::Path,
+) -> Result<(), String> {
+    Err("package export is only supported on Windows".into())
 }
