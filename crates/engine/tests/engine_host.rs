@@ -15,7 +15,7 @@ fn status_reports_only_current_engine_capabilities() {
     match response.result.unwrap() {
         ResponseData::Status { message } => assert_eq!(
             message,
-            "engine ready; worktree preparation, spec generation and storage recovery available; agents and local inference unavailable"
+            "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
         ),
         _ => panic!("expected engine status"),
     }
