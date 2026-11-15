@@ -821,6 +821,13 @@ mod tests {
                 .len(),
             1
         );
+        drop(db);
+        drop(engine);
+        let reopened = redb::Database::open(root.join("state.redb")).unwrap();
+        let stale = crate::runs::get(&reopened, &stale_id).unwrap();
+        assert_eq!(stale["agent_active"], false);
+        assert_eq!(stale["status"], "awaiting_implementation");
+        assert!(stale["events"].as_array().unwrap().is_empty());
     }
 
     #[test]
