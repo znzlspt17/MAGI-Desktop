@@ -8,15 +8,37 @@ use std::sync::{
 
 pub enum Kind {
     Storage,
-    RetrySave { run_id: String },
+    RetrySave {
+        run_id: String,
+    },
     Starting,
     Status,
     List,
-    Get { generation: u64 },
-    Interview { project_id: String, message: String },
-    GenerateSpec { project_id: String },
-    SpecRun { project_id: String, run_id: String },
-    Create { name: String, path: String },
+    Get {
+        generation: u64,
+    },
+    Interview {
+        project_id: String,
+        message: String,
+    },
+    GenerateSpec {
+        project_id: String,
+    },
+    SpecRun {
+        project_id: String,
+        run_id: String,
+    },
+    ModelSettings {
+        project_id: String,
+        submitted: crate::model_settings::Form,
+    },
+    Credential {
+        project_id: String,
+    },
+    Create {
+        name: String,
+        path: String,
+    },
 }
 
 pub struct Work {
