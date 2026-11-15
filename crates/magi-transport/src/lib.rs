@@ -62,20 +62,28 @@ impl std::io::Write for LimitedWriter<'_> {
 mod platform {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::{ffi::c_void, ptr};
+    use std::{ffi::c_void, os::windows::io::AsRawHandle, ptr};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, LocalFree},
+        Foundation::{CloseHandle, LocalFree, HANDLE},
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
         Security::{GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        System::{
+            Pipes::GetNamedPipeServerProcessId,
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
     };
     fn sid() -> Result<String> {
+        process_sid(unsafe { GetCurrentProcess() })
+    }
+    fn process_sid(process: HANDLE) -> Result<String> {
         unsafe {
             let mut token = ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
             let mut len = 0;
@@ -99,6 +107,27 @@ mod platform {
             let result = String::from_utf16(std::slice::from_raw_parts(out, n));
             LocalFree(out.cast());
             Ok(result?)
+        }
+    }
+    fn verify_peer_for_sid(
+        pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
+        expected: &str,
+    ) -> Result<()> {
+        unsafe {
+            let mut pid = 0;
+            if GetNamedPipeServerProcessId(pipe.as_raw_handle() as _, &mut pid) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let actual = process_sid(process);
+            CloseHandle(process);
+            if actual? != expected {
+                return Err(anyhow!("pipe server user mismatch"));
+            }
+            Ok(())
         }
     }
     pub fn default_pipe_name() -> String {
@@ -142,6 +171,19 @@ mod platform {
         name: &str,
         request: &Q,
     ) -> Result<R> {
+        request_with_verifier(name, request, |pipe| verify_peer_for_sid(pipe, &sid()?)).await
+    }
+    async fn request_with_verifier<Q: Serialize, R: DeserializeOwned>(
+        name: &str,
+        request: &Q,
+        verify: impl FnOnce(&tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()>,
+    ) -> Result<R> {
+        if !name.starts_with(r"\\.\pipe\")
+            || name.len() == r"\\.\pipe\".len()
+            || name.contains('\0')
+        {
+            return Err(anyhow!("invalid local pipe name"));
+        }
         tokio::time::timeout(TIMEOUT, async {
             let mut pipe = loop {
                 match ClientOptions::new().open(name) {
@@ -152,6 +194,7 @@ mod platform {
                     Err(e) => return Err(e.into()),
                 }
             };
+            verify(&pipe)?;
             // 연결 이후에는 요청을 재전송하지 않는다.
             write_frame(&mut pipe, request).await?;
             read_frame(&mut pipe).await
@@ -219,6 +262,52 @@ mod platform {
             GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
             DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
+        #[tokio::test]
+        async fn rejects_nonlocal_and_invalid_pipe_names_before_opening() {
+            for name in [
+                "",
+                r"\\remote\pipe\magi",
+                r"C:\temp\file",
+                r"\\.\pipe\",
+                "\\\\.\\pipe\\bad\0name",
+            ] {
+                let result =
+                    request_typed::<_, serde_json::Value>(name, &serde_json::json!({})).await;
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid local pipe name"),
+                    "{name:?}"
+                );
+            }
+        }
+        #[tokio::test]
+        async fn untrusted_or_unverifiable_server_receives_no_request_bytes() {
+            for (i, reason) in ["SID mismatch", "SID lookup failed"].iter().enumerate() {
+                let name = format!(r"\\.\pipe\magi-peer-test-{}-{i}", std::process::id());
+                let mut listener = server(&name, true).unwrap();
+                let reader = tokio::spawn(async move {
+                    listener.connect().await.unwrap();
+                    let mut byte = [0u8; 1];
+                    listener.read(&mut byte).await.unwrap()
+                });
+                let result = request_with_verifier::<_, serde_json::Value>(
+                    &name,
+                    &serde_json::json!({"message":"test"}),
+                    |pipe| {
+                        if i == 0 {
+                            verify_peer_for_sid(pipe, "S-1-0-0")
+                        } else {
+                            Err(anyhow!(*reason))
+                        }
+                    },
+                )
+                .await;
+                assert!(result.is_err());
+                assert_eq!(reader.await.unwrap(), 0, "{reason}");
+            }
+        }
         #[tokio::test]
         async fn pipe_dacl_is_protected_and_only_grants_current_sid() {
             unsafe {
