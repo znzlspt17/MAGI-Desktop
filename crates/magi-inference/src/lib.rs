@@ -215,3 +215,7 @@ pub fn inspect<R: Read + Seek>(input: &mut R) -> Result<ModelInfo, String> {
             .into(),
     })
 }
+
+mod ternary;
+
+pub use ternary::ternary_dot;
