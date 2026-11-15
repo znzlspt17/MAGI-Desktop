@@ -1816,6 +1816,7 @@ dependencies = [
 name = "integrations"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "jsonschema",
  "reqwest",
  "serde",
@@ -1823,6 +1824,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "uuid",
  "windows-sys 0.59.0",
  "zip",
 ]

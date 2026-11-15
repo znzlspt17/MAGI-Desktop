@@ -391,3 +391,403 @@ impl McpClient {
         Self::connect_inner(endpoint, Some(header)).await
     }
 }
+
+const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
+// 2026-11-16: 일회용 state와 PKCE verifier를 메모리에만 두어 콜백 위조와 재사용을 막는다.
+pub struct OAuthFlow {
+    authorize: reqwest::Url,
+    token: reqwest::Url,
+    client_id: String,
+    redirect: reqwest::Url,
+    state: String,
+    verifier: Option<String>,
+    resource: Option<String>,
+}
+impl std::fmt::Debug for OAuthFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OAuthFlow { redacted }")
+    }
+}
+impl OAuthFlow {
+    pub fn new(
+        authorize: &str,
+        token: &str,
+        client_id: &str,
+        redirect: &str,
+    ) -> Result<Self, String> {
+        let authorize = safe_oauth_url(authorize)?;
+        let token = safe_oauth_url(token)?;
+        let redirect = safe_oauth_url(redirect)?;
+        if client_id.trim().is_empty()
+            || redirect.query().is_some()
+            || redirect.fragment().is_some()
+        {
+            return Err("invalid OAuth client or redirect".into());
+        }
+        let state = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let verifier = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        Ok(Self {
+            authorize,
+            token,
+            client_id: client_id.into(),
+            redirect,
+            state,
+            verifier: Some(verifier),
+            resource: None,
+        })
+    }
+    pub fn authorization_url(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use sha2::{Digest, Sha256};
+        let mut url = self.authorize.clone();
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            self.verifier.as_deref().unwrap_or("").as_bytes(),
+        ));
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", self.redirect.as_str())
+            .append_pair("state", &self.state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        if let Some(resource) = &self.resource {
+            url.query_pairs_mut().append_pair("resource", resource);
+        }
+        url.into()
+    }
+    pub async fn exchange(&mut self, callback: &str) -> Result<String, String> {
+        let url = reqwest::Url::parse(callback).map_err(|_| "invalid callback")?;
+        if url.scheme() != self.redirect.scheme()
+            || url.host_str() != self.redirect.host_str()
+            || url.port_or_known_default() != self.redirect.port_or_known_default()
+            || url.path() != self.redirect.path()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("callback redirect mismatch".into());
+        }
+        let pairs: Vec<_> = url.query_pairs().collect();
+        let state: Vec<_> = pairs.iter().filter(|(k, _)| k == "state").collect();
+        let code: Vec<_> = pairs.iter().filter(|(k, _)| k == "code").collect();
+        if state.len() != 1 || state[0].1 != self.state || code.len() != 1 || code[0].1.is_empty() {
+            return Err("invalid OAuth state or code".into());
+        }
+        let verifier = self.verifier.take().ok_or("OAuth flow already used")?;
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "OAuth client failed")?;
+        let mut params = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", self.client_id.as_str()),
+            ("code", code[0].1.as_ref()),
+            ("redirect_uri", self.redirect.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ];
+        if let Some(resource) = &self.resource {
+            params.push(("resource", resource.as_str()));
+        }
+        let mut response = client
+            .post(self.token.clone())
+            .form(&params)
+            .send()
+            .await
+            .map_err(|_| "OAuth exchange failed")?;
+        if !response.status().is_success() {
+            return Err("OAuth exchange rejected".into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "OAuth response failed")?
+        {
+            if bytes.len() + chunk.len() > MAX_OAUTH_METADATA_BYTES {
+                return Err("OAuth response too large".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid OAuth response")?;
+        if !value
+            .get("token_type")
+            .and_then(Value::as_str)
+            .map(|s| s.eq_ignore_ascii_case("bearer"))
+            .unwrap_or(false)
+        {
+            return Err("unsupported OAuth token type".into());
+        }
+        value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "missing OAuth token".into())
+    }
+}
+fn safe_oauth_url(input: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(input).map_err(|_| "invalid OAuth URL")?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err("invalid OAuth URL".into());
+    }
+    let loopback = url
+        .host_str()
+        .map(|h| {
+            h == "localhost"
+                || h.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("OAuth HTTPS required".into());
+    }
+    Ok(url)
+}
+
+#[derive(Debug)]
+pub struct OAuthMetadata {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub resource: String,
+}
+// 2026-11-16: discovery 문서의 resource와 issuer를 교차 검증해 다른 서버의 토큰을 잘못 요청하지 않는다.
+pub async fn discover_oauth(resource: &str, metadata_url: &str) -> Result<OAuthMetadata, String> {
+    let resource_url = validate_endpoint(resource)?;
+    let metadata_url = safe_oauth_url(metadata_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "OAuth client failed")?;
+    let metadata = oauth_get_json(&client, metadata_url).await?;
+    let declared = metadata
+        .get("resource")
+        .and_then(Value::as_str)
+        .ok_or("missing OAuth resource")?;
+    if validate_endpoint(declared)? != resource_url {
+        return Err("OAuth resource mismatch".into());
+    }
+    let issuer = metadata
+        .get("authorization_servers")
+        .and_then(Value::as_array)
+        .and_then(|v| v.first())
+        .and_then(Value::as_str)
+        .ok_or("missing authorization server")?;
+    let issuer_url = safe_oauth_url(issuer)?;
+    if issuer_url.query().is_some() {
+        return Err("invalid issuer".into());
+    }
+    let mut well_known = issuer_url.clone();
+    let suffix = issuer_url.path().trim_end_matches('/');
+    well_known.set_path(&format!("/.well-known/oauth-authorization-server{suffix}"));
+    let server = oauth_get_json(&client, well_known).await?;
+    let declared_issuer = server
+        .get("issuer")
+        .and_then(Value::as_str)
+        .ok_or("missing issuer")?;
+    if safe_oauth_url(declared_issuer)? != issuer_url {
+        return Err("OAuth issuer mismatch".into());
+    }
+    if !server
+        .get("code_challenge_methods_supported")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().any(|v| v.as_str() == Some("S256")))
+        .unwrap_or(false)
+    {
+        return Err("OAuth PKCE S256 unsupported".into());
+    }
+    let authorization_endpoint = safe_oauth_url(
+        server
+            .get("authorization_endpoint")
+            .and_then(Value::as_str)
+            .ok_or("missing authorization endpoint")?,
+    )?
+    .to_string();
+    let token_endpoint = safe_oauth_url(
+        server
+            .get("token_endpoint")
+            .and_then(Value::as_str)
+            .ok_or("missing token endpoint")?,
+    )?
+    .to_string();
+    Ok(OAuthMetadata {
+        authorization_endpoint,
+        token_endpoint,
+        resource: resource_url.to_string(),
+    })
+}
+async fn oauth_get_json(client: &reqwest::Client, url: reqwest::Url) -> Result<Value, String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "OAuth discovery failed")?;
+    if !response.status().is_success() {
+        return Err("OAuth discovery rejected".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "OAuth discovery failed")?
+    {
+        if bytes.len() + chunk.len() > MAX_OAUTH_METADATA_BYTES {
+            return Err("OAuth metadata too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "invalid OAuth metadata".into())
+}
+
+impl OAuthMetadata {
+    pub fn create_flow(&self, client_id: &str, redirect: &str) -> Result<OAuthFlow, String> {
+        let mut flow = OAuthFlow::new(
+            &self.authorization_endpoint,
+            &self.token_endpoint,
+            client_id,
+            redirect,
+        )?;
+        flow.resource = Some(validate_endpoint(&self.resource)?.to_string());
+        Ok(flow)
+    }
+}
+pub async fn discover_oauth_automatically(endpoint: &str) -> Result<OAuthMetadata, String> {
+    let url = validate_endpoint(endpoint)?;
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "OAuth client failed")?;
+    let response = client
+        .post(url)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "magi-desktop", "version": CLIENT_VERSION},
+            },
+        }))
+        .send()
+        .await
+        .map_err(|_| "OAuth discovery failed")?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Err("MCP did not provide an OAuth challenge".into());
+    }
+    let mut metadata = None;
+    for header in response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+    {
+        let value = header.to_str().map_err(|_| "invalid OAuth challenge")?;
+        oauth_metadata_from_challenges(value, &mut metadata)?;
+    }
+    discover_oauth(
+        endpoint,
+        &metadata.ok_or("OAuth metadata challenge missing")?,
+    )
+    .await
+}
+// 2026-11-16: 인증 방식의 경계와 quoted-string을 구분해 다른 challenge의 값을 신뢰하지 않는다.
+fn oauth_metadata_from_challenges(
+    value: &str,
+    metadata: &mut Option<String>,
+) -> Result<(), String> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            pieces.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    if quoted || escaped {
+        return Err("invalid OAuth challenge".into());
+    }
+    pieces.push(&value[start..]);
+    let mut bearer = false;
+    for piece in pieces {
+        let mut part = piece.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(end) = part.find(char::is_whitespace) {
+            let prefix = &part[..end];
+            let rest = part[end..].trim_start();
+            if !prefix.contains('=') && !rest.starts_with('=') {
+                bearer = prefix.eq_ignore_ascii_case("bearer");
+                part = rest;
+            }
+        } else if !part.contains('=') {
+            bearer = part.eq_ignore_ascii_case("bearer");
+            continue;
+        }
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        if !bearer || !name.trim().eq_ignore_ascii_case("resource_metadata") {
+            continue;
+        }
+        let raw = raw.trim();
+        let raw = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or("invalid OAuth metadata challenge")?;
+        let mut candidate = String::new();
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                candidate.push(chars.next().ok_or("invalid OAuth metadata challenge")?);
+            } else if ch == '"' || ch.is_control() {
+                return Err("invalid OAuth metadata challenge".into());
+            } else {
+                candidate.push(ch);
+            }
+        }
+        if metadata.replace(candidate).is_some() {
+            return Err("ambiguous OAuth metadata challenge".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod oauth_challenge_tests {
+    use super::oauth_metadata_from_challenges;
+
+    #[test]
+    fn quoted_pair_is_decoded_before_metadata_url_validation() {
+        let mut metadata = None;
+        oauth_metadata_from_challenges(
+            r#"Bearer resource_metadata="https://example.test/a\,b""#,
+            &mut metadata,
+        )
+        .unwrap();
+        assert_eq!(metadata.as_deref(), Some("https://example.test/a,b"));
+    }
+}
