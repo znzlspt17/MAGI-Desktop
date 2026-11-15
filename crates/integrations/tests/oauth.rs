@@ -221,14 +221,36 @@ async fn oauth_discovery_handles_quoted_commas_and_escapes_across_challenges() {
     server.await.unwrap();
 }
 
+// 2026-11-16: 일부 TCP 패킷만 읽고 응답하지 않도록 요청 길이를 확인하고 조기 EOF를 거절한다.
+async fn read_complete_request(socket: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0; 4096];
+        let count = socket.read(&mut buffer).await.unwrap();
+        assert!(count > 0, "request ended before all bytes arrived");
+        request.extend_from_slice(&buffer[..count]);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&request[..end]).to_lowercase();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+}
 #[tokio::test]
 async fn oauth_ignores_metadata_in_other_authentication_schemes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut b = [0; 4096];
-        socket.read(&mut b).await.unwrap();
+        read_complete_request(&mut socket).await;
         let challenge = format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic resource_metadata=\"http://{addr}/metadata\", Bearer realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         socket.write_all(challenge.as_bytes()).await.unwrap();
     });
@@ -250,8 +272,7 @@ async fn oauth_rejects_malformed_or_duplicate_metadata_challenges() {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut b = [0; 4096];
-            socket.read(&mut b).await.unwrap();
+            read_complete_request(&mut socket).await;
             socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: {header}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         });
         let err = integrations::mcp::discover_oauth_automatically(&format!("http://{addr}/mcp")).await.unwrap_err();

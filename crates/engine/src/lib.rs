@@ -8,7 +8,9 @@ pub mod agent_loop;
 mod agent_runtime;
 mod completion;
 mod knowledge_text;
+mod mcp_connections;
 mod mcp_runtime;
+mod package_export;
 mod project_decisions;
 mod runs;
 mod storage;
@@ -148,6 +150,7 @@ impl Engine {
                 | Command::PutKnowledge { .. }
                 | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
+                | Command::ConfigureMcp { .. }
                 | Command::RequestMcpApproval { .. }
                 | Command::ApproveTool { .. }
                 | Command::SaveDraft { .. }
@@ -168,6 +171,12 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if let Command::ListMcpTools { project_id } = &request.command {
+            return Response {
+                id: request_id,
+                result: mcp_connections::list(Arc::clone(&self), project_id.clone()).await,
+            };
+        }
         if let Command::CallMcpApproved {
             run_id,
             approval_id,
@@ -456,9 +465,11 @@ impl Engine {
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. }
+            | Command::ExportPackage { project_id, .. }
             | Command::SaveDecision { project_id, .. }
             | Command::ReviseDecision { project_id, .. }
             | Command::SelectDecision { project_id, .. }
+            | Command::ConfigureMcp { project_id, .. }
             | Command::PutKnowledge { project_id, .. }
             | Command::SetKnowledgeEmbedding { project_id, .. } => Some(project_id),
             _ => None,
@@ -467,6 +478,7 @@ impl Engine {
             Command::StartAgent { run_id, .. }
             | Command::ResumeAgent { run_id, .. }
             | Command::SubmitTool { run_id, .. }
+            | Command::ExportRunPackage { run_id, .. }
             | Command::ApproveTool { run_id, .. }
             | Command::RequestMcpApproval { run_id, .. } => Some(run_id),
             _ => None,
@@ -550,6 +562,14 @@ impl Engine {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 project_decisions::select_decision(db, project_id, id, version)
             }
+            Command::ExportPackage { project_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_project(&db, &project_id, Path::new(&destination))
+            }
+            Command::ExportRunPackage { run_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_run(&db, &run_id, Path::new(&destination))
+            }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::put(&db, &project_id, document)
@@ -566,6 +586,10 @@ impl Engine {
                 if semantic { return Err("semantic search unavailable".into()); }
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::search(&db, &project_id, &query, 0, 100)
+            }
+            Command::ConfigureMcp { project_id, endpoint } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                mcp_connections::configure(&db, &project_id, &endpoint)
             }
             Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
                 let db = self.db.get().ok_or("storage unavailable")?;

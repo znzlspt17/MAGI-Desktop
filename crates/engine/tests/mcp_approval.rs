@@ -308,8 +308,27 @@ async fn cancelling_during_discovery_prevents_call_and_status_remains_responsive
         let mut release = Some(release_rx);
         for step in 0..3 {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut b = [0; 4096];
-            socket.read(&mut b).await.unwrap();
+            // 2026-11-16: 요청 전체를 수신해야 부분 TCP 읽기와 조기 EOF를 구분할 수 있다.
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "request ended before all bytes arrived");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
             if step == 2 {
                 ready.take().unwrap().send(()).unwrap();
                 release.take().unwrap().await.unwrap();
