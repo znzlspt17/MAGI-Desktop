@@ -10,8 +10,7 @@ type ReadHook = (
 #[cfg(all(test, windows))]
 static TEST_AFTER_READ: std::sync::Mutex<Option<ReadHook>> = std::sync::Mutex::new(None);
 
-// 2026-11-16: 후속 Runtime 연결 전 독립 검증 경계를 유지한다. 연결 시 dead_code 예외를 제거한다.
-#[allow(dead_code)]
+// 2026-11-16: Runtime 검증 시 실제 읽기와 evidence 저장을 하나의 경계로 처리한다.
 pub(crate) async fn verify(
     engine: Arc<Engine>,
     run_id: String,

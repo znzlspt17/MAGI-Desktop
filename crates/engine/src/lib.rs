@@ -4,7 +4,7 @@
 mod agent_completion;
 mod agent_execution;
 pub mod agent_loop;
-// 2026-11-16: StartAgent 연동 전 내구 runtime bridge를 독립 검증한다.
+// 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
 mod runs;
@@ -877,7 +877,6 @@ async fn save_generation_result<F>(
 }
 // 2026-11-16: 작업자 반환 오류에도 동일한 완료 ID를 진단에 남기고 저장만 다시 시도한다.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub(crate) async fn save_agent_result(
     manager: Arc<completion::CompletionManager>,
     db: Option<Arc<Database>>,

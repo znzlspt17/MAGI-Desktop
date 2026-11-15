@@ -771,7 +771,6 @@ pub(crate) fn finish_generation(
     Ok(applied)
 }
 // 2026-11-16: 재개 연결 전에도 원본 저장 형식과 CAS 계약을 보존한다.
-#[allow(dead_code)]
 pub(crate) fn save_checkpoint(
     db: &Database,
     id: &str,
@@ -808,7 +807,6 @@ pub(crate) fn save_checkpoint(
     tx.commit().map_err(|e| e.to_string())?;
     Ok(next)
 }
-#[allow(dead_code)]
 pub(crate) fn load_checkpoint(
     db: &Database,
     id: &str,
@@ -829,7 +827,6 @@ pub(crate) fn load_checkpoint(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn claim_call(
     db: &Database,
     run: &str,
@@ -872,7 +869,6 @@ pub(crate) fn claim_call(
     tx.commit().map_err(|e| e.to_string())?;
     Ok(result)
 }
-#[allow(dead_code)]
 pub(crate) fn complete_call(
     db: &Database,
     run: &str,
@@ -930,7 +926,6 @@ type PatchReadBarrier = (
 static TEST_PAUSE_AFTER_PATCH_READ: std::sync::Mutex<Option<PatchReadBarrier>> =
     std::sync::Mutex::new(None);
 // 2026-11-16: 논리 호출과 승인 요청을 같은 트랜잭션에 기록해 중단 후 파일 효과를 추정해 재실행하지 않는다.
-#[allow(dead_code)]
 pub(crate) fn submit_bound_patch(
     db: &Database,
     id: &str,
