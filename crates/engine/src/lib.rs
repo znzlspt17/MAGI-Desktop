@@ -142,6 +142,7 @@ impl Engine {
             Command::CreateProject { .. }
                 | Command::StartRun { .. }
                 | Command::PutKnowledge { .. }
+                | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
                 | Command::RequestMcpApproval { .. }
                 | Command::ApproveTool { .. }
@@ -429,6 +430,7 @@ impl Engine {
             Command::Status
                 | Command::SearchKnowledge { .. }
                 | Command::SearchKnowledgePage { .. }
+                | Command::SearchKnowledgeVector { .. }
                 | Command::GetKnowledgeSource { .. }
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
@@ -449,7 +451,8 @@ impl Engine {
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. }
-            | Command::PutKnowledge { project_id, .. } => Some(project_id),
+            | Command::PutKnowledge { project_id, .. }
+            | Command::SetKnowledgeEmbedding { project_id, .. } => Some(project_id),
             _ => None,
         };
         let run = match &command {
@@ -514,6 +517,14 @@ impl Engine {
                 }
                 if state=="saved" || state=="superseded" {self.finish_startup_recovery();}
                 Ok(ResponseData::Data(serde_json::json!({"state":state})))
+            }
+            Command::SetKnowledgeEmbedding { project_id, document_id, version, model, vector } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::set_embedding(&db, &project_id, &document_id, version, model, vector)
+            }
+            Command::SearchKnowledgeVector { project_id, model, vector, offset, limit } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                knowledge_text::search_vector(&db, &project_id, model, vector, offset, limit)
             }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;

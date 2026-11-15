@@ -111,3 +111,68 @@ pub(crate) fn search(
         serde_json::json!({"mode":"text","results":index.text_search(query,offset,limit)}),
     ))
 }
+
+// 2026-11-16: 손상된 checkpoint를 덮어쓰지 않아 복구할 수 없는 기존 벡터를 조용히 잃지 않게 한다.
+pub(crate) fn set_embedding(
+    db: &Database,
+    project_id: &str,
+    document_id: &str,
+    version: u64,
+    model: serde_json::Value,
+    vector: Vec<f32>,
+) -> Result<ResponseData, String> {
+    let model: integrations::EmbeddingModel = serde_json::from_value(model).map_err(err)?;
+    let tx = db.begin_write().map_err(err)?;
+    {
+        let projects = tx.open_table(PROJECTS).map_err(err)?;
+        if projects.get(project_id).map_err(err)?.is_none() {
+            return Err("project not found".into());
+        }
+    }
+    let sources: Vec<Document> = {
+        let table = tx.open_table(SOURCES).map_err(err)?;
+        let row = table.get(project_id).map_err(err)?;
+        match row {
+            Some(row) => serde_json::from_str(row.value()).map_err(err)?,
+            None => vec![],
+        }
+    };
+    let checkpoint = {
+        let table = tx.open_table(KNOWLEDGE).map_err(err)?;
+        let row = table.get(project_id).map_err(err)?;
+        row.map(|v| v.value().to_owned())
+    };
+    let mut index = match checkpoint {
+        Some(value) => {
+            KnowledgeIndex::restore(value.as_bytes()).map_err(|_| "invalid knowledge checkpoint")?
+        }
+        None => KnowledgeIndex::rebuild(sources)?,
+    };
+    index.set_embedding(document_id, version, model, vector)?;
+    let checkpoint = index.checkpoint()?;
+    {
+        let mut table = tx.open_table(KNOWLEDGE).map_err(err)?;
+        table
+            .insert(project_id, std::str::from_utf8(&checkpoint).map_err(err)?)
+            .map_err(err)?;
+    }
+    tx.commit().map_err(err)?;
+    Ok(ResponseData::Empty)
+}
+
+// 2026-11-16: 일치하는 모델의 저장 벡터만 사용하고 원문 출처를 결과와 함께 반환한다.
+pub(crate) fn search_vector(
+    db: &Database,
+    project_id: &str,
+    model: serde_json::Value,
+    vector: Vec<f32>,
+    offset: usize,
+    limit: usize,
+) -> Result<ResponseData, String> {
+    let model: integrations::EmbeddingModel = serde_json::from_value(model).map_err(err)?;
+    let index = read(db, project_id)?;
+    let results = index.semantic_search(&vector, &model, offset, limit)?;
+    Ok(ResponseData::Data(
+        serde_json::json!({"mode":"semantic","results":results}),
+    ))
+}
