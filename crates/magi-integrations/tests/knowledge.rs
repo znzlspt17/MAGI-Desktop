@@ -104,3 +104,25 @@ fn cancelled_embedding_cannot_publish_late_result() {
         .is_err());
     assert!(index.semantic_search(&[1.0, 0.0], &model, 0, 1).is_err());
 }
+
+#[test]
+fn checkpoint_never_returns_unrestorable_oversized_data() {
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    let document = |text: String| Document {
+        id: "large".into(),
+        version: 1,
+        source: "source".into(),
+        text,
+    };
+    let empty = KnowledgeIndex::rebuild(vec![document(String::new())]).unwrap();
+    let overhead = empty.checkpoint().unwrap().len();
+    let exact = KnowledgeIndex::rebuild(vec![document("x".repeat(MAX_BYTES - overhead))]).unwrap();
+    let bytes = exact.checkpoint().unwrap();
+    assert_eq!(bytes.len(), MAX_BYTES);
+    assert!(KnowledgeIndex::restore(&bytes).is_ok());
+    drop(bytes);
+    drop(exact);
+    let too_large =
+        KnowledgeIndex::rebuild(vec![document("x".repeat(MAX_BYTES - overhead + 1))]).unwrap();
+    assert!(too_large.checkpoint().is_err());
+}
