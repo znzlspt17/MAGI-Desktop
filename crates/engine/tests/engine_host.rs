@@ -15,7 +15,7 @@ fn status_reports_only_current_engine_capabilities() {
     match response.result.unwrap() {
         ResponseData::Status { message } => assert_eq!(
             message,
-            "engine ready; worktree preparation and storage recovery available; generation and models unavailable"
+            "engine ready; worktree preparation, spec generation and storage recovery available; agents and local inference unavailable"
         ),
         _ => panic!("expected engine status"),
     }
@@ -100,7 +100,7 @@ async fn process_serves_status_and_rejects_unavailable_commands() {
     }
     let request = Request {
         id: "unsupported".into(),
-        command: Command::GenerateSpec {
+        command: Command::ListHistory {
             project_id: "fixture".into(),
         },
     };
