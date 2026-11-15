@@ -123,6 +123,30 @@ impl Engine {
                 }
                 Ok(ResponseData::Projects(projects))
             }
+            Command::ConfigureModel {
+                project_id,
+                provider,
+                model,
+                capabilities,
+            } => self.update(&project_id, |project| {
+                if !["mock", "openai", "local"].contains(&provider.as_str())
+                    || model.trim().is_empty()
+                {
+                    return Err("unsupported provider or empty model".into());
+                }
+                // 2026-11-15: 설정 변경 후 기존 평가가 새 문맥의 평가로 오인되지 않게 한다.
+                let next_context = project
+                    .context_version
+                    .checked_add(1)
+                    .ok_or("interview context version exhausted")?;
+                project.model_settings = Some(domain::ModelSettings {
+                    provider,
+                    model,
+                    capabilities,
+                });
+                project.context_version = next_context;
+                Ok(ResponseData::Project(project.clone()))
+            }),
             Command::SubmitInterview {
                 project_id,
                 message,
