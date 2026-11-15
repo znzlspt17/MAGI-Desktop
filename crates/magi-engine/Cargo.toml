@@ -1,0 +1,13 @@
+[package]
+name = "magi-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magi-core = { path = "../magi-core" }
+redb = "2"
+serde_json.workspace = true
+sha2 = "0.10"
+tokio.workspace = true
+uuid = { version = "1", features = ["v4"] }

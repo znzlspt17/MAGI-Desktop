@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/magi-core", "crates/magi-inference", "crates/magi-transport", "crates/magi-provider"]
+members = ["crates/magi-core", "crates/magi-inference", "crates/magi-transport", "crates/magi-provider", "crates/magi-engine"]
 
 [workspace.package]
 edition = "2021"
