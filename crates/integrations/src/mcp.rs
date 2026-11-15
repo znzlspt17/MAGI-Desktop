@@ -132,8 +132,8 @@ impl McpClient {
                             }
                             let item: Value =
                                 serde_json::from_str(&data).map_err(|_| "invalid MCP SSE data")?;
-                            if item.get("id").is_some() && item.get("id") == body.get("id") {
-                                return Ok((item, session));
+                            if let Some(matched) = matching_response(item, body.get("id")) {
+                                return Ok((matched, session));
                             }
                         }
                     }
@@ -164,7 +164,7 @@ impl McpClient {
                 }
                 let item: Value =
                     serde_json::from_str(&data).map_err(|_| "invalid MCP SSE data")?;
-                if item.get("id") == expected_id && expected_id.is_some() {
+                if let Some(item) = matching_response(item, expected_id) {
                     matched = Some(item);
                     break;
                 }
@@ -230,6 +230,17 @@ impl McpClient {
         Err("too many MCP pages".into())
     }
 }
+// 2026-11-15: 협상된 MCP 버전의 SSE는 단일 메시지와 배치를 모두 허용한다.
+fn matching_response(item: Value, expected_id: Option<&Value>) -> Option<Value> {
+    let expected_id = expected_id?;
+    match item {
+        Value::Array(items) => items
+            .into_iter()
+            .find(|value| value.get("id") == Some(expected_id)),
+        item if item.get("id") == Some(expected_id) => Some(item),
+        _ => None,
+    }
+}
 fn rpc_result(response: Value, id: u64) -> Result<Value, String> {
     if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || response.get("id").and_then(Value::as_u64) != Some(id)
@@ -271,22 +282,26 @@ impl McpClient {
         if !authorization.permits(name, &arguments, cwd) {
             return Err("tool approval required".into());
         }
-        if !arguments.is_object() || !jsonschema::is_valid(schema, &arguments) {
+        // 2026-11-15: 외부 서버가 잘못된 schema를 보내도 panic 없이 호출 전에 거절한다.
+        let validator = jsonschema::validator_for(schema).map_err(|_| "invalid MCP tool schema")?;
+        if !arguments.is_object() || !validator.is_valid(&arguments) {
             return Err("tool arguments do not match schema".into());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response, _) = self.post(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}), false).await?;
         let result = rpc_result(response, id)?;
-        let content = result
+        // 2026-11-15: 잘못된 서버 응답을 빈 성공으로 해석하지 않는다.
+        let object = result.as_object().ok_or("invalid MCP tool result")?;
+        let content = object
             .get("content")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default();
-        let structured_content = result.get("structuredContent").cloned();
-        let is_error = result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .ok_or("invalid MCP tool content")?;
+        let structured_content = object.get("structuredContent").cloned();
+        let is_error = match object.get("isError") {
+            None => false,
+            Some(value) => value.as_bool().ok_or("invalid MCP tool error flag")?,
+        };
         Ok(ToolResult {
             content,
             structured_content,
