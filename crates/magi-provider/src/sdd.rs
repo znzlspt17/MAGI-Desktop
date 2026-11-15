@@ -93,6 +93,9 @@ pub struct SpecResult {
     pub rubric_hash: String,
     #[serde(default)]
     pub draft_hash: String,
+    // 2026-11-15: 보존한 초안과 질문을 낸 후보의 평가 근거를 혼동하지 않게 분리한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_review: Option<Box<SpecResult>>,
 }
 fn bad() -> ProviderError {
     ProviderError("Invalid specification response")
@@ -250,6 +253,8 @@ pub fn validate_draft_structure(draft: &magi_core::SpecDraft) -> Result<Vec<usiz
 // 2026-11-14: rubric 판정은 지정된 초안 섹션의 인용과 원문 근거, 연결된 결함을 확인한 뒤 점수를 제한한다.
 pub fn parse_candidate(raw: &str, input: &SpecInput) -> Result<SpecResult, ProviderError> {
     let mut c: SpecResult = serde_json::from_str(raw).map_err(|_| bad())?;
+    // 2026-11-15: 병합 이력은 이 실행에서만 만들고 모델이 제공한 이력은 신뢰하지 않는다.
+    c.question_review = None;
     if c.policy_version != POLICY_VERSION
         || input.request.trim().is_empty()
         || input.base_revision.trim().is_empty()
@@ -549,6 +554,15 @@ async fn generate_spec_inner(
         let candidate = parse_candidate(&response.text, &input)?;
         if !candidate.draft.mandatory_questions.is_empty() {
             if let Some(mut prior) = best.filter(|b| b.score >= candidate.score) {
+                // 2026-11-15: 후속 후보의 핵심 실패는 이전 초안에 합쳐져도 4점 상한을 유지한다.
+                let core_failure = candidate.verdicts.iter().any(|verdict| {
+                    !verdict.passed
+                        && input
+                            .rubric
+                            .iter()
+                            .any(|item| item.id == verdict.rubric_id && item.importance == "core")
+                });
+                prior.question_review = Some(Box::new(candidate.clone()));
                 for q in candidate.draft.mandatory_questions {
                     if !prior.draft.mandatory_questions.contains(&q) {
                         prior.draft.mandatory_questions.push(q);
@@ -564,7 +578,9 @@ async fn generate_spec_inner(
                         prior.draft.optional_issues.push(issue);
                     }
                 }
-                if !prior.draft.required_failures.is_empty() {
+                if core_failure {
+                    prior.score = prior.score.min(4);
+                } else if !prior.draft.required_failures.is_empty() {
                     prior.score = prior.score.min(7);
                 }
                 if !prior.draft.optional_issues.is_empty() {

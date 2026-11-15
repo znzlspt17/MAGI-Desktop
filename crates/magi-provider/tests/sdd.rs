@@ -399,3 +399,34 @@ async fn context_is_rechecked_after_feedback_grows() {
     assert!(result.unwrap_err().to_string().contains("context"));
     assert!(task.await.unwrap());
 }
+
+#[tokio::test]
+async fn merged_core_failure_keeps_cap_and_source_review() {
+    let mut best = candidate();
+    best["proposed_score"] = json!(8);
+    best["score"] = json!(8);
+    best["draft"]["title"] = json!("best");
+    let mut later = failed("major");
+    later["draft"]["title"] = json!("question candidate");
+    later["draft"]["mandatory_questions"] = json!(["결정 필요"]);
+    let (result, _) = revisions(vec![best, later], input("core")).await;
+    assert_eq!(result.draft.title, "best");
+    assert_eq!(result.draft.mandatory_questions, vec!["결정 필요"]);
+    assert_eq!(result.score, 4);
+    let saved = serde_json::to_value(&result).unwrap();
+    assert_eq!(saved["verdicts"][0]["passed"], true);
+    assert_eq!(
+        saved["question_review"]["draft"]["title"],
+        "question candidate"
+    );
+    assert_eq!(saved["question_review"]["verdicts"][0]["passed"], false);
+    assert_eq!(saved["question_review"]["issues"][0]["checklist_id"], "i1");
+}
+
+#[test]
+fn model_supplied_question_review_is_not_accepted_as_history() {
+    let mut raw = candidate();
+    raw["question_review"] = candidate();
+    let result = parse_candidate(&raw.to_string(), &input("core")).unwrap();
+    assert!(result.question_review.is_none());
+}
