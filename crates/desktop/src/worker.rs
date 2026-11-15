@@ -7,6 +7,23 @@ use std::sync::{
 };
 
 pub enum Kind {
+    KnowledgePut {
+        project_id: String,
+        epoch: u64,
+    },
+    KnowledgeSearch {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        query: String,
+        offset: usize,
+    },
+    KnowledgeSource {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        document_id: String,
+    },
     HistoryPage {
         project_id: String,
         request: u64,
