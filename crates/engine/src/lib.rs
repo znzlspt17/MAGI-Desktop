@@ -3,6 +3,7 @@
 //! 실행 복구와 모델 제공자 등 나머지 엔진 기능은 아직 연결되지 않았다.
 
 pub mod agent_loop;
+pub mod tools;
 mod worktree;
 
 use domain::{ApprovedSpec, Command, Project, Request, Response, ResponseData, SpecDraft};
