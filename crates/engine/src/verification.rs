@@ -43,6 +43,7 @@ pub(crate) async fn verify(
         let run = crate::runs::get(&db, &run_id)?;
         if run["agent_attempt"].as_u64() != Some(expected_attempt)
             || expected_attempt == 0
+            || run["agent_active"].as_bool() != Some(true)
             || run["status"] != "awaiting_implementation"
         {
             return Err("stale run".into());
@@ -149,7 +150,9 @@ pub(crate) async fn verify(
             requirement_ids: binding.requirement_ids.clone(),
             acceptance_ids: binding.acceptance_ids.clone(),
         };
-        crate::runs::record_verification(&db, &run_id, &run, &project, &evidence, &cancel)?;
+        crate::runs::record_verification(
+            &db, &run_id, &run, &project, &evidence, &task_id, &cancel,
+        )?;
         Ok(evidence)
     })
     .await
@@ -251,7 +254,7 @@ mod tests {
         let config = serde_json::json!({"role":"implementer","model":"fixture","tools":["read"],"limits":{}});
         let spec = serde_json::json!({"version":1,"hash":"fixture","base_revision":revision,"scope":["src"],"requirements":["req"],"acceptance":["accept"],"tasks":[task],"task_bindings":[{"task_id":"task","goal":"goal","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]}]});
         let project = serde_json::json!({"id":"project","name":"fixture","path":repo,"draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":spec,"context_version":2,"agent_configs":[config]});
-        let run = serde_json::json!({"id":run_id,"project_id":"project","spec_hash":"fixture","spec_version":1,"revision":revision,"scope":["src"],"worktree":work,"status":"awaiting_implementation","events":[],"context_version":2,"agent_attempt":1,"agent_configs":[config],"evidence":[]});
+        let run = serde_json::json!({"id":run_id,"project_id":"project","spec_hash":"fixture","spec_version":1,"revision":revision,"scope":["src"],"worktree":work,"status":"awaiting_implementation","events":[],"context_version":2,"agent_active":true,"agent_attempt":1,"agent_configs":[config],"evidence":[]});
         {
             let mut table = tx.open_table(crate::PROJECTS).unwrap();
             table
@@ -330,6 +333,24 @@ mod tests {
             tx.commit().unwrap();
         };
         let mut no_read_project = project.clone();
+        let mut inactive_run = run.clone();
+        inactive_run["agent_active"] = false.into();
+        replace_run(&inactive_run);
+        assert_eq!(
+            verify(
+                Arc::clone(&engine),
+                run_id.clone(),
+                "task".into(),
+                "read_contains:src/a.txt:actual".into(),
+                "inactive".into(),
+                1,
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+            "stale run"
+        );
+        replace_run(&run);
         no_read_project["agent_configs"][0]["tools"] = serde_json::json!([]);
         let mut no_read_run = run.clone();
         no_read_run["agent_configs"][0]["tools"] = serde_json::json!([]);
@@ -405,6 +426,10 @@ mod tests {
         assert_eq!(evidence.requirement_ids, vec!["requirement-0"]);
         assert_eq!(evidence.acceptance_ids, vec!["acceptance-0"]);
         assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["evidence_contexts"]["verify-1"],
+            serde_json::json!({"schema_version":1,"spec_version":1,"context_version":2,"agent_attempt":1,"task_id":"task"})
+        );
+        assert_eq!(
             crate::runs::get(&db, &run_id).unwrap()["evidence"]
                 .as_array()
                 .unwrap()
@@ -451,6 +476,7 @@ mod tests {
             &expected_run,
             &expected_project,
             &evidence,
+            "task",
             &CancellationToken::new()
         )
         .is_err());
@@ -461,6 +487,10 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        assert!(crate::runs::get(&reopened, &run_id)
+            .unwrap()
+            .get("evidence_contexts")
+            .is_none());
         drop(reopened);
         assert!(verify(
             Arc::clone(&engine),

@@ -9,6 +9,7 @@ pub(crate) fn record_verification(
     expected_run: &serde_json::Value,
     expected_project: &domain::Project,
     evidence: &domain::VerificationEvidence,
+    task_id: &str,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
@@ -50,6 +51,24 @@ pub(crate) fn record_verification(
             return Err("duplicate verification id".into());
         }
         items.push(serde_json::to_value(evidence).map_err(|_| "invalid evidence")?);
+        let context = serde_json::json!({
+            "schema_version": 1,
+            "spec_version": run["spec_version"].as_u64().ok_or("invalid spec version")?,
+            "context_version": run["context_version"].as_u64().ok_or("invalid context version")?,
+            "agent_attempt": run["agent_attempt"].as_u64().ok_or("invalid agent attempt")?,
+            "task_id": task_id,
+        });
+        let contexts = run
+            .as_object_mut()
+            .ok_or("invalid run")?
+            .entry("evidence_contexts")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("invalid evidence contexts")?;
+        if contexts.contains_key(&evidence.verification_id) {
+            return Err("duplicate verification id".into());
+        }
+        contexts.insert(evidence.verification_id.clone(), context);
         table
             .insert(id, run.to_string().as_str())
             .map_err(|e| e.to_string())?;
