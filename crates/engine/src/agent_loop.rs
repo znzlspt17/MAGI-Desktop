@@ -127,6 +127,29 @@ pub trait ModelDriver: Send + Sync {
         remaining_tokens: u64,
     ) -> impl std::future::Future<Output = Result<provider::Generation, String>> + Send;
 }
+// 2026-11-14: 역할마다 명시된 provider만 사용하여 모델을 임의 대체하지 않는다.
+pub struct OpenAiModels(pub HashMap<String, provider::OpenAiProvider>);
+impl ModelDriver for OpenAiModels {
+    async fn generate(
+        &self,
+        role: &str,
+        input: serde_json::Value,
+        tools: Vec<serde_json::Value>,
+        cancel: tokio_util::sync::CancellationToken,
+        remaining_tokens: u64,
+    ) -> Result<provider::Generation, String> {
+        let provider = self.0.get(role).ok_or("role model unavailable")?;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        let result = provider
+            .generate_with_limit(input, tools, cancel, sender, remaining_tokens)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = drain.await;
+        result
+    }
+}
+
 pub trait ToolDriver: Send + Sync {
     fn progress(&self, _stage: &str, _task_id: &str, _role: &str) {}
     fn fresh(
