@@ -558,7 +558,7 @@ impl Engine {
                 message: if self.completions.blocked() {
                     "engine storage recovery pending"
                 } else {
-                    "engine ready; worktree preparation, spec generation and storage recovery available; agents and local inference unavailable"
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
                 }.into(),
             }),
             Command::CreateProject { name, path } => {
@@ -1066,6 +1066,36 @@ fn validate_tasks(tasks: &[domain::TaskSpec], scope: &[String]) -> Result<(), St
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod status_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn ready_status_identifies_execution_and_resume_support() {
+        let root = std::env::temp_dir().join(format!("magi-status-guide-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let engine = Engine::open(&root.join("state.redb")).unwrap();
+        let response = engine.handle(Request {
+            id: "status".into(),
+            command: Command::Status,
+        });
+        match response.result.unwrap() {
+            ResponseData::Status { message } => assert_eq!(message, "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"),
+            _ => panic!("expected status"),
+        }
+        drop(engine);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-status-guide-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]
