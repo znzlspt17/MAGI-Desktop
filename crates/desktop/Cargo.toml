@@ -8,6 +8,7 @@ license.workspace = true
 domain = { package = "core", path = "../core" }
 transport = { path = "../transport" }
 eframe = "0.31"
+anyhow = "1"
 tokio.workspace = true
 
 [dev-dependencies]

@@ -16,6 +16,8 @@ struct State {
     status: String,
     projects: Vec<Project>,
     creating: bool,
+    starting: bool,
+    status_pending: bool,
 }
 
 impl State {
@@ -52,20 +54,37 @@ struct App {
     state: State,
     tx: SyncSender<worker::Work>,
     rx: Receiver<worker::Reply>,
+    cancel_startup: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
     fn send(&mut self, work: worker::Work) -> bool {
+        let status = matches!(&work.kind, worker::Kind::Status);
+        if status && self.state.status_pending {
+            return false;
+        }
+        if status {
+            self.cancel_startup
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         if self.tx.try_send(work).is_err() {
             self.state.status = "요청 대기열이 가득 찼거나 엔진 연결이 종료됐습니다".into();
             return false;
+        }
+        if status {
+            self.state.status_pending = true;
         }
         true
     }
 
     fn apply(&mut self, reply: worker::Reply) {
         use worker::Kind;
+        let is_status = matches!(&reply.kind, Kind::Status);
         match reply.kind {
+            Kind::Starting => {
+                self.state.starting = true;
+                self.state.status = "엔진 시작 대기 중".into();
+            }
             Kind::Status => match reply.result {
                 Ok(ResponseData::Status { message }) => {
                     self.state.status = if message
@@ -109,6 +128,10 @@ impl App {
                 self.state.created(&name, &path, result);
             }
         }
+        if is_status {
+            self.state.starting = false;
+            self.state.status_pending = false;
+        }
     }
 
     fn render(&mut self, ctx: &egui::Context) {
@@ -120,6 +143,16 @@ impl App {
                 ui.heading("MAGI Desktop");
                 ui.separator();
                 ui.label(&self.state.status);
+                if self.state.starting
+                    && ui
+                        .button("시작 대기 취소")
+                        .on_hover_text("대기만 중단하며 이미 시작된 엔진은 종료하지 않습니다.")
+                        .clicked()
+                {
+                    self.cancel_startup
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.state.status = "엔진 시작 대기 취소 중".into();
+                }
             });
         });
         egui::SidePanel::left("sidebar")
@@ -196,6 +229,13 @@ impl eframe::App for App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        self.cancel_startup
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn main() -> eframe::Result {
     eframe::run_native(
         "MAGI Desktop",
@@ -224,7 +264,7 @@ fn main() -> eframe::Result {
                     }
                 }
             });
-            let (tx, rx) = worker::start(cc.egui_ctx.clone());
+            let (tx, rx, cancel_startup) = worker::start(cc.egui_ctx.clone());
             let mut app = App {
                 state: State {
                     status: "엔진 연결 중".into(),
@@ -232,6 +272,7 @@ fn main() -> eframe::Result {
                 },
                 tx,
                 rx,
+                cancel_startup,
             };
             app.send(worker::Work::new(worker::Kind::Status, Command::Status));
             app.send(worker::Work::new(worker::Kind::List, Command::ListProjects));
@@ -295,6 +336,7 @@ mod tests {
             },
             tx,
             rx,
+            cancel_startup: Default::default(),
         };
         assert!(app.send(worker::Work::new(worker::Kind::Status, Command::Status)));
         assert!(!app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
@@ -311,6 +353,7 @@ mod tests {
             state: State::default(),
             tx,
             rx,
+            cancel_startup: Default::default(),
         };
         app.apply(worker::Reply {
             kind: worker::Kind::Status,
@@ -324,6 +367,31 @@ mod tests {
     }
 
     #[test]
+    fn startup_progress_and_cancellation_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(2);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.apply(worker::Reply {
+            kind: worker::Kind::Starting,
+            result: Ok(ResponseData::Status {
+                message: "엔진 시작 대기 중".into(),
+            }),
+        });
+        assert!(app.state.starting);
+        app.apply(worker::Reply {
+            kind: worker::Kind::Status,
+            result: Err("엔진 시작 대기가 취소됐습니다".into()),
+        });
+        assert!(!app.state.starting);
+        assert!(app.state.status.contains("취소"));
+    }
+
+    #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
         let (tx, _work) = std::sync::mpsc::sync_channel(8);
         let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -331,6 +399,7 @@ mod tests {
             state: State::default(),
             tx,
             rx,
+            cancel_startup: Default::default(),
         };
         for scale in [1.0, 2.0, 3.0] {
             let ctx = egui::Context::default();
@@ -353,6 +422,7 @@ mod tests {
                 },
                 tx,
                 rx,
+                cancel_startup: Default::default(),
             };
             let ctx = egui::Context::default();
             let mut time = 0.0;
