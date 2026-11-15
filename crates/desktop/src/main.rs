@@ -5,6 +5,7 @@ use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
 mod decisions_ui;
+mod knowledge_graph_ui;
 mod knowledge_text_ui;
 mod model_settings;
 mod run_history;
@@ -45,6 +46,7 @@ struct State {
     history: run_history::History,
     knowledge: knowledge_text_ui::State,
     decisions: decisions_ui::State,
+    graph: knowledge_graph_ui::State,
 }
 
 impl State {
@@ -55,6 +57,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.graph.select(id);
         self.decisions.select(id);
         self.knowledge.select(id);
         self.history.project(id);
@@ -901,6 +904,35 @@ impl App {
                     self.state.decisions.refresh_needed.insert(project_id);
                 }
             }
+            Kind::GraphPage {
+                project_id,
+                epoch,
+                request,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.graph.active.as_deref() == Some(&project_id)
+                    && self.state.graph.epoch == epoch
+                    && self.state.graph.page_request == request
+                {
+                    let page = self.state.graph.pages.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(data)) => match knowledge_graph_ui::edges(&data) {
+                            Ok(edges) => {
+                                page.edges = edges;
+                                page.offset = offset;
+                                page.loaded = true;
+                                page.error = None;
+                            }
+                            Err(_) => {
+                                page.error = Some("출처 관계 응답이 올바르지 않습니다.".into())
+                            }
+                        },
+                        Err(error) => page.error = Some(format!("출처 관계 조회 실패: {error}")),
+                        _ => page.error = Some("출처 관계 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -1389,6 +1421,27 @@ impl App {
                                         self.state.decisions.pending.insert(project.id.clone());
                                     }
                                 }
+                            }
+                        }
+                        self.state.graph.select(&project.id);
+                        if let Some(offset) =
+                            knowledge_graph_ui::render(ui, &mut self.state.graph, &project.id)
+                        {
+                            let request = self.state.graph.page_request.wrapping_add(1);
+                            if self.send(worker::Work::new(
+                                worker::Kind::GraphPage {
+                                    project_id: project.id.clone(),
+                                    epoch: self.state.graph.epoch,
+                                    request,
+                                    offset,
+                                },
+                                Command::GetGraphPage {
+                                    project_id: project.id.clone(),
+                                    offset,
+                                    limit: knowledge_graph_ui::PAGE_SIZE,
+                                },
+                            )) {
+                                self.state.graph.page_request = request;
                             }
                         }
                         self.state.knowledge.select(&project.id);
@@ -4666,6 +4719,190 @@ mod tests {
         assert_eq!(app.state.decisions.forms["b"].records[0]["id"], "b1");
     }
 
+    #[test]
+    fn graph_query_control_is_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="출처 관계 불러오기")));
+    }
+
+    #[test]
+    fn graph_query_requests_page_for_selected_project() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 10000.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "출처 관계 불러오기" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetGraphPage{project_id,offset:0,limit:30} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn graph_page_distinguishes_source_and_document_with_same_id() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        let request = app.state.graph.page_request;
+        app.apply(worker::Reply{kind:worker::Kind::GraphPage{project_id:"a".into(),epoch,request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"nodes":[{"id":"같은","kind":"source"},{"id":"같은","kind":"document","version":2}],"edges":[{"source":"같은","document_id":"같은","document_version":2}]})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in ["출처: 같은", "문서: 같은 (v2)"] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn graph_rejects_edge_without_corresponding_typed_nodes() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        let request = app.state.graph.page_request;
+        app.apply(worker::Reply{kind:worker::Kind::GraphPage{project_id:"a".into(),epoch,request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"nodes":[{"id":"same","kind":"source"}],"edges":[{"source":"same","document_id":"same","document_version":1}]})))});
+        assert!(app.state.graph.pages["a"].edges.is_empty());
+        assert!(app.state.graph.pages["a"].error.is_some());
+    }
+
+    #[test]
+    fn graph_late_error_and_project_round_trip_do_not_replace_current_page() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let old_epoch = app.state.graph.epoch;
+        app.state.graph.select("b");
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        app.state.graph.page_request = 2;
+        let data = serde_json::json!({"nodes":[{"id":"s","kind":"source"},{"id":"d","kind":"document","version":1}],"edges":[{"source":"s","document_id":"d","document_version":1}]});
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch,
+                request: 2,
+                offset: 30,
+            },
+            result: Ok(ResponseData::Data(data)),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch,
+                request: 1,
+                offset: 0,
+            },
+            result: Err("늦은 오류".into()),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch: old_epoch,
+                request: 2,
+                offset: 0,
+            },
+            result: Err("이전 선택 오류".into()),
+        });
+        let page = &app.state.graph.pages["a"];
+        assert_eq!(page.offset, 30);
+        assert_eq!(page.edges.len(), 1);
+        assert!(page.error.is_none());
+    }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
         let (tx, _work) = std::sync::mpsc::sync_channel(8);
