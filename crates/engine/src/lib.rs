@@ -391,6 +391,7 @@ impl Engine {
                 | Command::GetProject { .. }
                 | Command::ListProjects
                 | Command::GetRun { .. }
+                | Command::GetDiff { .. }
                 | Command::ListRuns { .. }
                 | Command::ListEvents { .. }
                 | Command::CancelRun { .. }
@@ -474,6 +475,10 @@ impl Engine {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 runs::cancel(&db, &run_id)?;
                 Ok(ResponseData::Empty)
+            }
+            Command::GetDiff { run_id } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                Ok(ResponseData::Data(runs::diff(&db, &run_id)?))
             }
             Command::ListEvents { run_id, after } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
