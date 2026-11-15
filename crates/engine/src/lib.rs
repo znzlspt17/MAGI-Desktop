@@ -9,6 +9,7 @@ mod agent_runtime;
 mod completion;
 mod knowledge_text;
 mod mcp_runtime;
+mod package_export;
 mod project_decisions;
 mod runs;
 mod storage;
@@ -456,6 +457,7 @@ impl Engine {
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. }
+            | Command::ExportPackage { project_id, .. }
             | Command::SaveDecision { project_id, .. }
             | Command::ReviseDecision { project_id, .. }
             | Command::SelectDecision { project_id, .. }
@@ -467,6 +469,7 @@ impl Engine {
             Command::StartAgent { run_id, .. }
             | Command::ResumeAgent { run_id, .. }
             | Command::SubmitTool { run_id, .. }
+            | Command::ExportRunPackage { run_id, .. }
             | Command::ApproveTool { run_id, .. }
             | Command::RequestMcpApproval { run_id, .. } => Some(run_id),
             _ => None,
@@ -549,6 +552,14 @@ impl Engine {
             Command::SelectDecision { project_id, id, version } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 project_decisions::select_decision(db, project_id, id, version)
+            }
+            Command::ExportPackage { project_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_project(&db, &project_id, Path::new(&destination))
+            }
+            Command::ExportRunPackage { run_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_run(&db, &run_id, Path::new(&destination))
             }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
