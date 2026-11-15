@@ -8,6 +8,7 @@ mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_text_ui;
 mod model_settings;
+mod run_controls;
 mod run_history;
 mod spec_review;
 mod storage;
@@ -47,6 +48,8 @@ struct State {
     knowledge: knowledge_text_ui::State,
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
+    execution_pending: std::collections::HashSet<String>,
+    cancel_pending: std::collections::HashSet<String>,
 }
 
 impl State {
@@ -97,6 +100,54 @@ struct App {
 }
 
 impl App {
+    fn cancel_execution(&mut self, project_id: &str, run_id: &str) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || self.state.history.project.as_deref() != Some(project_id)
+            || self.state.history.selected.as_deref() != Some(run_id)
+            || self.state.cancel_pending.contains(run_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::CancelExecution {
+                project_id: project_id.into(),
+                run_id: run_id.into(),
+                request: self.state.history.selection_request,
+            },
+            Command::CancelRun {
+                run_id: run_id.into(),
+            },
+        )) {
+            self.state.cancel_pending.insert(run_id.into());
+        }
+    }
+    fn start_execution(&mut self, project: &Project) {
+        let clean = self
+            .state
+            .spec_forms
+            .get(&project.id)
+            .is_none_or(|form| form.is_clean(project));
+        let pending = self.state.spec_review_pending.contains(&project.id)
+            || self.state.execution_pending.contains(&project.id);
+        if self.state.selected.as_deref() != Some(&project.id) {
+            return;
+        }
+        if let Some(hash) = run_controls::start_hash(project, clean, pending) {
+            if self.send(worker::Work::new(
+                worker::Kind::StartExecution {
+                    project_id: project.id.clone(),
+                    generation: self.state.generation,
+                },
+                Command::StartRun {
+                    project_id: project.id.clone(),
+                    expected_approved_hash: hash,
+                },
+            )) {
+                self.state.execution_pending.insert(project.id.clone());
+            }
+        }
+    }
+
     fn decision_failed(&mut self, project_id: &str, message: String) {
         self.state
             .decisions
@@ -904,6 +955,51 @@ impl App {
                     self.state.decisions.refresh_needed.insert(project_id);
                 }
             }
+            Kind::CancelExecution {
+                project_id,
+                run_id,
+                request,
+            } => {
+                self.state.cancel_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Empty) => {
+                            self.state.status =
+                                "취소를 요청했습니다. 실행 상태를 다시 확인합니다.".into();
+                            self.send(worker::Work::new(
+                                worker::Kind::HistoryDetail {
+                                    project_id,
+                                    run_id: run_id.clone(),
+                                    request,
+                                },
+                                Command::GetRun { run_id },
+                            ));
+                        }
+                        Err(error) => self.state.status = format!("취소 요청 실패: {error}"),
+                        _ => self.state.status = "취소 응답이 올바르지 않습니다.".into(),
+                    }
+                }
+            }
+            Kind::StartExecution {
+                project_id,
+                generation,
+            } => {
+                self.state.execution_pending.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.generation == generation
+                {
+                    match reply.result {
+                        Ok(ResponseData::Run { run_id }) => {
+                            self.state.status = format!("실행 시작: {run_id}")
+                        }
+                        Err(error) => self.state.status = format!("실행 시작 실패: {error}"),
+                        _ => self.state.status = "실행 시작 응답이 올바르지 않습니다.".into(),
+                    }
+                }
+            }
             Kind::GraphPage {
                 project_id,
                 epoch,
@@ -1098,7 +1194,34 @@ impl App {
                     if let Some(project) = self.state.project.clone() {
                         ui.heading(&project.name);
                         ui.label(&project.path);
+                        let clean = self
+                            .state
+                            .spec_forms
+                            .get(&project.id)
+                            .is_none_or(|form| form.is_clean(&project));
+                        let pending = self.state.spec_review_pending.contains(&project.id)
+                            || self.state.execution_pending.contains(&project.id);
+                        if ui
+                            .add_enabled(
+                                run_controls::start_hash(&project, clean, pending).is_some(),
+                                egui::Button::new("실행 시작"),
+                            )
+                            .clicked()
+                        {
+                            self.start_execution(&project);
+                        }
                         self.state.history.project(&project.id);
+                        if let Some(run_id) = self.state.history.selected.clone() {
+                            if ui
+                                .add_enabled(
+                                    !self.state.cancel_pending.contains(&run_id),
+                                    egui::Button::new("취소 요청"),
+                                )
+                                .clicked()
+                            {
+                                self.cancel_execution(&project.id, &run_id);
+                            }
+                        }
                         if let Some(action) = run_history::render(ui, &self.state.history) {
                             match action {
                                 run_history::Action::Page(offset) => {
@@ -4902,6 +5025,164 @@ mod tests {
         assert_eq!(page.offset, 30);
         assert_eq!(page.edges.len(), 1);
         assert!(page.error.is_none());
+    }
+    #[test]
+    fn start_execution_sends_the_saved_approval_identifier() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.start_execution(&p);
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::StartRun{project_id,expected_approved_hash} if project_id=="a" && expected_approved_hash=="h")
+        );
+    }
+    #[test]
+    fn execution_start_button_is_visible_for_approved_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let out = egui::Context::default().run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 시작")
+        ));
+    }
+    #[test]
+    fn cancel_execution_targets_only_the_selected_run() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        app.cancel_execution("a", "r2");
+        assert!(work.try_recv().is_err());
+        app.cancel_execution("a", "r1");
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::CancelRun{run_id} if run_id=="r1")
+        );
+    }
+    #[test]
+    fn selected_run_shows_cancel_control() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        let out = egui::Context::default().run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="취소 요청")
+        ));
+    }
+    #[test]
+    fn execution_queue_full_and_late_cancel_preserve_selection() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        app.start_execution(&p);
+        assert!(!app.state.execution_pending.contains("a"));
+        assert!(app.state.status.contains("대기열"));
+        app.cancel_execution("a", "r1");
+        assert!(!app.state.cancel_pending.contains("r1"));
+        assert!(work.try_recv().is_err());
+        let old = app.state.history.selection_request;
+        app.state.history.selection_request += 1;
+        app.state.history.selected = Some("r2".into());
+        app.state.status = "현재 선택".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::CancelExecution {
+                project_id: "a".into(),
+                run_id: "r1".into(),
+                request: old,
+            },
+            result: Err("늦은 오류".into()),
+        });
+        assert_eq!(app.state.status, "현재 선택");
+        assert_eq!(app.state.history.selected.as_deref(), Some("r2"));
+    }
+    #[test]
+    fn start_execution_blocks_pending_and_ignores_old_project_reply() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        app.start_execution(&p);
+        assert!(work.try_recv().is_err());
+        app.state.spec_review_pending.clear();
+        app.start_execution(&p);
+        let item = work.try_recv().unwrap();
+        app.start_execution(&p);
+        assert!(work.try_recv().is_err());
+        app.state.select("b");
+        app.state.status = "다른 프로젝트".into();
+        app.apply(worker::Reply {
+            kind: item.kind,
+            result: Err("이전 오류".into()),
+        });
+        assert_eq!(app.state.status, "다른 프로젝트");
+        assert!(!app.state.execution_pending.contains("a"));
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {

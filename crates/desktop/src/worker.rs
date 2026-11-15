@@ -7,6 +7,15 @@ use std::sync::{
 };
 
 pub enum Kind {
+    CancelExecution {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
+    StartExecution {
+        project_id: String,
+        generation: u64,
+    },
     GraphPage {
         project_id: String,
         epoch: u64,
