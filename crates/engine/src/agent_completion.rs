@@ -80,6 +80,20 @@ fn review_proof(
     let mut ids = Vec::new();
     for task in &spec.tasks {
         for (index, command) in task.validation.iter().enumerate() {
+            // 2026-11-16: 검증 결과가 승인된 작업의 요구사항과 인수 조건에 귀속됐는지 확인한다.
+            let mut bindings = spec
+                .task_bindings
+                .iter()
+                .filter(|binding| binding.task_id == task.id);
+            let Some(task_binding) = bindings.next() else {
+                return Ok(None);
+            };
+            if bindings.next().is_some()
+                || task_binding.requirement_ids.is_empty()
+                || task_binding.acceptance_ids.is_empty()
+            {
+                return Ok(None);
+            }
             let verification_id = serde_json::to_string(&(&task.id, "final_validation", index))
                 .map_err(|_| "invalid verification id")?;
             let mut matches = items
@@ -99,6 +113,8 @@ fn review_proof(
             if !evidence.passed
                 || evidence.spec_hash != spec.hash
                 || evidence.command != *command
+                || evidence.requirement_ids != task_binding.requirement_ids
+                || evidence.acceptance_ids != task_binding.acceptance_ids
                 || context["schema_version"] != 1
                 || context["spec_version"] != spec.version
                 || context["context_version"] != project.context_version
@@ -393,11 +409,23 @@ pub(crate) fn finish_agent(
                         e["sequence"].as_u64().and_then(|n| n.checked_add(1))
                     })
                     .ok_or("invalid event sequence")?;
-                events.push(serde_json::json!({"sequence":seq,"run_id":id,"attempt":1,"kind":kind,"message":message}));
+                events.push(serde_json::json!({"sequence":seq,"run_id":id,"attempt":attempt,"kind":kind,"message":message}));
                 table
                     .insert(id, run.to_string().as_str())
                     .map_err(|e| e.to_string())?;
             }
+        }
+        // 2026-11-16: 결과가 stale이어도 이미 끝난 동일 시도의 자원 표시는 남기지 않는다.
+        if !applied
+            && !cancelled_cleanup
+            && run["project_id"] == project_id
+            && run["agent_active"] == true
+            && run["agent_attempt"] == attempt
+        {
+            run["agent_active"] = false.into();
+            table
+                .insert(id, run.to_string().as_str())
+                .map_err(|e| e.to_string())?;
         }
         applied || cancelled_cleanup
     };
@@ -459,7 +487,7 @@ mod tests {
         let run_id = uuid::Uuid::new_v4().to_string();
         let project_id = uuid::Uuid::new_v4().to_string();
         let command = "read_contains:src/a.txt:after";
-        let spec = serde_json::json!({"version":1,"hash":"fixture","base_revision":revision,"scope":["src"],"requirements":["req"],"acceptance":["accept"],"tasks":[{"id":"task","dependencies":[],"owned_paths":["src"],"validation":[command]}]});
+        let spec = serde_json::json!({"version":1,"hash":"fixture","base_revision":revision,"scope":["src"],"requirements":["req"],"acceptance":["accept"],"tasks":[{"id":"task","dependencies":[],"owned_paths":["src"],"validation":[command]}],"task_bindings":[{"task_id":"task","goal":"goal","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]}]});
         let project = serde_json::json!({"id":project_id,"name":"fixture","path":repo,"draft":{"title":"fixture","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"fixture","approved":spec,"context_version":2});
         let mut run = serde_json::json!({"id":run_id,"project_id":project_id,"spec_hash":"fixture","spec_version":1,"revision":revision,"scope":["src"],"worktree":worktree,"status":"awaiting_implementation","events":[],"context_version":2,"agent_active":true,"agent_attempt":1,"evidence":[],"custom":"preserved"});
         let tx = db.begin_write().unwrap();
@@ -475,7 +503,7 @@ mod tests {
         tx.commit().unwrap();
         let diff = crate::runs::diff(&db, &run_id).unwrap();
         let id = serde_json::to_string(&("task", "final_validation", 0)).unwrap();
-        let evidence = serde_json::json!({"verification_id":id,"revision":revision,"spec_hash":"fixture","command":command,"passed":true,"output":"fixture","worktree_hash":diff["worktree_hash"],"requirement_ids":[],"acceptance_ids":[]});
+        let evidence = serde_json::json!({"verification_id":id,"revision":revision,"spec_hash":"fixture","command":command,"passed":true,"output":"fixture","worktree_hash":diff["worktree_hash"],"requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]});
         run["evidence"] = serde_json::json!([evidence]);
         run["evidence_contexts"] = serde_json::json!({id.clone():{"schema_version":1,"spec_version":1,"context_version":2,"agent_attempt":1,"task_id":"task"}});
         let tx = db.begin_write().unwrap();
@@ -498,11 +526,70 @@ mod tests {
             verification_ids: vec![id],
         };
         let (_, digest) = review_input(&spec, &evidence, &diff, &binding).unwrap();
+        let mut missing_binding: domain::Project = serde_json::from_value(project.clone()).unwrap();
+        missing_binding
+            .approved
+            .as_mut()
+            .unwrap()
+            .task_bindings
+            .clear();
+        assert!(review_proof(&db, &run_id, &run, &missing_binding)
+            .unwrap()
+            .is_none());
+        let second_id = uuid::Uuid::new_v4().to_string();
+        let mut second = run.clone();
+        second["id"] = second_id.clone().into();
+        second["agent_attempt"] = 2.into();
+        second["evidence_contexts"][&binding.verification_ids[0]]["agent_attempt"] = 2.into();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(RUNS).unwrap();
+            table
+                .insert(second_id.as_str(), second.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let mut second_binding = binding.clone();
+        second_binding.agent_attempt = 2;
+        let (_, second_digest) = review_input(&spec, &evidence, &diff, &second_binding).unwrap();
+        crate::runs::claim_call(&db, &second_id, "final-review", &second_digest).unwrap();
+        crate::runs::complete_call(
+            &db,
+            &second_id,
+            "final-review",
+            serde_json::json!({"approved":true,"binding":second_binding}),
+        )
+        .unwrap();
+        let second_manager = crate::completion::CompletionManager::empty(
+            root.join("second-journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let second_record =
+            crate::completion::CompletionManager::agent_record(&second_id, &project_id, true, 2);
+        second_manager.preserve_failed_handoff(second_record.clone());
+        assert_eq!(second_manager.retry(&db, &second_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &second_id).unwrap()["events"][0]["attempt"],
+            2
+        );
+        second_manager.preserve_failed_handoff(second_record);
+        assert_eq!(second_manager.retry(&db, &second_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &second_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         for mode in [
             "failed_verification",
             "wrong_snapshot",
             "wrong_context",
             "wrong_binding",
+            "missing_requirements",
+            "wrong_requirements",
+            "missing_acceptance",
+            "wrong_acceptance",
         ] {
             let bad_id = uuid::Uuid::new_v4().to_string();
             let mut bad_run = run.clone();
@@ -514,6 +601,20 @@ mod tests {
                     bad_run["evidence_contexts"][&binding.verification_ids[0]]["agent_attempt"] =
                         2.into()
                 }
+                "missing_requirements" => {
+                    bad_run["evidence"][0]["requirement_ids"] = serde_json::json!([])
+                }
+                "wrong_requirements" => {
+                    bad_run["evidence"][0]["requirement_ids"] =
+                        serde_json::json!(["requirement-other"])
+                }
+                "missing_acceptance" => {
+                    bad_run["evidence"][0]["acceptance_ids"] = serde_json::json!([])
+                }
+                "wrong_acceptance" => {
+                    bad_run["evidence"][0]["acceptance_ids"] =
+                        serde_json::json!(["acceptance-other"])
+                }
                 _ => {}
             }
             let tx = db.begin_write().unwrap();
@@ -524,7 +625,10 @@ mod tests {
                     .unwrap();
             }
             tx.commit().unwrap();
-            crate::runs::claim_call(&db, &bad_id, "final-review", &digest).unwrap();
+            let bad_evidence: Vec<domain::VerificationEvidence> =
+                serde_json::from_value(bad_run["evidence"].clone()).unwrap();
+            let (_, bad_digest) = review_input(&spec, &bad_evidence, &diff, &binding).unwrap();
+            crate::runs::claim_call(&db, &bad_id, "final-review", &bad_digest).unwrap();
             let mut bad_binding = binding.clone();
             if mode == "wrong_binding" {
                 bad_binding.agent_attempt = 2;
@@ -672,6 +776,10 @@ mod tests {
         tx.commit().unwrap();
         proceed_tx.send(()).unwrap();
         assert!(!worker.join().unwrap());
+        assert_eq!(
+            crate::runs::get(&db, &stale_id).unwrap()["agent_active"],
+            false
+        );
         assert!(crate::runs::get(&db, &stale_id).unwrap()["events"]
             .as_array()
             .unwrap()

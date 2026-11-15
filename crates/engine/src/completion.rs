@@ -1557,6 +1557,44 @@ mod agent_journal_tests {
     use super::*;
     #[cfg(windows)]
     #[test]
+    fn interrupted_completion_preserves_second_attempt_on_retry() {
+        let root =
+            std::env::temp_dir().join(format!("agent-attempt-event-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let db = redb::Database::create(root.join("state.redb")).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        seed_approved_project(&db, &project_id);
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            table.insert(run_id.as_str(), serde_json::json!({"id":run_id,"project_id":project_id,"status":"awaiting_implementation","agent_active":true,"agent_attempt":2,"events":[],"spec_hash":"fixture","spec_version":1,"context_version":1}).to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let manager = CompletionManager::empty(
+            root.join("journal"),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 2);
+        manager.preserve_failed_handoff(record.clone());
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["events"][0]["attempt"], 2);
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "saved");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[cfg(windows)]
+    #[test]
     fn cancelled_success_clears_worker_even_if_project_is_unavailable() {
         let root =
             std::env::temp_dir().join(format!("agent-cancel-missing-{}", uuid::Uuid::new_v4()));
@@ -2011,13 +2049,19 @@ mod agent_journal_tests {
             root.join("journal"),
             std::sync::Arc::new(std::sync::Mutex::new(())),
         );
-        manager.preserve_failed_handoff(CompletionManager::agent_record(
-            &run_id,
-            &project_id,
-            false,
-            1,
-        ));
+        let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
+        manager.preserve_failed_handoff(record.clone());
         assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["agent_active"],
+            false
+        );
+        manager.preserve_failed_handoff(record);
+        assert_eq!(manager.retry(&db, &run_id).unwrap(), "superseded");
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["agent_active"],
+            false
+        );
         assert_eq!(
             crate::runs::get(&db, &run_id).unwrap()["events"]
                 .as_array()
@@ -2025,6 +2069,11 @@ mod agent_journal_tests {
                 .len(),
             0
         );
+        drop(db);
+        let reopened = redb::Database::open(root.join("state.redb")).unwrap();
+        let stored = crate::runs::get(&reopened, &run_id).unwrap();
+        assert_eq!(stored["agent_active"], false);
+        assert_eq!(stored["status"], "awaiting_implementation");
     }
     #[cfg(windows)]
     #[test]
