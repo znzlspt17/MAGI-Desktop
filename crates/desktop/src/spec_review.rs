@@ -66,7 +66,7 @@ impl Form {
     }
 }
 pub(crate) enum Action {
-    Save(Result<domain::SpecDraft, String>),
+    Save(Result<Box<domain::SpecDraft>, String>),
     Approve(Vec<String>),
 }
 pub(crate) fn render(
@@ -180,7 +180,7 @@ pub(crate) fn render(
         ui.text_edit_multiline(value);
     }
     if save {
-        Some(Action::Save(form.draft()))
+        Some(Action::Save(form.draft().map(Box::new)))
     } else if approve {
         Some(Action::Approve(project.draft.optional_issues.clone()))
     } else {

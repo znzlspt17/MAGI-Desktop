@@ -802,6 +802,7 @@ impl App {
                         ) {
                             match action {
                                 spec_review::Action::Save(Ok(draft)) => {
+                                    let draft = *draft;
                                     let submitted = draft.clone();
                                     if self.send(worker::Work::new(
                                         worker::Kind::SaveDraft {
