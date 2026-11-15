@@ -1,5 +1,6 @@
 //! 로컬 프로젝트와 명세 생성, 실행 결과 저장 및 복구를 제공한다.
 
+mod agent_execution;
 pub mod agent_loop;
 mod completion;
 mod runs;
@@ -25,8 +26,9 @@ pub struct Engine {
     slots: Arc<std::sync::atomic::AtomicUsize>,
     startup_recovery_pending: std::sync::atomic::AtomicBool,
     completions: Arc<completion::CompletionManager>,
-    cancellations:
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    cancellations: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    >,
     credentials:
         std::sync::Mutex<std::collections::HashMap<String, (String, domain::SecretString)>>,
 }
@@ -353,7 +355,7 @@ impl Engine {
         self.cancellations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(run_id.clone(), token.clone());
+            .insert(run_id.clone(), Arc::new(token.clone()));
         if let Err(error) = runs::begin_generation(
             db.as_ref(),
             &run_id,
