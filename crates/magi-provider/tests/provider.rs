@@ -326,3 +326,53 @@ async fn explicit_limit_is_sent_and_zero_is_rejected() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn embeddings_validate_index_dimensions_and_number_range() {
+    use magi_provider::{OpenAiEmbeddingConfig, OpenAiEmbeddingProvider};
+    for (body, valid) in [
+        (
+            r#"{"data":[{"index":1,"embedding":[3,4]},{"index":0,"embedding":[1,2]}]}"#,
+            true,
+        ),
+        (
+            r#"{"data":[{"index":0,"embedding":[1,2]},{"index":0,"embedding":[3,4]}]}"#,
+            false,
+        ),
+        (
+            r#"{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[3,4]}]}"#,
+            false,
+        ),
+        (
+            r#"{"data":[{"index":0,"embedding":[1e100,2]},{"index":1,"embedding":[3,4]}]}"#,
+            false,
+        ),
+    ] {
+        let raw = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .into_boxed_str(),
+        );
+        let c = OpenAiEmbeddingConfig {
+            endpoint: server(raw).await,
+            model: "text-embedding-3-small".into(),
+            api_key: "fake-test-key".into(),
+            dimensions: 2,
+            max_response_bytes: 2048,
+        };
+        let result = OpenAiEmbeddingProvider::new(c)
+            .unwrap()
+            .embed(
+                vec!["a".into(), "b".into()],
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result.is_ok(), valid);
+        if let Ok(v) = result {
+            assert_eq!(v, vec![vec![1., 2.], vec![3., 4.]]);
+        }
+    }
+}
