@@ -195,3 +195,248 @@ fn unknown_verification_can_be_returned_as_mandatory_question() {
     let result = parse_candidate(&c.to_string(), &input("core"));
     assert!(result.is_ok());
 }
+
+async fn revisions(
+    responses: Vec<Value>,
+    inp: SpecInput,
+) -> (magi_provider::sdd::SpecResult, usize) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    let task = tokio::spawn(async move {
+        for c in responses {
+            let Ok(Ok((mut s, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(800), listener.accept())
+                    .await
+            else {
+                break;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut b = [0; 16384];
+            let _ = s.read(&mut b).await;
+            let body = format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":c.to_string()}]}]}})
+            );
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(raw.as_bytes()).await;
+        }
+    });
+    let provider = magi_provider::OpenAiProvider::new(magi_provider::OpenAiConfig {
+        endpoint: format!("http://{addr}/v1/responses"),
+        model: "gpt-6".into(),
+        api_key: "fake-test-key".into(),
+        max_output_bytes: 20000,
+    })
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let result = magi_provider::sdd::generate_spec(
+        &provider,
+        inp,
+        tokio_util::sync::CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    task.await.unwrap();
+    (result, count.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn stops_after_two_stale_rounds_and_keeps_highest() {
+    let mut a = failed("major");
+    a["proposed_score"] = json!(3);
+    a["draft"]["title"] = json!("first");
+    let mut b = a.clone();
+    b["proposed_score"] = json!(4);
+    b["draft"]["title"] = json!("best");
+    let mut low = a.clone();
+    low["draft"]["title"] = json!("low");
+    let (r, n) = revisions(vec![a, b, low.clone(), low.clone(), low], input("core")).await;
+    assert_eq!(r.draft.title, "best");
+    assert_eq!(r.score, 4);
+    assert_eq!(n, 4);
+}
+
+#[tokio::test]
+async fn lower_scored_question_stops_without_losing_best() {
+    let mut a = failed("major");
+    a["draft"]["title"] = json!("best");
+    let mut b = a.clone();
+    b["draft"]["title"] = json!("lower");
+    b["proposed_score"] = json!(1);
+    b["draft"]["mandatory_questions"] = json!(["어느 범위인가요?"]);
+    let (r, n) = revisions(vec![a, b], input("core")).await;
+    assert_eq!(r.draft.title, "best");
+    assert_eq!(r.draft.mandatory_questions, vec!["어느 범위인가요?"]);
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn merged_question_updates_hash_and_caps_required_failure() {
+    use sha2::{Digest, Sha256};
+    let mut a = failed("minor");
+    a["draft"]["title"] = json!("best");
+    let mut b = a.clone();
+    b["draft"]["mandatory_questions"] = json!(["결정 필요"]);
+    b["draft"]["required_failures"] = json!(["추가 필수 실패"]);
+    let (result, _) = revisions(vec![a, b], input("secondary")).await;
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&result.draft).unwrap())
+    );
+    assert_eq!(result.draft_hash, actual);
+    assert!(result.score <= 7);
+    assert!(result
+        .draft
+        .required_failures
+        .contains(&"추가 필수 실패".to_owned()));
+}
+
+#[tokio::test]
+async fn question_merge_preserves_new_optional_issue() {
+    let mut a = failed("minor");
+    a["draft"]["title"] = json!("best");
+    let mut b = a.clone();
+    b["draft"]["mandatory_questions"] = json!(["결정 필요"]);
+    b["draft"]["optional_issues"] = json!(["추가 선택 이슈"]);
+    b["proposed_score"] = json!(1);
+    let (r, _) = revisions(vec![a, b], input("secondary")).await;
+    assert!(r
+        .draft
+        .optional_issues
+        .contains(&"추가 선택 이슈".to_owned()));
+}
+
+#[tokio::test]
+async fn context_limit_rejects_before_connecting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provider = magi_provider::OpenAiProvider::new(magi_provider::OpenAiConfig {
+        endpoint: format!("http://{addr}/v1/responses"),
+        model: "gpt-6".into(),
+        api_key: "fake-test-key".into(),
+        max_output_bytes: 10000,
+    })
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        magi_provider::sdd::generate_spec_with_context(
+            &provider,
+            input("core"),
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+            10,
+            5,
+        ),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "context 제한은 네트워크 전에 실패해야 합니다"
+    );
+    assert!(result.unwrap().is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn context_is_rechecked_after_feedback_grows() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut b = [0; 16384];
+        let _ = s.read(&mut b).await;
+        let mut c = failed("minor");
+        c["assumptions"] = json!(["x".repeat(15000)]);
+        let body = format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":c.to_string()}]}]}})
+        );
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        s.write_all(raw.as_bytes()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
+    });
+    let provider = magi_provider::OpenAiProvider::new(magi_provider::OpenAiConfig {
+        endpoint: format!("http://{addr}/v1/responses"),
+        model: "gpt-6".into(),
+        api_key: "fake-test-key".into(),
+        max_output_bytes: 40000,
+    })
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let result = magi_provider::sdd::generate_spec_with_context(
+        &provider,
+        input("secondary"),
+        tokio_util::sync::CancellationToken::new(),
+        tx,
+        12000,
+        100,
+    )
+    .await;
+    assert!(result.unwrap_err().to_string().contains("context"));
+    assert!(task.await.unwrap());
+}
+
+#[tokio::test]
+async fn merged_core_failure_keeps_cap_and_source_review() {
+    let mut best = candidate();
+    best["proposed_score"] = json!(8);
+    best["score"] = json!(8);
+    best["draft"]["title"] = json!("best");
+    let mut later = failed("major");
+    later["draft"]["title"] = json!("question candidate");
+    later["draft"]["mandatory_questions"] = json!(["결정 필요"]);
+    let (result, _) = revisions(vec![best, later], input("core")).await;
+    assert_eq!(result.draft.title, "best");
+    assert_eq!(result.draft.mandatory_questions, vec!["결정 필요"]);
+    assert_eq!(result.score, 4);
+    let saved = serde_json::to_value(&result).unwrap();
+    assert_eq!(saved["verdicts"][0]["passed"], true);
+    assert_eq!(
+        saved["question_review"]["draft"]["title"],
+        "question candidate"
+    );
+    assert_eq!(saved["question_review"]["verdicts"][0]["passed"], false);
+    assert_eq!(saved["question_review"]["issues"][0]["checklist_id"], "i1");
+    let restored: magi_provider::sdd::SpecResult = serde_json::from_value(saved).unwrap();
+    assert_eq!(
+        restored.question_review.unwrap().draft.title,
+        "question candidate"
+    );
+}
+
+#[test]
+fn model_supplied_question_review_is_not_accepted_as_history() {
+    let mut raw = candidate();
+    raw["question_review"] = candidate();
+    let result = parse_candidate(&raw.to_string(), &input("core")).unwrap();
+    assert!(result.question_review.is_none());
+    for untrusted in [json!("unexpected"), json!({}), json!([1, 2])] {
+        raw["question_review"] = untrusted;
+        let result = parse_candidate(&raw.to_string(), &input("core")).unwrap();
+        assert!(result.question_review.is_none());
+    }
+}
