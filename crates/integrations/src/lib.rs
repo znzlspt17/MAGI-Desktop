@@ -467,3 +467,5 @@ mod zip_tests {
         std::fs::remove_dir(root).unwrap();
     }
 }
+
+pub mod mcp;
