@@ -7,7 +7,12 @@ use std::sync::{
 };
 
 pub enum Kind {
-    GraphPage {project_id:String,epoch:u64,request:u64,offset:usize},
+    GraphPage {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        offset: usize,
+    },
     DecisionSave {
         project_id: String,
         epoch: u64,
