@@ -206,6 +206,36 @@ pub(crate) fn start(
     attempt
 }
 // 2026-11-15: Git 작업 중 취소 요청은 종료 확인이 아니므로 cancelling으로만 기록한다.
+// 2026-11-16: 생성 시점의 초안과 문맥을 같은 쓰기 트랜잭션에서 확인한다.
+pub(crate) fn begin_generation(
+    db: &Database,
+    id: &str,
+    project_id: &str,
+    expected: &str,
+    context_version: u64,
+) -> Result<(), String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+        let value = projects
+            .get(project_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("project not found")?;
+        let project: domain::Project =
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+        if project.draft_hash != expected || project.context_version != context_version {
+            return Err("draft or context changed".into());
+        }
+    }
+    let run = serde_json::json!({"id":id,"project_id":project_id,"spec_hash":expected,"revision":"","status":"generating","worktree":"","events":[{"sequence":1,"run_id":id,"attempt":1,"kind":"generating","message":"명세 생성 요청을 시작했습니다."}],"spec_version":0,"scope":[],"pending":null,"report":null,"context_version":context_version,"agent_configs":[],"autonomy_mode":"","model_provider":"","model_capabilities":null,"agent_active":false,"agent_attempt":0,"resources_unknown":false,"used_calls":[],"evidence":[]});
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let json = run.to_string();
+        table.insert(id, json.as_str()).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
 pub(crate) fn cancel(db: &Database, id: &str) -> Result<(), String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
     {
@@ -218,6 +248,7 @@ pub(crate) fn cancel(db: &Database, id: &str) -> Result<(), String> {
             serde_json::from_str(value.value()).map_err(|e| e.to_string())?
         };
         let next = match run["status"].as_str() {
+            Some("generating") => Some(("cancelled", "작업을 취소했습니다.")),
             Some("preparing") => Some(("cancelling", "취소를 요청했습니다.")),
             Some("awaiting_implementation") => Some(("cancelled", "작업을 취소했습니다.")),
             _ => None,
@@ -390,6 +421,116 @@ pub(crate) fn finish_worktree(
             false
         }
     };
+    {
+        let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
+        table
+            .insert(completion_id, u8::from(applied))
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(applied)
+}
+// 2026-11-16: 평가 보고서와 프로젝트 초안 및 완료 marker를 같은 트랜잭션에 기록한다.
+pub(crate) fn finish_generation(
+    db: &Database,
+    id: &str,
+    result: Result<provider::sdd::SpecResult, String>,
+    completion_id: &str,
+) -> Result<bool, String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let previous = {
+        let table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
+        let value = table
+            .get(completion_id)
+            .map_err(|e| e.to_string())?
+            .map(|v| v.value());
+        value
+    };
+    if let Some(value) = previous {
+        {
+            let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
+            table
+                .insert(completion_id, value)
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(value != 0);
+    }
+    let mut run: serde_json::Value = {
+        let table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let value = table
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("run not found")?;
+        serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+    };
+    if run["status"].as_str() != Some("generating") {
+        {
+            let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
+            table.insert(completion_id, 0).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(false);
+    }
+    let mut applied = true;
+    match result {
+        Ok(report) => {
+            let draft = report.draft.clone();
+            run["report"] = serde_json::to_value(report).map_err(|e| e.to_string())?;
+            let project_id = run["project_id"]
+                .as_str()
+                .ok_or("invalid run project")?
+                .to_owned();
+            let mut table = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+            let mut project: domain::Project = {
+                let value = table
+                    .get(project_id.as_str())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("project not found")?;
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+            };
+            if run["spec_hash"].as_str() != Some(project.draft_hash.as_str())
+                || run["context_version"].as_u64() != Some(project.context_version)
+            {
+                applied = false;
+                run["status"] = "stale".into();
+                append_event(
+                    &mut run,
+                    id,
+                    "stale",
+                    "생성 중 초안 또는 입력이 변경되어 결과를 적용하지 않았습니다.",
+                )?;
+            } else {
+                project.draft_hash = crate::draft_hash(&draft)?;
+                project.assessment = Some(domain::AssessmentRef {
+                    draft_hash: project.draft_hash.clone(),
+                    context_version: project.context_version,
+                });
+                project.draft = draft;
+                project.approved = None;
+                let json = serde_json::to_string(&project).map_err(|e| e.to_string())?;
+                table
+                    .insert(project_id.as_str(), json.as_str())
+                    .map_err(|e| e.to_string())?;
+                run["status"] = "generated".into();
+                append_event(
+                    &mut run,
+                    id,
+                    "generated",
+                    "명세 초안을 생성했습니다. 사용자 검토가 필요합니다.",
+                )?;
+            }
+        }
+        Err(_) => {
+            run["status"] = "failed".into();
+            append_event(&mut run, id, "failed", "명세 생성 요청이 실패했습니다.")?;
+        }
+    }
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(&run).map_err(|e| e.to_string())?;
+        table.insert(id, json.as_str()).map_err(|e| e.to_string())?;
+    }
     {
         let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
         table

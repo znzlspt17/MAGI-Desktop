@@ -1,5 +1,5 @@
 // 2026-11-15: 지원하지 않는 journal stage를 건너뛰지 않도록 복구 전에 구별한다.
-fn parse_worktree_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
+fn parse_completion_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
     if bytes.len() > 4 * 1024 * 1024 {
         return Err("journal exceeds limit".into());
     }
@@ -15,27 +15,36 @@ fn parse_worktree_record(bytes: &[u8]) -> Result<serde_json::Value, String> {
     {
         return Err("invalid completion journal".into());
     }
-    if record.pointer("/outcome/stage").and_then(|v| v.as_str()) != Some("worktree") {
-        return Err("unsupported completion journal".into());
-    }
     let result = record
         .pointer("/outcome/result")
         .cloned()
         .ok_or("invalid completion journal")?;
-    let _: Result<(), String> =
-        serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+    match record
+        .pointer("/outcome/stage")
+        .and_then(|value| value.as_str())
+    {
+        Some("worktree") => {
+            let _: Result<(), String> =
+                serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+        }
+        Some("generation") => {
+            let _: Result<provider::sdd::SpecResult, String> =
+                serde_json::from_value(result).map_err(|_| "invalid completion journal")?;
+        }
+        _ => return Err("unsupported completion journal".into()),
+    }
     Ok(record)
 }
 
 #[cfg(windows)]
-fn publish_worktree_record(
+fn publish_completion_record(
     directory: &std::path::Path,
     record: &serde_json::Value,
 ) -> Result<std::path::PathBuf, String> {
     use std::{io::Write, os::windows::ffi::OsStrExt};
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
     let bytes = serde_json::to_vec(record).map_err(|_| "journal encoding failed")?;
-    let verified = parse_worktree_record(&bytes)?;
+    let verified = parse_completion_record(&bytes)?;
     let run_id = verified["run_id"]
         .as_str()
         .ok_or("invalid completion journal")?;
@@ -69,7 +78,7 @@ fn publish_worktree_record(
     Ok(target)
 }
 #[cfg(windows)]
-fn read_worktree_record(path: &std::path::Path) -> Result<serde_json::Value, String> {
+fn read_completion_record(path: &std::path::Path) -> Result<serde_json::Value, String> {
     use std::{
         io::Read,
         os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
@@ -97,7 +106,7 @@ fn read_worktree_record(path: &std::path::Path) -> Result<serde_json::Value, Str
     file.take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "journal unavailable")?;
-    parse_worktree_record(&bytes)
+    parse_completion_record(&bytes)
 }
 
 pub(crate) struct CompletionManager {
@@ -131,7 +140,7 @@ impl CompletionManager {
             } else {
                 uuid::Uuid::new_v4().to_string()
             };
-            let record = read_worktree_record(&path);
+            let record = read_completion_record(&path);
             let known = record
                 .as_ref()
                 .is_ok_and(|record| valid_id && record["run_id"].as_str() == Some(id.as_str()));
@@ -148,7 +157,7 @@ impl CompletionManager {
             pending.push(serde_json::json!({
                 "run_id": id,
                 "project_id": project_id,
-                "stage": if known { "worktree" } else { "unknown" },
+                "stage": if known { record.as_ref().ok().and_then(|item|item.pointer("/outcome/stage")).and_then(|value|value.as_str()).unwrap_or("unknown") } else { "unknown" },
                 "state": "pending",
                 "attempts": 0,
                 "journaled": known,
@@ -188,14 +197,50 @@ impl CompletionManager {
         project_id: &str,
         result: Result<(), String>,
     ) {
-        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":result}});
+        self.register_outcome(
+            db,
+            run_id,
+            project_id,
+            "worktree",
+            serde_json::json!(result),
+        );
+    }
+
+    // 2026-11-16: 생성 결과도 동일한 내구 journal과 재시도 경계를 사용한다.
+    #[cfg(windows)]
+    pub(crate) fn register_generation(
+        &self,
+        db: &redb::Database,
+        run_id: &str,
+        project_id: &str,
+        result: Result<provider::sdd::SpecResult, String>,
+    ) {
+        self.register_outcome(
+            db,
+            run_id,
+            project_id,
+            "generation",
+            serde_json::json!(result),
+        );
+    }
+
+    #[cfg(windows)]
+    fn register_outcome(
+        &self,
+        db: &redb::Database,
+        run_id: &str,
+        project_id: &str,
+        stage: &str,
+        result: serde_json::Value,
+    ) {
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":stage,"result":result}});
         {
             let _gate = self.mutation_gate.lock().unwrap_or_else(|e| e.into_inner());
             let mut entries = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             entries.push(serde_json::json!({
                 "run_id": run_id,
                 "project_id": project_id,
-                "stage": "worktree",
+                "stage": stage,
                 "state": "retrying",
                 "attempts": 0,
                 "journaled": false,
@@ -204,7 +249,7 @@ impl CompletionManager {
             }));
         }
         if let Some(dir) = &self.directory {
-            if let Ok(path) = publish_worktree_record(dir, &record) {
+            if let Ok(path) = publish_completion_record(dir, &record) {
                 if let Some(item) = self
                     .pending
                     .lock()
@@ -248,12 +293,12 @@ impl CompletionManager {
             }
         }
         if !self.for_run(run_id).is_null() {
-            self.log_event(run_id, "storage_pending");
+            self.log_event(run_id, stage, "storage_pending");
         }
     }
     // 2026-11-15: DB와 별도로 제한된 진단을 유지하며 로그 실패도 메모리에 표시한다.
     #[cfg(windows)]
-    fn log_event(&self, run_id: &str, action: &str) {
+    fn log_event(&self, run_id: &str, stage: &str, action: &str) {
         use std::{
             io::Write,
             os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
@@ -265,7 +310,7 @@ impl CompletionManager {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
-        let entry = serde_json::json!({"version":1,"timestamp_ms":timestamp,"run_id":run_id,"stage":"worktree","event":action});
+        let entry = serde_json::json!({"version":1,"timestamp_ms":timestamp,"run_id":run_id,"stage":stage,"event":action});
         {
             let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
             if logs.len() == 256 {
@@ -423,11 +468,6 @@ impl CompletionManager {
             {
                 continue;
             }
-            let Ok(result) =
-                serde_json::from_value::<Result<(), String>>(record["outcome"]["result"].clone())
-            else {
-                continue;
-            };
             let journaled = entry["journaled"].as_bool().unwrap_or(false);
             // 2026-11-15: 게시되지 않은 결과는 기존 기록이나 접근 불가 상태를 덮지 않는다.
             if !journaled {
@@ -439,10 +479,27 @@ impl CompletionManager {
                     _ => continue,
                 }
             }
-            let Ok(applied) = crate::runs::finish_worktree(db, run_id, &result, completion_id)
-            else {
-                continue;
+            let applied = match record
+                .pointer("/outcome/stage")
+                .and_then(|value| value.as_str())
+            {
+                Some("worktree") => serde_json::from_value::<Result<(), String>>(
+                    record["outcome"]["result"].clone(),
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|result| {
+                    crate::runs::finish_worktree(db, run_id, &result, completion_id)
+                }),
+                Some("generation") => serde_json::from_value::<
+                    Result<provider::sdd::SpecResult, String>,
+                >(record["outcome"]["result"].clone())
+                .map_err(|e| e.to_string())
+                .and_then(|result| {
+                    crate::runs::finish_generation(db, run_id, result, completion_id)
+                }),
+                _ => Err("unsupported completion journal".into()),
             };
+            let Ok(applied) = applied else { continue };
             if let Some(item) = self
                 .pending
                 .lock()
@@ -528,7 +585,7 @@ impl CompletionManager {
                 .cloned()
         };
         if let (Some(directory), Some(record)) = (&self.directory, record) {
-            if let Ok(path) = publish_worktree_record(directory, &record) {
+            if let Ok(path) = publish_completion_record(directory, &record) {
                 if let Some(item) = self
                     .pending
                     .lock()
@@ -581,8 +638,13 @@ impl CompletionManager {
             }
             .into();
         }
+        let stage = self.for_run(run_id)["stage"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
         self.log_event(
             run_id,
+            &stage,
             if busy {
                 "storage_busy"
             } else {
@@ -650,12 +712,12 @@ mod tests {
     fn recognizes_worktree_and_rejects_other_stages_without_rewriting() {
         let fixture = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let bytes = serde_json::to_vec(&fixture).unwrap();
-        assert_eq!(parse_worktree_record(&bytes).unwrap(), fixture);
+        assert_eq!(parse_completion_record(&bytes).unwrap(), fixture);
         for stage in ["generation", "agent", "unknown"] {
             let mut unsupported = fixture.clone();
             unsupported["outcome"]["stage"] = stage.into();
             let encoded = serde_json::to_vec(&unsupported).unwrap();
-            assert!(parse_worktree_record(&encoded).is_err());
+            assert!(parse_completion_record(&encoded).is_err());
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
                 unsupported
@@ -670,16 +732,16 @@ mod tests {
         let root = root.canonicalize().unwrap();
         let dir = root.join("state.redb.completion-journal");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
-        let path = publish_worktree_record(&dir, &record).unwrap();
+        let path = publish_completion_record(&dir, &record).unwrap();
         assert_eq!(
-            parse_worktree_record(&std::fs::read(&path).unwrap()).unwrap(),
+            parse_completion_record(&std::fs::read(&path).unwrap()).unwrap(),
             record
         );
         let mut changed = record.clone();
         changed["id"] = uuid::Uuid::new_v4().to_string().into();
-        assert!(publish_worktree_record(&dir, &changed).is_err());
+        assert!(publish_completion_record(&dir, &changed).is_err());
         assert_eq!(
-            parse_worktree_record(&std::fs::read(&path).unwrap()).unwrap(),
+            parse_completion_record(&std::fs::read(&path).unwrap()).unwrap(),
             record
         );
         std::fs::remove_file(path).unwrap();
@@ -697,9 +759,9 @@ mod tests {
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let bytes = serde_json::to_vec(&record).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read_worktree_record(&path).unwrap(), record);
+        assert_eq!(read_completion_record(&path).unwrap(), record);
         std::fs::hard_link(&path, &alias).unwrap();
-        assert!(read_worktree_record(&path).is_err());
+        assert!(read_completion_record(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(std::fs::read(&alias).unwrap(), bytes);
         std::fs::remove_file(path).unwrap();
@@ -727,11 +789,11 @@ mod tests {
         tx.commit().unwrap();
         let dir = root.join("state.redb.completion-journal");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":{"Ok":null}}});
-        let path = publish_worktree_record(&dir, &record).unwrap();
+        let path = publish_completion_record(&dir, &record).unwrap();
         let manager =
             CompletionManager::empty(dir.clone(), std::sync::Arc::new(std::sync::Mutex::new(())));
         manager.register(&db, &run_id, &project_id, Err("different result".into()));
-        assert_eq!(read_worktree_record(&path).unwrap(), record);
+        assert_eq!(read_completion_record(&path).unwrap(), record);
         assert_eq!(
             crate::runs::get(&db, &run_id).unwrap()["status"],
             "preparing"
@@ -774,6 +836,8 @@ mod tests {
             slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
             .handle(domain::Request {
@@ -805,7 +869,7 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         let record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("record.json")).unwrap()).unwrap();
-        publish_worktree_record(&root.join("state.redb.completion-journal"), &record).unwrap();
+        publish_completion_record(&root.join("state.redb.completion-journal"), &record).unwrap();
         std::process::exit(86);
     }
     #[cfg(windows)]
@@ -878,6 +942,153 @@ mod tests {
         drop(engine);
         std::fs::remove_file(root.join("record.json")).unwrap();
         std::fs::remove_dir(root.join("state.redb.completion-journal")).unwrap();
+        std::fs::remove_file(dbpath).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn generation_child_exit_replays_report_before_interruption_without_credentials() {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::temp_dir().join(format!("magi-crash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let dbpath = root.join("state.redb");
+        let engine = crate::Engine::open(&dbpath).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "not-created".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let project_id = project.id.clone();
+        let draft_hash = project.draft_hash.clone();
+        drop(engine);
+        let db = redb::Database::open(&dbpath).unwrap();
+        let tx = db.begin_write().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let data=serde_json::json!({"id":run_id,"project_id":project_id,"status":"generating","events":[],"spec_hash":draft_hash,"context_version":project.context_version}).to_string();
+            table.insert(run_id.as_str(), data.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let draft = domain::SpecDraft {
+            title: "생성됨".into(),
+            ..Default::default()
+        };
+        let report = serde_json::json!({"policy_version":1,"draft":draft,"assumptions":["추정"],"evidence":[],"verdicts":[],"issues":[],"revision_directives":[],"score_reason":"fixture","proposed_score":8,"score":8,"rubric_hash":"r","draft_hash":"d","question_review":null});
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"generation","result":{"Ok":report}}});
+        std::fs::write(
+            root.join("record.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "completion::tests::crash_after_publish_child",
+                "--nocapture",
+            ])
+            .env("MAGI_TEST_CRASH_DIRECTORY", &root)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(86));
+        let engine = crate::Engine::open(&dbpath).unwrap();
+        let result = engine
+            .handle(domain::Request {
+                id: "run".into(),
+                command: domain::Command::GetRun {
+                    run_id: run_id.clone(),
+                },
+            })
+            .result
+            .unwrap();
+        let run = match result {
+            domain::ResponseData::Data(v) => v,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "생성됨");
+        let events = engine
+            .handle(domain::Request {
+                id: "events".into(),
+                command: domain::Command::ListEvents { run_id, after: 0 },
+            })
+            .result
+            .unwrap();
+        let events = match events {
+            domain::ResponseData::Events(v) => v,
+            _ => panic!("events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "generated");
+        drop(engine);
+        std::fs::remove_file(root.join("record.json")).unwrap();
+        std::fs::remove_dir(root.join("state.redb.completion-journal")).unwrap();
+        std::fs::remove_file(dbpath).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn generation_journal_and_storage_failure_remain_memory_only_and_visible() {
+        let root = std::env::temp_dir().join(format!("journal-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let dbpath = root.join("state.redb");
+        let db = redb::Database::create(&dbpath).unwrap();
+        let directory = root.join("blocked");
+        std::fs::write(&directory, b"fixture").unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let manager = CompletionManager::empty(
+            directory.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        );
+        manager.register_generation(&db, &run_id, &project_id, Err("fake failure".into()));
+        let gate = std::sync::Arc::clone(&manager.mutation_gate);
+        let engine = crate::Engine {
+            db: crate::storage::StorageSlot::new(dbpath.clone(), db),
+            run_root: root.clone(),
+            git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+            completions: std::sync::Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        let response = engine
+            .handle(domain::Request {
+                id: "diagnostic".into(),
+                command: domain::Command::ListStorageFailures,
+            })
+            .result
+            .unwrap();
+        let status = match response {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("diagnostic"),
+        };
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        assert_eq!(status["log_available"], false);
+        assert_eq!(status["log_entries"].as_array().unwrap().len(), 1);
+        assert_eq!(std::fs::read(&directory).unwrap(), b"fixture");
+        drop(engine);
+        std::fs::remove_file(directory).unwrap();
         std::fs::remove_file(dbpath).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

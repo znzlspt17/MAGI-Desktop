@@ -232,6 +232,8 @@ mod tests {
         let engine = crate::Engine {
             db: slot,
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: dir.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
             mutation_gate: Arc::new(std::sync::Mutex::new(())),
@@ -381,6 +383,8 @@ mod tests {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let invoke = |command| {
             engine
@@ -552,6 +556,8 @@ mod tests {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let project = match engine
             .handle(domain::Request {
@@ -675,6 +681,8 @@ mod tests {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
             .handle(domain::Request {
@@ -744,6 +752,8 @@ mod tests {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let retry = engine
             .handle(domain::Request {
@@ -927,6 +937,8 @@ mod tests {
             slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(true),
             completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let status = engine
             .handle(domain::Request {
@@ -1056,5 +1068,652 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(root).unwrap();
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn generation_failure_is_diagnosed_and_retried_after_previous_io() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let value=serde_json::json!({"id":run_id,"project_id":project_id,"status":"generating","events":[]}).to_string();
+            table.insert(run_id.as_str(), value.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("dummy"))
+                .unwrap();
+            table.insert("x", 1).unwrap();
+        }
+        broken.store(true, Ordering::SeqCst);
+        assert!(tx.commit().is_err());
+        let slot = StorageSlot::new(path.clone(), db);
+        let journal = root.join("state.redb.completion-journal");
+        let manager = crate::completion::CompletionManager::empty(
+            journal.clone(),
+            Arc::new(std::sync::Mutex::new(())),
+        );
+        let db = slot.get().unwrap();
+        manager.register_generation(&db, &run_id, &project_id, Err("fake failure".into()));
+        drop(db);
+        let status = manager.status();
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], true);
+        broken.store(false, Ordering::SeqCst);
+        let engine = crate::Engine {
+            db: slot,
+            completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: Arc::new(std::sync::Mutex::new(())),
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        };
+        let response = engine.handle(domain::Request {
+            id: "retry".into(),
+            command: domain::Command::RetryCompletionSave {
+                run_id: run_id.clone(),
+            },
+        });
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry data"),
+        };
+        assert_eq!(value["state"], "saved");
+        let db = engine.db.get().unwrap();
+        assert_eq!(crate::runs::get(&db, &run_id).unwrap()["status"], "failed");
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    const GENERATION_HEADINGS: [&str; 24] = [
+        "# 최종 에이전트 명세",
+        "## 1. 목표",
+        "## 2. 배경",
+        "## 3. 사용자 의도",
+        "## 4. 범위",
+        "### 4.1 범위 포함",
+        "### 4.2 범위 제외",
+        "## 5. 용어 정의",
+        "## 6. 근거 요약",
+        "## 7. 필수 요구사항",
+        "## 8. 권장 요구사항",
+        "## 9. 선택 요구사항",
+        "## 10. 금지 행동",
+        "## 11. 입력 계약",
+        "## 12. 출력 계약",
+        "## 13. 아키텍처",
+        "## 14. 모듈 책임",
+        "## 15. 데이터 흐름",
+        "## 16. 오류 처리 정책",
+        "## 17. 설정 정책",
+        "## 18. 저장 및 산출물 정책",
+        "## 19. 구현 순서",
+        "## 20. 수용 기준",
+        "## 21. 테스트 계획",
+    ];
+    fn generation_markdown() -> String {
+        let mut s = GENERATION_HEADINGS
+            .iter()
+            .map(|h| format!("{h}\n검색 제공\n"))
+            .collect::<String>();
+        s.push_str(
+            "## 22. 수동 검증 확인 목록\n검색 제공\n## 23. AI 코딩 에이전트 지침\n검색 제공\n",
+        );
+        s
+    }
+
+    fn generation_candidate() -> serde_json::Value {
+        serde_json::json!({"policy_version":4,"draft":{"title":"검색","scope":["검색 제공"],"requirements":["검색 제공"],"acceptance":["검색 결과 확인"],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":"abc","markdown":generation_markdown(),"source_links":["requirement-0"],"constraints":["제약 없음"],"tasks":[{"id":"task1","dependencies":[],"owned_paths":["src"],"validation":["read_contains:src/readme.txt:검색"]}],"reused_decisions":[],"task_bindings":[{"task_id":"task1","goal":"검색 구현","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]}]},"assumptions":[],"evidence":[{"requirement_id":"requirement-0","source":"request","quote":"검색"}],"verdicts":[{"rubric_id":"criterion-0","passed":true,"section":"## 7. 필수 요구사항","quote":"검색 제공","reason":"요구사항 포함","issue_checklist_id":null}],"issues":[],"revision_directives":[],"score_reason":"기준 충족","proposed_score":10,"score":10})
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn loopback_result_survives_previous_io_and_retry_without_another_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let journal = root.join("state.redb.completion-journal");
+        let engine = Arc::new(crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(crate::completion::CompletionManager::empty(
+                journal.clone(),
+                Arc::clone(&gate),
+            )),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        });
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-io-secret".into()),
+        });
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "generate".into(),
+                command: domain::Command::GenerateSpec {
+                    project_id: project.id.clone(),
+                },
+            })
+            .await;
+        let run_id = match response.result.unwrap() {
+            domain::ResponseData::Run { run_id } => run_id,
+            _ => panic!("run"),
+        };
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut request = [0; 16384];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("dummy"))
+                .unwrap();
+            table.insert("x", 1).unwrap();
+        }
+        broken.store(true, Ordering::SeqCst);
+        assert!(tx.commit().is_err());
+        drop(db);
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":generation_candidate().to_string()}]}]}})
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !engine.generation_active(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generation worker did not finish");
+        let status = engine.completions.status();
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], true);
+        broken.store(false, Ordering::SeqCst);
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .await;
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let run = match call(domain::Command::GetRun {
+            run_id: run_id.clone(),
+        }) {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "검색");
+        let saved = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        assert_eq!(saved.draft.title, "검색");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_acknowledgment_keeps_resources_busy_until_worker_returns() {
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = Arc::new(crate::Engine::open(&path).unwrap());
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-cancel-secret".into()),
+        });
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "generate".into(),
+                command: domain::Command::GenerateSpec {
+                    project_id: project.id.clone(),
+                },
+            })
+            .await;
+        let run_id = match response.result.unwrap() {
+            domain::ResponseData::Run { run_id } => run_id,
+            _ => panic!("run"),
+        };
+        let (_socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        {
+            let _gate = engine.mutation_gate.lock().unwrap();
+            call(domain::Command::CancelRun {
+                run_id: run_id.clone(),
+            });
+            let run = match call(domain::Command::GetRun {
+                run_id: run_id.clone(),
+            }) {
+                domain::ResponseData::Data(value) => value,
+                _ => panic!("run"),
+            };
+            assert_eq!(run["status"], "cancelled");
+            assert_eq!(run["resources_released"], false);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !engine.generation_active(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker did not finish");
+        let run = match call(domain::Command::GetRun { run_id }) {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["resources_released"], true);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        if journal.exists() {
+            std::fs::remove_dir(journal).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn generation_database_failure_does_not_send_network_request_or_change_project() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let journal = root.join("state.redb.completion-journal");
+        let engine = Arc::new(crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(crate::completion::CompletionManager::empty(
+                journal.clone(),
+                Arc::clone(&gate),
+            )),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        });
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-io-secret".into()),
+        });
+        let before = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => serde_json::to_value(project).unwrap(),
+            _ => panic!("project"),
+        };
+        broken.store(true, Ordering::SeqCst);
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "generate".into(),
+                command: domain::Command::GenerateSpec {
+                    project_id: project.id.clone(),
+                },
+            })
+            .await;
+        assert!(response.result.unwrap_err().contains("fake failure"));
+        assert_eq!(engine.slots.load(Ordering::Acquire), 0);
+        assert!(engine.cancellations.lock().unwrap().is_empty());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        broken.store(false, Ordering::SeqCst);
+        engine.db.reopen_when_idle().unwrap();
+        let after = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => serde_json::to_value(project).unwrap(),
+            _ => panic!("project"),
+        };
+        assert_eq!(after, before);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generation_run_is_not_visible_before_cancel_token_is_installed() {
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = Arc::new(crate::Engine::open(&path).unwrap());
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-cancel-secret".into()),
+        });
+        let tokens = engine.cancellations.lock().unwrap();
+        let worker_engine = Arc::clone(&engine);
+        let project_id = project.id.clone();
+        let task = tokio::spawn(async move {
+            worker_engine
+                .handle_async(domain::Request {
+                    id: "generate".into(),
+                    command: domain::Command::GenerateSpec { project_id },
+                })
+                .await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let db = engine.db.get().unwrap();
+        let page = crate::runs::list(&db, &project.id, 0, 10).unwrap();
+        drop(db);
+        assert!(
+            page["runs"].as_array().unwrap().is_empty(),
+            "run became visible before its cancel token could be registered"
+        );
+        drop(tokens);
+        let response = task.await.unwrap();
+        let run_id = match response.result.unwrap() {
+            domain::ResponseData::Run { run_id } => run_id,
+            _ => panic!("run"),
+        };
+        call(domain::Command::CancelRun {
+            run_id: run_id.clone(),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !engine.generation_active(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker did not finish");
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        let journal = root.join("state.redb.completion-journal");
+        if journal.exists() {
+            std::fs::remove_dir(journal).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
     }
 }
