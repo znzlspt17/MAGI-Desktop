@@ -7,6 +7,21 @@ use std::sync::{
 };
 
 pub enum Kind {
+    HistoryPage {
+        project_id: String,
+        request: u64,
+        offset: usize,
+    },
+    HistoryDetail {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
+    HistoryEvents {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
     SaveDraft {
         project_id: String,
         base_hash: String,

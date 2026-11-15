@@ -5,6 +5,7 @@ use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
 mod model_settings;
+mod run_history;
 mod spec_review;
 mod storage;
 mod worker;
@@ -39,6 +40,7 @@ struct State {
     spec_forms: std::collections::HashMap<String, spec_review::Form>,
     spec_review_pending: std::collections::HashSet<String>,
     spec_submitted: std::collections::HashMap<String, domain::SpecDraft>,
+    history: run_history::History,
 }
 
 impl State {
@@ -49,6 +51,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.history.project(id);
         self.selected = Some(id.to_owned());
         self.project = None;
         self.generation = self.generation.wrapping_add(1);
@@ -514,6 +517,101 @@ impl App {
                     _ => {}
                 }
             }
+            Kind::HistoryPage {
+                project_id,
+                request,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["offset"].as_u64() == Some(offset as u64)
+                                && data["limit"].as_u64()
+                                    == Some(run_history::PAGE_SIZE as u64)
+                                && data["total"].as_u64().is_some()
+                                && data["runs"].as_array().is_some_and(|runs| {
+                                    runs.len() <= run_history::PAGE_SIZE
+                                        && runs.iter().all(|run| {
+                                            run["project_id"] == project_id
+                                                && run["id"].as_str().is_some()
+                                                && run["status"].as_str().is_some()
+                                        })
+                                }) =>
+                        {
+                            self.state.history.runs = data["runs"].as_array().unwrap().clone();
+                            self.state.history.offset = offset;
+                            self.state.history.total = data["total"].as_u64().unwrap() as usize;
+                            self.state.history.loaded = true;
+                            self.state.history.error = None;
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 기록 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 기록 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryDetail {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["id"] == run_id
+                                && data["project_id"] == project_id
+                                && data["status"].as_str().is_some() =>
+                        {
+                            self.state.history.detail = Some(data);
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 상태 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 상태 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryEvents {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Events(events))
+                            if events.iter().all(|event| event.run_id == run_id) =>
+                        {
+                            self.state.history.events = events;
+                        }
+                        Err(error) => {
+                            self.state.history.error =
+                                Some(format!("실행 이벤트 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 이벤트 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -679,6 +777,55 @@ impl App {
                     if let Some(project) = self.state.project.clone() {
                         ui.heading(&project.name);
                         ui.label(&project.path);
+                        self.state.history.project(&project.id);
+                        if let Some(action) = run_history::render(ui, &self.state.history) {
+                            match action {
+                                run_history::Action::Page(offset) => {
+                                    let request = self.state.history.request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::HistoryPage {
+                                            project_id: project.id.clone(),
+                                            request,
+                                            offset,
+                                        },
+                                        Command::ListRuns {
+                                            project_id: project.id.clone(),
+                                            offset,
+                                            limit: run_history::PAGE_SIZE,
+                                        },
+                                    )) {
+                                        self.state.history.request = request;
+                                    }
+                                }
+                                run_history::Action::Select(run_id) => {
+                                    self.state.history.selected = Some(run_id.clone());
+                                    self.state.history.detail = None;
+                                    self.state.history.events.clear();
+                                    self.state.history.error = None;
+                                    self.state.history.selection_request =
+                                        self.state.history.selection_request.wrapping_add(1);
+                                    let request = self.state.history.selection_request;
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryDetail {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::GetRun {
+                                            run_id: run_id.clone(),
+                                        },
+                                    ));
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryEvents {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::ListEvents { run_id, after: 0 },
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(notice) = self.state.spec_notices.get(&project.id) {
                             ui.label(notice);
                         }
@@ -3020,6 +3167,527 @@ mod tests {
         });
         assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "new");
         assert!(app.state.project.as_ref().unwrap().approved.is_none());
+    }
+
+    #[test]
+    fn run_history_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록 조회")));
+    }
+
+    #[test]
+    fn history_button_requests_selected_project_page() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "실행 기록 조회" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let first = work.try_recv().unwrap();
+        assert!(
+            matches!(first.command,Command::ListRuns{project_id,offset:0,limit:20} if project_id=="a")
+        );
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        app.apply(worker::Reply{kind:first.kind,result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"kept","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        assert_eq!(app.state.history.runs[0]["id"], "kept");
+    }
+
+    #[test]
+    fn history_page_displays_runs_for_current_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"completed","persistence":null}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1"))));
+    }
+
+    #[test]
+    fn history_next_page_requests_next_offset() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":41,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "다음 페이지" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("다음 페이지");
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListRuns{project_id,offset:20,limit:20} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn selecting_run_requests_detail_and_events() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="run-1")
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListEvents{run_id,after:0} if run_id=="run-1")
+        );
+    }
+
+    #[test]
+    fn selected_run_shows_events_and_unsaved_completion() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let request = app.state.history.selection_request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryDetail{project_id:"a".into(),run_id:"r".into(),request},result:Ok(ResponseData::Data(serde_json::json!({"id":"r","project_id":"a","status":"completed","persistence":{"state":"pending"}})))});
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "r".into(),
+                request,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "r".into(),
+                attempt: 1,
+                kind: "progress".into(),
+                message: "이벤트 내용".into(),
+            }])),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("결과 저장 대기"))));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("이벤트 내용"))));
+    }
+
+    #[test]
+    fn project_switch_invalidates_old_history_response_even_when_switched_back() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.select("a");
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"old","project_id":"a","status":"completed"}],"total":1,"offset":0,"limit":20}))) });
+        assert!(app.state.history.runs.is_empty());
+    }
+
+    #[test]
+    fn selecting_another_run_clears_prior_error_and_detail() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"new","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        app.state.history.error = Some("기존 오류".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"old","status":"completed"}));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("new") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.error.is_none());
+    }
+
+    #[test]
+    fn late_run_detail_and_events_do_not_replace_current_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("new".into());
+        app.state.history.selection_request = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryDetail {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"old","project_id":"a","status":"completed"}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "old".into(),
+                attempt: 1,
+                kind: "test".into(),
+                message: "old".into(),
+            }])),
+        });
+        assert_eq!(app.state.history.selected.as_deref(), Some("new"));
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.events.is_empty());
+    }
+
+    #[test]
+    fn history_empty_page_and_failure_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":0,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록이 없습니다.")));
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Err("임시 오류".into()),
+        });
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("임시 오류"))));
+    }
+
+    #[test]
+    fn malformed_history_page_is_not_shown_as_valid() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"r","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":99}))) });
+        assert!(app.state.history.runs.is_empty());
+        assert!(app
+            .state
+            .history
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("올바르지"));
     }
 
     #[test]
