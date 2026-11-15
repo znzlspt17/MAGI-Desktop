@@ -12,6 +12,23 @@ struct Envelope<T> {
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct PipeOpenNotFound;
+
+#[cfg(windows)]
+impl std::fmt::Display for PipeOpenNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local pipe not found during open")
+    }
+}
+
+/// 로컬 pipe 열기 단계에서 pipe가 존재하지 않았는지 판별한다.
+#[cfg(windows)]
+pub fn is_pipe_open_not_found(error: &anyhow::Error) -> bool {
+    error.is::<PipeOpenNotFound>()
+}
+
 async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T> {
     let size = r.read_u32().await? as usize;
     if size == 0 || size > MAX_FRAME {
@@ -65,7 +82,7 @@ mod platform {
     use std::{ffi::c_void, os::windows::io::AsRawHandle, ptr};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, LocalFree, HANDLE},
+        Foundation::{CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, HANDLE},
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
@@ -191,6 +208,9 @@ mod platform {
                     Err(e) if e.raw_os_error() == Some(231) => {
                         tokio::time::sleep(Duration::from_millis(20)).await
                     }
+                    Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                        return Err(anyhow::Error::new(e).context(PipeOpenNotFound));
+                    }
                     Err(e) => return Err(e.into()),
                 }
             };
@@ -262,6 +282,74 @@ mod platform {
             GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
             DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
+        #[tokio::test]
+        async fn missing_pipe_open_is_distinguished_from_verification_error() {
+            let missing = format!(
+                r"\\.\pipe\magi-missing-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let error = request_typed::<_, serde_json::Value>(&missing, &serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert!(
+                is_pipe_open_not_found(&error),
+                "실제 pipe 부재를 식별해야 함"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(2)
+            );
+            assert!(is_pipe_open_not_found(&error.context("outer context")));
+            let error = request(
+                &missing,
+                &domain::Request {
+                    id: "id".into(),
+                    command: domain::Command::Status,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(is_pipe_open_not_found(&error));
+            for error in [
+                anyhow!("invalid local pipe name"),
+                anyhow!("request timed out"),
+                anyhow!("unsupported protocol version"),
+                std::io::Error::from_raw_os_error(5).into(),
+            ] {
+                assert!(!is_pipe_open_not_found(&error));
+            }
+
+            let name = format!(r"\\.\pipe\magi-verify-{}", std::process::id());
+            let mut listener = server(&name, true).unwrap();
+            let reader = tokio::spawn(async move {
+                listener.connect().await.unwrap();
+                let mut byte = [0u8; 1];
+                listener.read(&mut byte).await.unwrap()
+            });
+            let error = request_with_verifier::<_, serde_json::Value>(
+                &name,
+                &serde_json::json!({}),
+                |_| Err(std::io::Error::from_raw_os_error(2).into()),
+            )
+            .await
+            .unwrap_err();
+            assert!(!is_pipe_open_not_found(&error));
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(2)
+            );
+            assert_eq!(reader.await.unwrap(), 0);
+        }
         #[tokio::test]
         async fn rejects_nonlocal_and_invalid_pipe_names_before_opening() {
             for name in [
