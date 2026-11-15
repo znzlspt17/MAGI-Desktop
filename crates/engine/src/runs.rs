@@ -1,4 +1,5 @@
 use redb::{Database, ReadableTable, TableDefinition};
+use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
 #[cfg(all(test, windows))]
@@ -256,12 +257,17 @@ pub(crate) fn cancel(db: &Database, id: &str) -> Result<(), String> {
             serde_json::from_str(value.value()).map_err(|e| e.to_string())?
         };
         let next = match run["status"].as_str() {
+            Some("executing") => Some(("cancelling", "외부 작업 취소를 요청했습니다.")),
+            Some("awaiting_approval") => Some(("cancelled", "대기 중인 승인을 취소했습니다.")),
             Some("generating") => Some(("cancelled", "작업을 취소했습니다.")),
             Some("preparing") => Some(("cancelling", "취소를 요청했습니다.")),
             Some("awaiting_implementation") => Some(("cancelled", "작업을 취소했습니다.")),
             _ => None,
         };
         if let Some((state, message)) = next {
+            if run["status"] == "awaiting_approval" {
+                run["pending"] = serde_json::Value::Null;
+            }
             run["status"] = state.into();
             let events = run["events"].as_array_mut().ok_or("invalid run events")?;
             let seq = events.last().map_or(Ok(1), |event| {
@@ -549,9 +555,570 @@ pub(crate) fn finish_generation(
     Ok(applied)
 }
 #[cfg(test)]
+pub(crate) static TEST_FAIL_AFTER_PATCH: std::sync::Mutex<
+    Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static TEST_FAIL_AFTER_TRUNCATE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+type PatchReadBarrier = (
+    String,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+#[cfg(test)]
+static TEST_PAUSE_AFTER_PATCH_READ: std::sync::Mutex<Option<PatchReadBarrier>> =
+    std::sync::Mutex::new(None);
+// 2026-11-16: 파일 읽기와 승인 대기 전환 사이의 취소·새 요청은 같은 트랜잭션에서 다시 확인한다.
+pub(crate) fn submit_patch(
+    db: &Database,
+    id: &str,
+    tool: String,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if tool != "patch" {
+        return Err("unsupported tool".into());
+    }
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("path required")?;
+    let content = arguments
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("content required")?;
+    if content.len() > 1024 * 1024 {
+        return Err("content too large".into());
+    }
+    let snapshot = get(db, id)?;
+    if snapshot["status"] != "awaiting_implementation" || !snapshot["pending"].is_null() {
+        return Err("run not ready for tool approval".into());
+    }
+    let run: PatchRun = serde_json::from_value(snapshot.clone()).map_err(|e| e.to_string())?;
+    let (full_path, missing) = target_path(&run, path)?;
+    let before_hash = if missing {
+        "missing".to_owned()
+    } else {
+        file_hash(&run, &full_path)?
+    };
+    #[cfg(test)]
+    if let Some((_, ready, release)) = TEST_PAUSE_AFTER_PATCH_READ
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|(run_id, _, _)| run_id == id)
+    {
+        ready.wait();
+        release.wait();
+    }
+    let approval_id = uuid::Uuid::new_v4().to_string();
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut current: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if current["status"] != "awaiting_implementation"
+            || !current["pending"].is_null()
+            || [
+                "project_id",
+                "spec_hash",
+                "spec_version",
+                "worktree",
+                "scope",
+            ]
+            .iter()
+            .any(|key| current[*key] != snapshot[*key])
+        {
+            return Err("run not ready for tool approval".into());
+        }
+        current["pending"] = serde_json::json!({"id":approval_id,"tool":tool,"arguments":arguments,"before_hash":before_hash,"call_id":null,"authorized":false});
+        current["status"] = "awaiting_approval".into();
+        append_event(
+            &mut current,
+            id,
+            "approval_required",
+            "파일 변경 승인이 필요합니다.",
+        )?;
+        table
+            .insert(id, current.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"approval_id":approval_id}))
+}
+
+// 2026-11-16: 현재 승인본과 요청 ID를 원자적으로 확인하고 executing을 내구 기록한 후에만 파일을 변경한다.
+pub(crate) fn approve_patch(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    approved: bool,
+) -> Result<serde_json::Value, String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let (run, pending) = {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut current: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if current["status"] != "awaiting_approval" || current["pending"].is_null() {
+            return Err("no pending approval".into());
+        }
+        let pending = current["pending"].clone();
+        if pending["id"].as_str() != Some(approval) {
+            return Err("approval does not match pending request".into());
+        }
+        if pending["tool"] != "patch" {
+            return Err("unsupported tool".into());
+        }
+        if approved {
+            let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+            let project_id = current["project_id"]
+                .as_str()
+                .ok_or("invalid run project")?;
+            let value = projects
+                .get(project_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("project not found")?;
+            let project: domain::Project =
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+            let spec = project
+                .approved
+                .as_ref()
+                .ok_or("approved specification changed")?;
+            if current["spec_hash"].as_str() != Some(spec.hash.as_str())
+                || current["spec_version"].as_u64() != Some(spec.version)
+                || project.draft_hash != spec.hash
+                || current["scope"]
+                    != serde_json::to_value(&spec.scope).map_err(|e| e.to_string())?
+            {
+                return Err("approved specification changed".into());
+            }
+            current["status"] = "executing".into();
+            append_event(
+                &mut current,
+                id,
+                "tool_started",
+                "승인된 파일 변경을 시작합니다.",
+            )?;
+        } else {
+            current["pending"] = serde_json::Value::Null;
+            current["status"] = "awaiting_implementation".into();
+            append_event(
+                &mut current,
+                id,
+                "tool_denied",
+                "도구 요청이 거절되었습니다.",
+            )?;
+        }
+        table
+            .insert(id, current.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+        (current, pending)
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    if !approved {
+        return Ok(serde_json::json!({"status":"denied"}));
+    }
+    let run: PatchRun = serde_json::from_value(run).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let path = pending["arguments"]["path"]
+            .as_str()
+            .ok_or("invalid path")?;
+        let content = pending["arguments"]["content"]
+            .as_str()
+            .ok_or("invalid content")?;
+        let before = pending["before_hash"].as_str().ok_or("invalid file hash")?;
+        let (path, missing) = target_path(&run, path)?;
+        if before == "missing" {
+            if missing {
+                create_checked(&run, &path, content)
+            } else {
+                Err("file changed since approval".into())
+            }
+        } else if missing {
+            Err("file changed since approval".into())
+        } else {
+            write_checked(&run, &path, content, before)
+        }
+    })();
+    #[cfg(test)]
+    if let Some((_, flag)) = TEST_FAIL_AFTER_PATCH
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(run_id, _)| run_id == id)
+    {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    finish_patch(db, id, approval, &result)?;
+    result?;
+    Ok(serde_json::json!({"status":"applied"}))
+}
+
+// 2026-11-16: 파일 효과 뒤 저장이 실패하면 executing을 남겨 재시작 때 불명확 상태로 복구한다.
+fn finish_patch(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    result: &Result<(), String>,
+) -> Result<(), String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if !["executing", "cancelling"].contains(&run["status"].as_str().unwrap_or(""))
+            || run["pending"]["id"].as_str() != Some(approval)
+        {
+            return Err("patch execution state changed".into());
+        }
+        let cancelled = run["status"] == "cancelling";
+        run["pending"] = serde_json::Value::Null;
+        let (state, kind, message) = if result.is_ok() && !cancelled {
+            (
+                "awaiting_implementation",
+                "tool_complete",
+                "승인된 파일 변경을 적용했습니다.",
+            )
+        } else if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e == "file changed since approval")
+            && !cancelled
+        {
+            (
+                "awaiting_implementation",
+                "stale_tool",
+                "승인 후 파일이 변경되어 요청을 적용하지 않았습니다.",
+            )
+        } else {
+            (
+                "uncertain",
+                "uncertain",
+                "파일 변경 결과를 확인해야 합니다.",
+            )
+        };
+        run["status"] = state.into();
+        append_event(&mut run, id, kind, message)?;
+        table
+            .insert(id, run.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+#[derive(serde::Deserialize)]
+struct PatchRun {
+    worktree: String,
+    scope: Vec<String>,
+}
+fn target_path(run: &PatchRun, name: &str) -> Result<(PathBuf, bool), String> {
+    use std::path::Component;
+    let rel = Path::new(name);
+    if !crate::worktree::safe_relative(name)
+        || rel.components().any(|c| !matches!(c, Component::Normal(_)))
+        || crate::worktree::protected(&name.replace('\\', "/"))
+        || name
+            .split(['/', '\\'])
+            .any(|p| p.eq_ignore_ascii_case(".git"))
+    {
+        return Err("unsafe path".into());
+    }
+    let normalized = name.replace('\\', "/").to_lowercase();
+    if !run.scope.iter().any(|scope| {
+        let s = scope
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        !s.is_empty() && (normalized == s || normalized.starts_with(&(s + "/")))
+    }) {
+        return Err("path outside approved scope".into());
+    }
+    let root = crate::tools::checked_root(Path::new(&run.worktree))?;
+    let mut current = root.clone();
+    let mut missing = false;
+    for c in rel.components() {
+        current.push(c);
+        if missing {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err("links are not allowed".into());
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return Err("reparse points are not allowed".into());
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(_) => return Err("path unavailable".into()),
+        }
+    }
+    if missing {
+        return Ok((current, true));
+    }
+    let canonical = current.canonicalize().map_err(|_| "invalid path")?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err("path escapes worktree or is not a file".into());
+    }
+    Ok((canonical, false))
+}
+#[cfg(windows)]
+fn checked_file(
+    run: &PatchRun,
+    path: &Path,
+) -> Result<(std::fs::File, crate::tools::DirectoryPins), String> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let root = crate::tools::checked_root(Path::new(&run.worktree))?;
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| "path escapes worktree")?;
+    let pins =
+        crate::tools::pin_directories(&root, relative.parent().ok_or("invalid parent")?, false)?;
+    let pinned_path = pins
+        .parent
+        .join(relative.file_name().ok_or("invalid leaf")?);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&pinned_path)
+        .map_err(|_| "file open failed")?;
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0
+        || info.nNumberOfLinks != 1
+        || info.dwFileAttributes & 0x400 != 0
+    {
+        return Err("hardlinks or reparse points are not allowed".into());
+    }
+    let mut buf = vec![0u16; 32768];
+    let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0) }
+        as usize;
+    if n == 0 || n >= buf.len() {
+        return Err("cannot verify open file path".into());
+    }
+    let final_path = PathBuf::from(String::from_utf16(&buf[..n]).map_err(|_| "invalid file path")?);
+
+    if !final_path.starts_with(&root) || final_path != path {
+        return Err("open file escaped worktree".into());
+    }
+    Ok((file, pins))
+}
+#[cfg(windows)]
+fn hash_open_file(file: &mut std::fs::File) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "file seek failed")?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "file read failed")?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("file too large".into());
+    }
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+#[cfg(windows)]
+fn file_hash(run: &PatchRun, path: &Path) -> Result<String, String> {
+    let (mut file, _pins) = checked_file(run, path)?;
+    hash_open_file(&mut file)
+}
+#[cfg(windows)]
+fn write_checked(run: &PatchRun, path: &Path, content: &str, expected: &str) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    let (mut file, _pins) = checked_file(run, path)?;
+    if expected.is_empty() || hash_open_file(&mut file)? != expected {
+        return Err("file changed since approval".into());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "file seek failed")?;
+    file.set_len(0).map_err(|_| "file resize failed")?;
+    #[cfg(test)]
+    if TEST_FAIL_AFTER_TRUNCATE.lock().unwrap().as_deref() == Some(path) {
+        return Err("injected partial write failure".into());
+    }
+    file.write_all(content.as_bytes())
+        .map_err(|_| "file update failed".to_owned())
+}
+#[cfg(not(windows))]
+fn file_hash(_run: &PatchRun, _path: &Path) -> Result<String, String> {
+    Err("file patch is supported only on Windows".into())
+}
+#[cfg(not(windows))]
+fn write_checked(
+    _run: &PatchRun,
+    _path: &Path,
+    _content: &str,
+    _expected: &str,
+) -> Result<(), String> {
+    Err("file patch is supported only on Windows".into())
+}
+
+#[cfg(windows)]
+fn create_checked(run: &PatchRun, path: &Path, content: &str) -> Result<(), String> {
+    use std::{
+        io::Write,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let root = crate::tools::checked_root(Path::new(&run.worktree))?;
+    let rel = path
+        .strip_prefix(&root)
+        .map_err(|_| "path escapes worktree")?;
+    let parent = rel.parent().ok_or("invalid parent")?;
+    let pins = crate::tools::pin_directories(&root, parent, true)?;
+    let pinned_path = pins.parent.join(rel.file_name().ok_or("invalid leaf")?);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&pinned_path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err("file changed since approval".into())
+        }
+        Err(_) => return Err("file creation failed".into()),
+    };
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0
+        || info.nNumberOfLinks != 1
+        || info.dwFileAttributes & 0x400 != 0
+    {
+        return Err("unsafe created file".into());
+    }
+    let mut buf = vec![0u16; 32768];
+    let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0) }
+        as usize;
+    if n == 0 || n >= buf.len() {
+        return Err("cannot verify created file".into());
+    }
+    let actual = PathBuf::from(String::from_utf16(&buf[..n]).map_err(|_| "invalid path")?);
+    if actual != pinned_path || !actual.starts_with(&pins.root) {
+        return Err("created path escaped worktree".into());
+    }
+    file.write_all(content.as_bytes())
+        .map_err(|_| "file creation failed".into())
+}
+#[cfg(not(windows))]
+fn create_checked(_run: &PatchRun, _path: &Path, _content: &str) -> Result<(), String> {
+    Err("file patch is supported only on Windows".into())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_between_patch_read_and_commit_cannot_revive_run() {
+        let root = std::env::temp_dir().join(format!("magi-patch-cas-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join("src/file.txt"), "before").unwrap();
+        let path = root.join("state.redb");
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(RUNS).unwrap();
+            let run = serde_json::json!({"id":run_id,"project_id":"fixture","status":"awaiting_implementation","worktree":worktree,"scope":["src"],"events":[],"pending":null});
+            table
+                .insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *TEST_PAUSE_AFTER_PATCH_READ.lock().unwrap() =
+            Some((run_id.clone(), ready.clone(), release.clone()));
+        let worker_db = db.clone();
+        let id = run_id.clone();
+        let worker = std::thread::spawn(move || {
+            submit_patch(
+                &worker_db,
+                &id,
+                "patch".into(),
+                serde_json::json!({"path":"src/file.txt","content":"after"}),
+            )
+        });
+        ready.wait();
+        cancel(&db, &run_id).unwrap();
+        release.wait();
+        assert!(worker.join().unwrap().is_err());
+        *TEST_PAUSE_AFTER_PATCH_READ.lock().unwrap() = None;
+        let run = get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "cancelled");
+        assert!(run["pending"].is_null());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("src/file.txt")).unwrap(),
+            "before"
+        );
+        drop(db);
+        std::fs::remove_file(worktree.join("src/file.txt")).unwrap();
+        std::fs::remove_dir(worktree.join("src")).unwrap();
+        std::fs::remove_dir(worktree).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn cancelling_an_executing_patch_keeps_its_result_uncertain() {
+        let root = std::env::temp_dir().join(format!("magi-patch-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let db = Database::create(&path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(RUNS).unwrap();
+            let run = serde_json::json!({"id":"run","status":"executing","pending":{"id":"approval"},"events":[]});
+            table.insert("run", run.to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        cancel(&db, "run").unwrap();
+        assert_eq!(get(&db, "run").unwrap()["status"], "cancelling");
+        finish_patch(&db, "run", "approval", &Ok(())).unwrap();
+        let run = get(&db, "run").unwrap();
+        assert_eq!(run["status"], "uncertain");
+        assert!(run["pending"].is_null());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn applied_worktree_is_committed_once_and_preserves_other_run_fields() {
         let dir = std::env::temp_dir().join(format!("magi-run-finish-{}", uuid::Uuid::new_v4()));
