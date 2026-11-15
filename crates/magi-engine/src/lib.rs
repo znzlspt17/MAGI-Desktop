@@ -2,6 +2,8 @@
 //!
 //! 실행 복구와 모델 제공자 등 나머지 엔진 기능은 아직 연결되지 않았다.
 
+pub mod agent_loop;
+
 use magi_core::{Command, Project, Request, Response, ResponseData, SpecDraft};
 use redb::{Database, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
