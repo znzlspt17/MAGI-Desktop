@@ -9,6 +9,8 @@ mod agent_runtime;
 mod completion;
 mod knowledge_text;
 mod mcp_runtime;
+mod package_export;
+mod project_decisions;
 mod runs;
 mod storage;
 pub mod tools;
@@ -141,6 +143,9 @@ impl Engine {
             &request.command,
             Command::CreateProject { .. }
                 | Command::StartRun { .. }
+                | Command::SaveDecision { .. }
+                | Command::ReviseDecision { .. }
+                | Command::SelectDecision { .. }
                 | Command::PutKnowledge { .. }
                 | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
@@ -429,6 +434,7 @@ impl Engine {
             &command,
             Command::Status
                 | Command::SearchKnowledge { .. }
+                | Command::ListDecisions { .. }
                 | Command::SearchKnowledgePage { .. }
                 | Command::SearchKnowledgeVector { .. }
                 | Command::GetKnowledgeSource { .. }
@@ -451,6 +457,10 @@ impl Engine {
             | Command::ConfigureAgents { project_id, .. }
             | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. }
+            | Command::ExportPackage { project_id, .. }
+            | Command::SaveDecision { project_id, .. }
+            | Command::ReviseDecision { project_id, .. }
+            | Command::SelectDecision { project_id, .. }
             | Command::PutKnowledge { project_id, .. }
             | Command::SetKnowledgeEmbedding { project_id, .. } => Some(project_id),
             _ => None,
@@ -459,6 +469,7 @@ impl Engine {
             Command::StartAgent { run_id, .. }
             | Command::ResumeAgent { run_id, .. }
             | Command::SubmitTool { run_id, .. }
+            | Command::ExportRunPackage { run_id, .. }
             | Command::ApproveTool { run_id, .. }
             | Command::RequestMcpApproval { run_id, .. } => Some(run_id),
             _ => None,
@@ -525,6 +536,30 @@ impl Engine {
             Command::SearchKnowledgeVector { project_id, model, vector, offset, limit } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::search_vector(&db, &project_id, model, vector, offset, limit)
+            }
+            Command::SaveDecision { project_id, decision } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                project_decisions::save_decision(db, project_id, decision)
+            }
+            Command::ListDecisions { project_id } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                project_decisions::list_decisions(db, project_id)
+            }
+            Command::ReviseDecision { project_id, id, text } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                project_decisions::revise_decision(db, project_id, id, text)
+            }
+            Command::SelectDecision { project_id, id, version } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                project_decisions::select_decision(db, project_id, id, version)
+            }
+            Command::ExportPackage { project_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_project(&db, &project_id, Path::new(&destination))
+            }
+            Command::ExportRunPackage { run_id, destination } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                package_export::export_run(&db, &run_id, Path::new(&destination))
             }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
