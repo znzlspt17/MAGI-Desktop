@@ -212,3 +212,25 @@ impl KnowledgeIndex {
         self.set_embedding(&ticket.id, ticket.version, model, vector)
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub document_id: String,
+    pub document_version: u64,
+}
+// 2026-11-14: 실제 원본 연결만 노출해 문서 유사도를 출처 관계로 오인하지 않는다.
+impl KnowledgeIndex {
+    pub fn graph(&self, offset: usize, limit: usize) -> Vec<GraphEdge> {
+        self.documents
+            .values()
+            .skip(offset)
+            .take(limit.min(100))
+            .map(|d| GraphEdge {
+                source: d.source.clone(),
+                document_id: d.id.clone(),
+                document_version: d.version,
+            })
+            .collect()
+    }
+}

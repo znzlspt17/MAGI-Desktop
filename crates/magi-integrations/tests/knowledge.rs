@@ -106,6 +106,36 @@ fn cancelled_embedding_cannot_publish_late_result() {
 }
 
 #[test]
+
+fn graph_reports_only_actual_source_provenance_in_stable_order() {
+    let index = KnowledgeIndex::rebuild(vec![
+        Document {
+            id: "b".into(),
+            version: 2,
+            source: "file:b".into(),
+            text: "B".into(),
+        },
+        Document {
+            id: "a".into(),
+            version: 1,
+            source: "file:a".into(),
+            text: "A".into(),
+        },
+    ])
+    .unwrap();
+    let edge = index.graph(0, 1).remove(0);
+    assert_eq!(
+        (
+            edge.source.as_str(),
+            edge.document_id.as_str(),
+            edge.document_version
+        ),
+        ("file:a", "a", 1)
+    );
+    assert_eq!(index.graph(1, 1)[0].document_id, "b");
+}
+
+#[test]
 fn checkpoint_never_returns_unrestorable_oversized_data() {
     const MAX_BYTES: usize = 64 * 1024 * 1024;
     let document = |text: String| Document {
