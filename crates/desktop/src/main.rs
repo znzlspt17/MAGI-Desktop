@@ -23,6 +23,8 @@ struct State {
     close_check: bool,
     close_allowed: bool,
     close_confirmation: bool,
+    interview_inputs: std::collections::HashMap<String, String>,
+    interview_pending: std::collections::HashSet<String>,
 }
 
 impl State {
@@ -232,6 +234,28 @@ impl App {
                 }
                 _ => {}
             },
+            Kind::Interview {
+                project_id,
+                message,
+            } => {
+                self.state.interview_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project)) if project.id == project_id => {
+                        if self.state.interview_inputs.get(&project_id) == Some(&message) {
+                            self.state.interview_inputs.remove(&project_id);
+                        }
+                        if self.state.selected.as_deref() == Some(&project_id) {
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.project = Some(project);
+                            self.state.status =
+                                "인터뷰 답변을 저장했습니다. 기존 명세 승인이 해제되었습니다."
+                                    .into();
+                        }
+                    }
+                    Ok(_) => self.state.status = "오류: 인터뷰 응답이 올바르지 않습니다".into(),
+                    Err(e) => self.state.status = format!("오류: {e}"),
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -367,12 +391,52 @@ impl App {
                 });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(project) = &self.state.project {
+            if let Some(project) = self.state.project.clone() {
                 ui.heading(&project.name);
                 ui.label(&project.path);
-            } else { ui.label("프로젝트를 선택하세요."); }
+                ui.heading("인터뷰");
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for message in &project.interview {
+                            ui.label(message);
+                        }
+                    });
+                let input = self
+                    .state
+                    .interview_inputs
+                    .entry(project.id.clone())
+                    .or_default();
+                ui.add(egui::TextEdit::multiline(input).desired_rows(4));
+                let message = input.clone();
+                if ui
+                    .add_enabled(
+                        !message.trim().is_empty()
+                            && !self.state.interview_pending.contains(&project.id),
+                        egui::Button::new("응답 저장"),
+                    )
+                    .clicked()
+                {
+                    let id = project.id.clone();
+                    if self.send(worker::Work::new(
+                        worker::Kind::Interview {
+                            project_id: id.clone(),
+                            message: message.clone(),
+                        },
+                        Command::SubmitInterview {
+                            project_id: id.clone(),
+                            message,
+                        },
+                    )) {
+                        self.state.interview_pending.insert(id);
+                        self.state.generation = self.state.generation.wrapping_add(1);
+                    }
+                }
+                ui.label("답변을 저장하면 기존 명세 승인이 해제됩니다.");
+            } else {
+                ui.label("프로젝트를 선택하세요.");
+            }
             ui.separator();
-            ui.label("현재 프로젝트 목록과 생성 기능을 사용할 수 있습니다. 다른 작업 기능은 아직 제공되지 않습니다.");
         });
     }
 }
@@ -1065,6 +1129,188 @@ mod tests {
         });
         assert!(!app.state.starting);
         assert!(app.state.status.contains("취소"));
+    }
+
+    #[test]
+    fn selected_project_interview_is_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.interview.push("기존 인터뷰 답변".into());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text == "기존 인터뷰 답변")));
+    }
+
+    #[test]
+    fn interview_input_and_submit_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text == "응답 저장")));
+    }
+
+    #[test]
+    fn interview_response_preserves_new_input_and_other_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state
+            .interview_inputs
+            .insert("a".into(), "새 답변".into());
+        app.state.interview_pending.insert("a".into());
+        let generation = app.state.select("b");
+        app.state.receive_project(generation, project("b"));
+        let mut updated = project("a");
+        updated.interview.push("이전 답변".into());
+        app.apply(worker::Reply {
+            kind: worker::Kind::Interview {
+                project_id: "a".into(),
+                message: "이전 답변".into(),
+            },
+            result: Ok(ResponseData::Project(updated)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().id, "b");
+        assert_eq!(app.state.interview_inputs["a"], "새 답변");
+        assert!(!app.state.interview_pending.contains("a"));
+    }
+
+    #[test]
+    fn interview_failure_retains_input_and_success_invalidates_old_fetch() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let generation = app.state.select("a");
+        app.state.interview_inputs.insert("a".into(), "답변".into());
+        app.state.interview_pending.insert("a".into());
+        app.apply(worker::Reply {
+            kind: worker::Kind::Interview {
+                project_id: "a".into(),
+                message: "답변".into(),
+            },
+            result: Err("저장 실패".into()),
+        });
+        assert_eq!(app.state.interview_inputs["a"], "답변");
+        assert!(app.state.status.contains("저장 실패"));
+        let mut updated = project("a");
+        updated.interview.push("답변".into());
+        app.apply(worker::Reply {
+            kind: worker::Kind::Interview {
+                project_id: "a".into(),
+                message: "답변".into(),
+            },
+            result: Ok(ResponseData::Project(updated)),
+        });
+        app.state.receive_project(generation, project("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().interview, ["답변"]);
+        assert!(!app.state.interview_inputs.contains_key("a"));
+        assert!(app.state.status.contains("승인"));
+    }
+
+    #[test]
+    fn interview_button_sends_selected_project_and_preserves_input_when_queue_full() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.interview_inputs.insert("a".into(), "답변".into());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let output = frame(&mut app, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == "응답 저장" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let click = |app: &mut App| {
+            frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        };
+        click(&mut app);
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::SubmitInterview { project_id, message } if project_id == "a" && message == "답변")
+        );
+        app.state.interview_pending.clear();
+        app.send(worker::Work::new(worker::Kind::List, Command::ListProjects));
+        click(&mut app);
+        assert_eq!(app.state.interview_inputs["a"], "답변");
+        assert!(!app.state.interview_pending.contains("a"));
+        assert!(app.state.status.contains("가득"));
     }
 
     #[test]

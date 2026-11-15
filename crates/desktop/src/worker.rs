@@ -13,6 +13,7 @@ pub enum Kind {
     Status,
     List,
     Get { generation: u64 },
+    Interview { project_id: String, message: String },
     Create { name: String, path: String },
 }
 
