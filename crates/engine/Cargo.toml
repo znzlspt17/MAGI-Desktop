@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util = "0.3"
 domain = { package = "core", path = "../core" }
 provider = { path = "../provider" }
 transport = { path = "../transport" }
