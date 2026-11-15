@@ -100,6 +100,8 @@ impl Engine {
                 | Command::SaveDraft { .. }
                 | Command::SubmitInterview { .. }
                 | Command::ConfigureModel { .. }
+                | Command::ConfigureAgents { .. }
+                | Command::SetAutonomy { .. }
                 | Command::ApproveSpec { .. }
         );
         let _gate = guarded.then(|| self.mutation_gate.lock().unwrap_or_else(|e| e.into_inner()));
@@ -138,6 +140,8 @@ impl Engine {
             | Command::SaveDraft { project_id, .. }
             | Command::SubmitInterview { project_id, .. }
             | Command::ConfigureModel { project_id, .. }
+            | Command::ConfigureAgents { project_id, .. }
+            | Command::SetAutonomy { project_id, .. }
             | Command::ApproveSpec { project_id, .. } => Some(project_id),
             _ => None,
         };
@@ -329,6 +333,38 @@ impl Engine {
                 )?;
                 Ok(ResponseData::Run { run_id })
             }
+            // 2026-11-16: 실제 실행은 연결하지 않고 역할별 설정 계약과 기존 승인 근거를 보존한다.
+            Command::ConfigureAgents { project_id, agents } => self.update(&project_id, |p| {
+                let roles = ["coordinator", "implementer", "reviewer"];
+                if agents.len() != 3 || roles.iter().any(|role| agents.iter().filter(|a| a.role == *role).count() != 1) {
+                    return Err("exactly one configuration for each role is required".into());
+                }
+                for agent in &agents {
+                    if agent.model.trim().is_empty()
+                        || !(1..=64).contains(&agent.limits.get("max_rounds").and_then(|v| v.as_u64()).unwrap_or(0))
+                        || !(1..=1_000_000).contains(&agent.limits.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0))
+                    { return Err("agent model and limits required".into()); }
+                    if agent.limits.get("max_output_tokens").is_some_and(|v| v.as_u64().is_none_or(|n| !(1..=1_000_000).contains(&n))) {
+                        return Err("invalid agent output limit".into());
+                    }
+                    if agent.tools.iter().any(|tool| !["read", "search", "patch", "exec", "git", "mcp"].contains(&tool.as_str())
+                        || (agent.role == "reviewer" && !["read", "search"].contains(&tool.as_str()))) {
+                        return Err("invalid role tool".into());
+                    }
+                }
+                let next_context = p.context_version.checked_add(1).ok_or("interview context version exhausted")?;
+                p.agent_configs = agents;
+                p.context_version = next_context;
+                Ok(ResponseData::Project(p.clone()))
+            }),
+            // 2026-11-16: 자율 모드 변경도 평가 문맥에 반영해 이전 평가의 최신성을 보장한다.
+            Command::SetAutonomy { project_id, mode } => self.update(&project_id, |p| {
+                if !["step", "approved_scope"].contains(&mode.as_str()) { return Err("invalid autonomy mode".into()); }
+                let next_context = p.context_version.checked_add(1).ok_or("interview context version exhausted")?;
+                p.autonomy_mode = mode;
+                p.context_version = next_context;
+                Ok(ResponseData::Project(p.clone()))
+            }),
             Command::ConfigureModel {
                 project_id,
                 provider,
@@ -649,4 +685,128 @@ fn validate_tasks(tasks: &[domain::TaskSpec], scope: &[String]) -> Result<(), St
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod agent_settings_tests {
+    use super::*;
+    fn request(engine: &Engine, command: Command) -> Result<ResponseData, String> {
+        engine
+            .handle(Request {
+                id: "agent-settings".into(),
+                command,
+            })
+            .result
+    }
+    fn agents() -> Vec<domain::AgentConfig> {
+        ["coordinator", "implementer", "reviewer"]
+            .iter()
+            .map(|role| domain::AgentConfig {
+                role: (*role).into(),
+                model: "fixture".into(),
+                tools: vec!["read".into()],
+                limits: serde_json::json!({"max_rounds":1,"max_tokens":100}),
+            })
+            .collect()
+    }
+    #[test]
+    fn pending_completion_blocks_only_its_project_and_startup_blocks_both() {
+        let root =
+            std::env::temp_dir().join(format!("magi-settings-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let engine = Engine::open(&path).unwrap();
+        let create = |name: &str| match request(
+            &engine,
+            Command::CreateProject {
+                name: name.into(),
+                path: "fixture".into(),
+            },
+        )
+        .unwrap()
+        {
+            ResponseData::Project(p) => p,
+            _ => panic!("expected project"),
+        };
+        let first = create("first");
+        let second = create("second");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let db = engine.db.get().unwrap();
+        engine.completions.register(&db, &run_id, &first.id, Ok(()));
+        drop(db);
+        assert!(!engine.completions.for_run(&run_id).is_null());
+        let before = serde_json::to_value(&first).unwrap();
+        let error = "완료 결과 저장을 먼저 복구해야 합니다.";
+        assert_eq!(
+            request(
+                &engine,
+                Command::ConfigureAgents {
+                    project_id: first.id.clone(),
+                    agents: agents()
+                }
+            )
+            .unwrap_err(),
+            error
+        );
+        assert_eq!(
+            request(
+                &engine,
+                Command::SetAutonomy {
+                    project_id: first.id.clone(),
+                    mode: "approved_scope".into()
+                }
+            )
+            .unwrap_err(),
+            error
+        );
+        let after = match request(
+            &engine,
+            Command::GetProject {
+                project_id: first.id.clone(),
+            },
+        )
+        .unwrap()
+        {
+            ResponseData::Project(p) => p,
+            _ => panic!("expected project"),
+        };
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+        assert!(request(
+            &engine,
+            Command::ConfigureAgents {
+                project_id: second.id.clone(),
+                agents: agents()
+            }
+        )
+        .is_ok());
+        assert!(request(
+            &engine,
+            Command::SetAutonomy {
+                project_id: second.id.clone(),
+                mode: "approved_scope".into()
+            }
+        )
+        .is_ok());
+        engine.completions.add_startup_issue(false);
+        for command in [
+            Command::ConfigureAgents {
+                project_id: second.id.clone(),
+                agents: agents(),
+            },
+            Command::SetAutonomy {
+                project_id: second.id,
+                mode: "step".into(),
+            },
+        ] {
+            assert_eq!(request(&engine, command).unwrap_err(), error);
+        }
+        drop(engine);
+        let journal = root.join("state.redb.completion-journal");
+        let _ = std::fs::remove_file(journal.join(format!("{run_id}.json")));
+        let _ = std::fs::remove_file(journal.join("events.log"));
+        let _ = std::fs::remove_dir(journal);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }
