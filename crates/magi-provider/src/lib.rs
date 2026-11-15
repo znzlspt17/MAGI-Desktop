@@ -379,3 +379,5 @@ impl OpenAiProvider {
         Err(protocol())
     }
 }
+
+pub mod sdd;

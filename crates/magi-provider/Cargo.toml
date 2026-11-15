@@ -11,3 +11,6 @@ tokio.workspace = true
 tokio-util = "0.7"
 futures-util = "0.3"
 jsonschema = { version = "0.29", default-features = false }
+magi-core = { path = "../magi-core" }
+serde.workspace = true
+sha2 = "0.10"
