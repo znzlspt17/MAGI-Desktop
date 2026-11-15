@@ -824,9 +824,12 @@ dependencies = [
  "core",
  "eframe",
  "engine",
+ "redb",
+ "serde",
  "serde_json",
  "tokio",
  "transport",
+ "uuid",
 ]
 
 [[package]]

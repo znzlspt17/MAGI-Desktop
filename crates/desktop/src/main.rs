@@ -4,6 +4,7 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod storage;
 mod worker;
 
 #[derive(Default)]
@@ -18,6 +19,9 @@ struct State {
     creating: bool,
     starting: bool,
     status_pending: bool,
+    storage: storage::Storage,
+    close_check: bool,
+    close_allowed: bool,
 }
 
 impl State {
@@ -58,6 +62,43 @@ struct App {
 }
 
 impl App {
+    fn poll_storage(&mut self) {
+        if self.state.storage.pending_poll {
+            self.state.storage.poll_again = true;
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::Storage,
+            Command::ListStorageFailures,
+        )) {
+            self.state.storage.pending_poll = true;
+            self.state.storage.last_poll = std::time::Instant::now();
+        } else {
+            self.state.storage.known = false;
+            self.state.storage.error =
+                Some("저장 상태 요청을 보내지 못했습니다. 다시 확인해 주세요.".into());
+            self.state.close_check = false;
+        }
+    }
+
+    fn retry_storage(&mut self, run_id: &str) {
+        if self.state.storage.retries.contains(run_id) {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::RetrySave {
+                run_id: run_id.to_owned(),
+            },
+            Command::RetryCompletionSave {
+                run_id: run_id.to_owned(),
+            },
+        )) {
+            self.state.storage.notice = None;
+            self.state.storage.retries.insert(run_id.to_owned());
+            self.state.storage.protected.insert(run_id.to_owned());
+        }
+    }
+
     fn send(&mut self, work: worker::Work) -> bool {
         let status = matches!(&work.kind, worker::Kind::Status);
         if status && self.state.status_pending {
@@ -81,6 +122,74 @@ impl App {
         use worker::Kind;
         let is_status = matches!(&reply.kind, Kind::Status);
         match reply.kind {
+            Kind::Storage => {
+                self.state.storage.pending_poll = false;
+                let snapshot = match reply.result {
+                    Ok(ResponseData::Data(value)) => serde_json::from_value::<storage::Snapshot>(value).map_err(|_| "저장 진단 응답을 읽을 수 없습니다".to_owned()).and_then(|snapshot| if snapshot.valid() { Ok(snapshot) } else { Err("저장 진단 상태가 올바르지 않습니다. 엔진을 확인하고 다시 시도하세요.".into()) }),
+                    Ok(_) => Err("저장 진단 응답을 읽을 수 없습니다".into()),
+                    Err(error) if error.contains("requested feature is not available") => Err("현재 엔진은 저장 복구 진단을 지원하지 않습니다. 엔진을 업데이트한 뒤 다시 확인하세요.".into()),
+                    Err(error) => Err(format!("저장 진단에 연결하지 못했습니다: {error}. 엔진 연결을 확인하고 다시 시도하세요.")),
+                };
+                match snapshot {
+                    Ok(mut snapshot) => {
+                        if let Some(previous) = &self.state.storage.snapshot {
+                            for failure in &previous.failures {
+                                if self.state.storage.protected.contains(&failure.run_id)
+                                    && (self.state.storage.poll_again
+                                        || self.state.storage.retries.contains(&failure.run_id))
+                                    && !snapshot
+                                        .failures
+                                        .iter()
+                                        .any(|item| item.run_id == failure.run_id)
+                                {
+                                    snapshot.failures.push(failure.clone());
+                                }
+                            }
+                        }
+                        self.state.storage.snapshot = Some(snapshot);
+                        self.state.storage.known = true;
+                        self.state.storage.error = None;
+                        if !self.state.storage.poll_again {
+                            self.state
+                                .storage
+                                .protected
+                                .retain(|run| self.state.storage.retries.contains(run));
+                        }
+                    }
+                    Err(error) => {
+                        self.state.storage.known = false;
+                        self.state.storage.error = Some(error);
+                    }
+                }
+                if std::mem::take(&mut self.state.storage.poll_again) {
+                    self.poll_storage();
+                } else if self.state.close_check {
+                    self.state.close_check = false;
+                    if self.state.storage.may_close() {
+                        self.state.close_allowed = true;
+                    } else {
+                        self.state.status = "완료 저장 상태를 확인한 뒤 다시 닫아 주세요".into();
+                    }
+                }
+            }
+            Kind::RetrySave { run_id } => {
+                self.state.storage.retries.remove(&run_id);
+                let storage_only = self
+                    .state
+                    .storage
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.failures.iter().find(|f| f.run_id == run_id))
+                    .is_some_and(|f| matches!(f.stage.as_str(), "unknown" | "startup"));
+                match reply.result {
+                    Ok(ResponseData::Data(value)) if value["state"] == "saved" => self.state.storage.notice = Some(if storage_only { "저장소 복구를 완료했습니다.".into() } else { format!("실행 {run_id}: 완료 결과 저장을 복구했습니다.") }),
+                    Ok(ResponseData::Data(value)) if value["state"] == "superseded" => self.state.storage.notice = Some(format!("실행 {run_id}: 새 상태가 먼저 확정되어 이전 결과를 적용하지 않았습니다. 현재 상태를 확인하세요.")),
+                    Ok(ResponseData::Data(value)) if value["state"] == "pending" || value["state"] == "cleanup_pending" => {},
+                    Ok(_) => self.state.storage.notice = Some(format!("실행 {run_id}: 저장 결과를 확인할 수 없습니다.")),
+                    Err(error) => self.state.storage.notice = Some(format!("실행 {run_id}: 저장 재시도 실패: {error}")),
+                }
+                self.poll_storage();
+            }
             Kind::Starting => {
                 self.state.starting = true;
                 self.state.status = "엔진 시작 대기 중".into();
@@ -138,6 +247,25 @@ impl App {
         while let Ok(reply) = self.rx.try_recv() {
             self.apply(reply);
         }
+        if self.state.close_allowed && !self.state.storage.may_close() {
+            self.state.close_allowed = false;
+        }
+        if self.state.close_allowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && !self.state.close_allowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.state.status = "완료 저장 상태를 확인한 뒤 다시 닫아 주세요".into();
+            self.state.close_check = true;
+            self.poll_storage();
+        }
+        if !self.state.close_allowed
+            && self.state.storage.last_poll.elapsed() >= std::time::Duration::from_secs(2)
+            && !self.state.storage.pending_poll
+        {
+            self.poll_storage();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("MAGI Desktop");
@@ -155,6 +283,7 @@ impl App {
                 }
             });
         });
+        self.storage_panel(ctx);
         egui::SidePanel::left("sidebar")
             .default_width(230.0)
             .show(ctx, |ui| {
@@ -276,6 +405,7 @@ fn main() -> eframe::Result {
             };
             app.send(worker::Work::new(worker::Kind::Status, Command::Status));
             app.send(worker::Work::new(worker::Kind::List, Command::ListProjects));
+            app.poll_storage();
             Ok(Box::new(app))
         }),
     )
@@ -367,6 +497,401 @@ mod tests {
     }
 
     #[test]
+    fn unknown_storage_status_cancels_window_close() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| app.render(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
+    }
+
+    #[test]
+    fn unsupported_storage_and_memory_only_results_block_close() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        app.apply(worker::Reply {
+            kind: worker::Kind::Storage,
+            result: Err("requested feature is not available".into()),
+        });
+        assert!(!app.state.storage.known);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(app
+            .state
+            .storage
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("지원하지 않습니다"));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("지원하지 않습니다"))));
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"r","project_id":"p","stage":"agent","state":"pending","attempts":1,"journaled":false,"message":"저장 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| app.render(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
+    }
+
+    #[test]
+    fn closing_checks_fresh_storage_state_before_allowing_exit() {
+        let (tx, requests) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"","log_available":true,"log_attempted":true,"log_entries":[]}))) });
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| app.render(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
+        assert!(requests
+            .try_iter()
+            .any(|work| matches!(work.command, Command::ListStorageFailures)));
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"","log_available":true,"log_attempted":true,"log_entries":[]}))) });
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn close_waits_for_new_poll_when_older_poll_was_in_flight() {
+        let (tx, requests) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let empty = || {
+            Ok(ResponseData::Data(
+                serde_json::json!({"failures":[],"log_path":"","log_available":true,"log_attempted":true,"log_entries":[]}),
+            ))
+        };
+        app.apply(worker::Reply {
+            kind: worker::Kind::Storage,
+            result: empty(),
+        });
+        app.poll_storage();
+        assert!(matches!(
+            requests.try_recv().unwrap().command,
+            Command::ListStorageFailures
+        ));
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(input, |ctx| app.render(ctx));
+        app.apply(worker::Reply {
+            kind: worker::Kind::Storage,
+            result: empty(),
+        });
+        assert!(matches!(
+            requests.try_recv().unwrap().command,
+            Command::ListStorageFailures
+        ));
+        assert!(!app.state.close_allowed);
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"r","project_id":"p","stage":"agent","state":"pending","attempts":2,"journaled":false,"message":"저장 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn storage_warning_and_retry_are_visible_across_project_switches() {
+        let (tx, requests) = std::sync::mpsc::sync_channel(16);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"run-7","project_id":"project-a","stage":"agent","state":"pending","attempts":3,"journaled":false,"message":"저장 대기"}],
+            "log_path":"C:/temp/events.log","log_available":false,"log_attempted":true,"log_entries":[]
+        }))) });
+        app.state.select("project-b");
+        let ctx = egui::Context::default();
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        frame(vec![]);
+        let output = frame(vec![]);
+        let visible = |text: &str| {
+            output.shapes.iter().find_map(|clipped| {
+                if let egui::epaint::Shape::Text(shape) = &clipped.shape {
+                    let center = shape.visual_bounding_rect().center();
+                    if shape.galley.job.text.contains(text) && clipped.clip_rect.contains(center) {
+                        Some(center)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        };
+        assert!(visible("아직 저장되지 않음").is_some());
+        assert!(visible("run-7").is_some());
+        assert!(visible("C:/temp/events.log").is_some());
+        assert!(visible("진단 로그를 파일에 기록할 수 없습니다").is_some());
+        let retry = visible("완료 저장 재시도").unwrap();
+        frame(vec![
+            egui::Event::PointerMoved(retry),
+            egui::Event::PointerButton {
+                pos: retry,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        frame(vec![egui::Event::PointerButton {
+            pos: retry,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![]);
+        frame(vec![
+            egui::Event::PointerMoved(retry),
+            egui::Event::PointerButton {
+                pos: retry,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        frame(vec![egui::Event::PointerButton {
+            pos: retry,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let commands: Vec<_> = requests.try_iter().map(|work| work.command).collect();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], Command::RetryCompletionSave { run_id } if run_id == "run-7")
+        );
+        drop(frame);
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"C:/temp/events.log","log_available":false,"log_attempted":true,"log_entries":[]}))) });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("저장 재시도 중"))), "미확정 재시도 경고는 이전 진단으로 사라지면 안 됨");
+        app.apply(worker::Reply {
+            kind: worker::Kind::RetrySave {
+                run_id: "run-7".into(),
+            },
+            result: Ok(ResponseData::Data(serde_json::json!({"state":"saved"}))),
+        });
+        assert!(requests
+            .try_iter()
+            .any(|work| matches!(work.command, Command::ListStorageFailures)));
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"C:/temp/events.log","log_available":false,"log_attempted":true,"log_entries":[]}))) });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("완료 결과 저장을 복구했습니다"))));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("아직 저장되지 않음"))));
+    }
+
+    #[test]
+    fn superseded_retry_does_not_claim_saved() {
+        let (tx, _requests) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.apply(worker::Reply {
+            kind: worker::Kind::RetrySave {
+                run_id: "run-old".into(),
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"state":"superseded"}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("이전 결과를 적용하지 않았습니다"))));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("저장을 복구했습니다"))));
+    }
+
+    #[test]
+    fn startup_recovery_does_not_claim_a_computed_run_was_saved() {
+        let (tx, _requests) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"diagnostic","project_id":"","stage":"startup","state":"pending","attempts":1,"journaled":false,"message":"저장소 초기화 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+        app.apply(worker::Reply {
+            kind: worker::Kind::RetrySave {
+                run_id: "diagnostic".into(),
+            },
+            result: Ok(ResponseData::Data(serde_json::json!({"state":"saved"}))),
+        });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("저장소 복구를 완료했습니다"))));
+        assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("완료 결과 저장을 복구했습니다"))));
+    }
+
+    #[test]
+    fn storage_stage_and_logging_states_are_rendered_distinctly() {
+        for (stage, state, label) in [
+            ("agent", "retrying", "저장 재시도 중"),
+            ("worktree", "cleanup_pending", "복구 기록 정리 대기"),
+            (
+                "unknown",
+                "pending",
+                "완료 복구 기록 또는 저장소를 확인할 수 없음",
+            ),
+            (
+                "startup",
+                "pending",
+                "완료 복구 기록 또는 저장소를 확인할 수 없음",
+            ),
+        ] {
+            let (tx, _work) = std::sync::mpsc::sync_channel(8);
+            let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+            let mut app = App {
+                state: State::default(),
+                tx,
+                rx,
+                cancel_startup: Default::default(),
+            };
+            app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+                "failures":[{"run_id":"r","project_id":"p","stage":stage,"state":state,"attempts":1,"journaled":true,"message":"진단"}],
+                "log_path":"C:/temp/events.log","log_available":false,"log_attempted":true,
+                "log_entries":[{"timestamp_ms":1,"run_id":"r","stage":stage,"event":"storage_pending"}]
+            }))) });
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+            let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains(label))), "{stage} {state}");
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("storage_pending"))));
+            if matches!(stage, "unknown" | "startup") {
+                assert!(!app.state.storage.may_close());
+            }
+        }
+    }
+
+    #[test]
+    fn older_diagnostic_after_pending_retry_cannot_remove_warning() {
+        for failed in [false, true] {
+            let (tx, requests) = std::sync::mpsc::sync_channel(16);
+            let (_reply_tx, rx) = std::sync::mpsc::sync_channel(8);
+            let mut app = App {
+                state: State::default(),
+                tx,
+                rx,
+                cancel_startup: Default::default(),
+            };
+            app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({
+            "failures":[{"run_id":"r","project_id":"p","stage":"agent","state":"pending","attempts":1,"journaled":false,"message":"저장 대기"}],
+            "log_path":"","log_available":true,"log_attempted":true,"log_entries":[]
+        }))) });
+            app.poll_storage();
+            app.retry_storage("r");
+            requests.try_iter().for_each(drop);
+            let result = if failed {
+                Err("저장 실패".into())
+            } else {
+                Ok(ResponseData::Data(serde_json::json!({"state":"pending"})))
+            };
+            app.apply(worker::Reply {
+                kind: worker::Kind::RetrySave { run_id: "r".into() },
+                result,
+            });
+            app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"","log_available":true,"log_attempted":true,"log_entries":[]}))) });
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+            let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.job.text.contains("아직 저장되지 않음"))));
+            assert!(!app.state.storage.may_close());
+            assert!(requests
+                .try_iter()
+                .any(|work| matches!(work.command, Command::ListStorageFailures)));
+        }
+    }
+
+    #[test]
     fn startup_progress_and_cancellation_are_visible() {
         let (tx, _work) = std::sync::mpsc::sync_channel(2);
         let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -424,6 +949,7 @@ mod tests {
                 rx,
                 cancel_startup: Default::default(),
             };
+            app.apply(worker::Reply { kind: worker::Kind::Storage, result: Ok(ResponseData::Data(serde_json::json!({"failures":[],"log_path":"","log_available":true,"log_attempted":false,"log_entries":[]}))) });
             let ctx = egui::Context::default();
             let mut time = 0.0;
             let mut frame = |events: Vec<egui::Event>, app: &mut App| {

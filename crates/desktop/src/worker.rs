@@ -7,6 +7,8 @@ use std::sync::{
 };
 
 pub enum Kind {
+    Storage,
+    RetrySave { run_id: String },
     Starting,
     Status,
     List,
@@ -138,6 +140,50 @@ fn start_with_pipe(
 ) -> (SyncSender<Work>, Receiver<Reply>) {
     let (tx, work) = mpsc::sync_channel::<Work>(32);
     let (reply_tx, rx) = mpsc::sync_channel::<Reply>(64);
+    let (regular_tx, regular_rx) = mpsc::sync_channel::<Work>(16);
+    let (control_tx, control_rx) = mpsc::sync_channel::<Work>(8);
+    start_lane(
+        ctx.clone(),
+        pipe.clone(),
+        startup,
+        regular_rx,
+        reply_tx.clone(),
+    );
+    start_lane(ctx.clone(), pipe, None, control_rx, reply_tx.clone());
+    std::thread::spawn(move || {
+        while let Ok(work) = work.recv() {
+            let lane = if matches!(&work.kind, Kind::Storage | Kind::RetrySave { .. }) {
+                &control_tx
+            } else {
+                &regular_tx
+            };
+            if let Err(error) = lane.try_send(work) {
+                let work = match error {
+                    mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => work,
+                };
+                if reply_tx
+                    .send(Reply {
+                        kind: work.kind,
+                        result: Err("요청 처리 대기열이 가득 찼거나 종료됐습니다".into()),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        }
+    });
+    (tx, rx)
+}
+
+fn start_lane(
+    ctx: egui::Context,
+    pipe: String,
+    startup: Option<Arc<AtomicBool>>,
+    work: Receiver<Work>,
+    reply_tx: SyncSender<Reply>,
+) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -145,11 +191,18 @@ fn start_with_pipe(
         {
             Ok(runtime) => runtime,
             Err(e) => {
-                let _ = reply_tx.send(Reply {
-                    kind: Kind::Status,
-                    result: Err(format!("IPC 실행기 시작 실패: {e}")),
-                });
-                ctx.request_repaint();
+                while let Ok(work) = work.recv() {
+                    if reply_tx
+                        .send(Reply {
+                            kind: work.kind,
+                            result: Err(format!("IPC 실행기 시작 실패: {e}")),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
                 return;
             }
         };
@@ -198,7 +251,6 @@ fn start_with_pipe(
             ctx.request_repaint();
         }
     });
-    (tx, rx)
 }
 
 fn launch_engine() -> Result<std::process::Child, String> {
@@ -222,6 +274,310 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "검증 대상 engine.exe 경로를 지정해 실행하는 저장 복구 통합 검사"]
+    fn storage_ui_recovers_real_engine_journal_after_database_unlock() {
+        use std::os::windows::process::CommandExt;
+
+        struct Fixture {
+            dir: std::path::PathBuf,
+            run: String,
+            child: Option<std::process::Child>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let journal = self.dir.join("state.redb.completion-journal");
+                let _ = std::fs::remove_file(journal.join(format!("{}.json", self.run)));
+                let _ = std::fs::remove_file(journal.join("events.log"));
+                let _ = std::fs::remove_dir(&journal);
+                let _ = std::fs::remove_file(self.dir.join("state.redb"));
+                let _ = std::fs::remove_dir(&self.dir);
+            }
+        }
+        let exe = std::path::PathBuf::from(
+            std::env::var_os("MAGI_TEST_RECOVERY_ENGINE").expect("검증 대상 엔진 경로 필요"),
+        );
+        assert!(exe.is_absolute() && exe.is_file());
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = temp.join(format!("magi-ui-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        assert!(dir.starts_with(&temp) && dir != temp);
+        let database = dir.join("state.redb");
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut fixture = Fixture {
+            dir,
+            run: run.clone(),
+            child: None,
+        };
+        let engine = engine::Engine::open(&database).unwrap();
+        let project = match engine
+            .handle(Request {
+                id: "create".into(),
+                command: Command::CreateProject {
+                    name: "임시 프로젝트".into(),
+                    path: "C:/test".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            ResponseData::Project(project) => project,
+            _ => panic!("프로젝트 생성 응답"),
+        };
+        drop(engine);
+        let locked = redb::Database::open(&database).unwrap();
+        let tx = locked.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let value = serde_json::json!({"id":run,"project_id":project.id,"status":"preparing","events":[]}).to_string();
+            table.insert(run.as_str(), value.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let journal = fixture.dir.join("state.redb.completion-journal");
+        std::fs::create_dir(&journal).unwrap();
+        let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run,"project_id":project.id,"outcome":{"stage":"worktree","result":{"Ok":null}}});
+        std::fs::write(
+            journal.join(format!("{run}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let pipe = format!(r"\\.\pipe\magi-ui-recovery-{}", uuid::Uuid::new_v4());
+        fixture.child = Some(
+            std::process::Command::new(exe)
+                .arg("--database")
+                .arg(&database)
+                .arg("--pipe")
+                .arg(&pipe)
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let request = Request {
+                id: "ready".into(),
+                command: Command::Status,
+            };
+            if runtime
+                .block_on(transport::request(&pipe, &request))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "엔진 준비 시간 초과");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let ctx = egui::Context::default();
+        let (tx, rx) = start_with_pipe(ctx.clone(), pipe.clone(), None);
+        let mut app = crate::App {
+            state: crate::State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let frame = |app: &mut crate::App, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        app.poll_storage();
+        loop {
+            frame(&mut app, vec![]);
+            if app.state.storage.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .failures
+                    .iter()
+                    .any(|failure| failure.run_id == run)
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "저장 진단 응답 시간 초과"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = frame(&mut app, vec![]);
+        let find_text = |output: &egui::FullOutput, value: &str| {
+            output.shapes.iter().find_map(|shape| {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    let center = text.visual_bounding_rect().center();
+                    if text.galley.job.text.contains(value) && shape.clip_rect.contains(center) {
+                        return Some(center);
+                    }
+                }
+                None
+            })
+        };
+        assert!(find_text(&output, "아직 저장되지 않음").is_some());
+        assert!(find_text(&output, "events.log").is_some());
+        assert!(find_text(&output, &run).is_some());
+        let retry = find_text(&output, "완료 저장 재시도").expect("재시도 버튼");
+        drop(locked);
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(retry),
+                egui::Event::PointerButton {
+                    pos: retry,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: retry,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            frame(&mut app, vec![]);
+            if app.state.storage.known
+                && !app.state.storage.pending_poll
+                && app
+                    .state
+                    .storage
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.failures.is_empty())
+                && app
+                    .state
+                    .storage
+                    .notice
+                    .as_deref()
+                    .is_some_and(|n| n.contains("저장을 복구했습니다"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "저장 복구 응답 시간 초과"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = frame(&mut app, vec![]);
+        assert!(find_text(&output, "아직 저장되지 않음").is_none());
+        assert!(find_text(&output, "완료 결과 저장을 복구했습니다").is_some());
+        drop(app);
+        let mut child = fixture.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let db = redb::Database::open(&database).unwrap();
+        let tx = db.begin_read().unwrap();
+        let table = tx
+            .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+            .unwrap();
+        let value = table.get(run.as_str()).unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_str(value.value()).unwrap();
+        assert_eq!(stored["status"], "awaiting_implementation");
+        assert_eq!(
+            stored["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "worktree_ready")
+                .count(),
+            1
+        );
+        drop(value);
+        drop(table);
+        drop(tx);
+        drop(db);
+    }
+
+    #[test]
+    fn storage_poll_is_not_blocked_by_slow_project_request() {
+        let pipe = format!(r"\\.\pipe\magi-storage-priority-{}", std::process::id());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let name = pipe.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let (requests, mut rx) = tokio::sync::mpsc::channel::<(
+                    Request,
+                    tokio::sync::oneshot::Sender<domain::Response>,
+                )>(16);
+                tokio::spawn(async move {
+                    while let Some((request, reply)) = rx.recv().await {
+                        tokio::spawn(async move {
+                            if matches!(request.command, Command::ListProjects) {
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                            }
+                            let _ = reply.send(domain::Response {
+                                id: request.id,
+                                result: Ok(ResponseData::Data(serde_json::json!({"failures":[]}))),
+                            });
+                        });
+                    }
+                });
+                let server_name = name.clone();
+                let task =
+                    tokio::spawn(async move { transport::serve(&server_name, requests).await });
+                let probe = Request {
+                    id: "probe".into(),
+                    command: Command::Status,
+                };
+                for _ in 0..100 {
+                    if transport::request(&name, &probe).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                ready_tx.send(()).unwrap();
+                let _ = stop_rx.await;
+                task.abort();
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (tx, rx) = start_with_pipe(egui::Context::default(), pipe, None);
+        tx.send(Work::new(Kind::List, Command::ListProjects))
+            .unwrap();
+        tx.send(Work::new(Kind::Storage, Command::ListStorageFailures))
+            .unwrap();
+        let first = rx.recv_timeout(Duration::from_millis(600));
+        drop(tx);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        assert!(matches!(
+            first,
+            Ok(Reply {
+                kind: Kind::Storage,
+                result: Ok(_)
+            })
+        ));
+    }
 
     #[test]
     fn starts_hidden_child_and_connects_to_its_real_pipe() {
