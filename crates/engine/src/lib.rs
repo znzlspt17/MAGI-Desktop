@@ -1,6 +1,8 @@
 //! 로컬 프로젝트와 명세 생성, 실행 결과 저장 및 복구를 제공한다.
 
 pub mod agent_loop;
+// 2026-11-16: StartAgent 연동 전 내구 runtime bridge를 독립 검증한다.
+mod agent_runtime;
 mod completion;
 mod runs;
 mod storage;
