@@ -16,6 +16,8 @@ pub fn search_text(documents: &[(&str, &str)], query: &str) -> Vec<String> {
 }
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+// 2026-11-15: 생성한 checkpoint가 같은 버전의 복원 한도에 맞도록 양쪽에서 공유한다.
+const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
@@ -43,10 +45,14 @@ pub struct KnowledgeIndex {
 }
 impl KnowledgeIndex {
     pub fn checkpoint(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|e| e.to_string())
+        let data = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if data.len() > MAX_CHECKPOINT_BYTES {
+            return Err("checkpoint too large".into());
+        }
+        Ok(data)
     }
     pub fn restore(data: &[u8]) -> Result<Self, String> {
-        if data.len() > 64 * 1024 * 1024 {
+        if data.len() > MAX_CHECKPOINT_BYTES {
             return Err("checkpoint too large".into());
         }
         let saved: Self = serde_json::from_slice(data).map_err(|e| e.to_string())?;

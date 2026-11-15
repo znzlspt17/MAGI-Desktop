@@ -65,10 +65,7 @@ impl Engine {
                     return Err("project name and path required".into());
                 }
                 let draft = SpecDraft::default();
-                let draft_hash = format!(
-                    "{:x}",
-                    Sha256::digest(serde_json::to_vec(&draft).map_err(err)?)
-                );
+                let draft_hash = draft_hash(&draft)?;
                 let project = Project {
                     id: uuid::Uuid::new_v4().to_string(),
                     name,
@@ -118,9 +115,56 @@ impl Engine {
                 }
                 Ok(ResponseData::Projects(projects))
             }
+            Command::SubmitInterview {
+                project_id,
+                message,
+            } => self.update(&project_id, |project| {
+                if message.trim().is_empty() {
+                    return Err("interview message is empty".into());
+                }
+                project.interview.push(message);
+                project.context_version = project.context_version.saturating_add(1);
+                project.approved = None;
+                Ok(ResponseData::Project(project.clone()))
+            }),
+            Command::SaveDraft { project_id, draft } => self.update(&project_id, |project| {
+                project.draft_hash = draft_hash(&draft)?;
+                project.draft = draft;
+                project.approved = None;
+                Ok(ResponseData::Project(project.clone()))
+            }),
             _ => Err("requested feature is not available".into()),
         }
     }
+
+    // 2026-11-15: 원본과 같이 읽기, 변경, 저장을 하나의 트랜잭션으로 묶는다.
+    fn update(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut Project) -> Result<ResponseData, String>,
+    ) -> Result<ResponseData, String> {
+        let tx = self.db.begin_write().map_err(err)?;
+        let result;
+        {
+            let mut table = tx.open_table(PROJECTS).map_err(err)?;
+            let mut project: Project = {
+                let value = table.get(id).map_err(err)?.ok_or("project not found")?;
+                serde_json::from_str(value.value()).map_err(err)?
+            };
+            result = update(&mut project)?;
+            let json = serde_json::to_string(&project).map_err(err)?;
+            table.insert(id, json.as_str()).map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        Ok(result)
+    }
+}
+
+fn draft_hash(draft: &SpecDraft) -> Result<String, String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(draft).map_err(err)?)
+    ))
 }
 
 fn initialize_schema(db: &Database) -> Result<(), String> {

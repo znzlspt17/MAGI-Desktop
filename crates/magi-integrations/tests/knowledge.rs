@@ -106,6 +106,7 @@ fn cancelled_embedding_cannot_publish_late_result() {
 }
 
 #[test]
+
 fn graph_reports_only_actual_source_provenance_in_stable_order() {
     let index = KnowledgeIndex::rebuild(vec![
         Document {
@@ -132,4 +133,26 @@ fn graph_reports_only_actual_source_provenance_in_stable_order() {
         ("file:a", "a", 1)
     );
     assert_eq!(index.graph(1, 1)[0].document_id, "b");
+}
+
+#[test]
+fn checkpoint_never_returns_unrestorable_oversized_data() {
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    let document = |text: String| Document {
+        id: "large".into(),
+        version: 1,
+        source: "source".into(),
+        text,
+    };
+    let empty = KnowledgeIndex::rebuild(vec![document(String::new())]).unwrap();
+    let overhead = empty.checkpoint().unwrap().len();
+    let exact = KnowledgeIndex::rebuild(vec![document("x".repeat(MAX_BYTES - overhead))]).unwrap();
+    let bytes = exact.checkpoint().unwrap();
+    assert_eq!(bytes.len(), MAX_BYTES);
+    assert!(KnowledgeIndex::restore(&bytes).is_ok());
+    drop(bytes);
+    drop(exact);
+    let too_large =
+        KnowledgeIndex::rebuild(vec![document("x".repeat(MAX_BYTES - overhead + 1))]).unwrap();
+    assert!(too_large.checkpoint().is_err());
 }
