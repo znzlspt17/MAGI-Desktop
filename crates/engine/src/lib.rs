@@ -132,6 +132,8 @@ impl Engine {
             &request.command,
             Command::CreateProject { .. }
                 | Command::StartRun { .. }
+                | Command::SubmitTool { .. }
+                | Command::ApproveTool { .. }
                 | Command::SaveDraft { .. }
                 | Command::SubmitInterview { .. }
                 | Command::ConfigureModel { .. }
@@ -467,6 +469,14 @@ impl Engine {
                 }
                 if state=="saved" || state=="superseded" {self.finish_startup_recovery();}
                 Ok(ResponseData::Data(serde_json::json!({"state":state})))
+            }
+            Command::SubmitTool { run_id, tool, arguments } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                Ok(ResponseData::Data(runs::submit_patch(&db, &run_id, tool, arguments)?))
+            }
+            Command::ApproveTool { run_id, approval_id, approved } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                Ok(ResponseData::Data(runs::approve_patch(&db, &run_id, &approval_id, approved)?))
             }
             Command::CancelRun { run_id } => {
                 // 2026-11-16: 저장 실패가 진행 중인 모델 작업의 취소 전달을 막지 않게 한다.
