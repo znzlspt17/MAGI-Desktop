@@ -262,30 +262,36 @@ fn identical_draft_keeps_assessment_but_clears_approval() {
 }
 
 #[test]
-fn saturated_context_version_is_preserved_when_interview_is_added() {
+fn saturated_context_rejects_interview_without_changing_project() {
     let fixture = TestDatabase::new();
     let original = seed_approved_project(&fixture.path, u64::MAX);
     let engine = Engine::open(&fixture.path).unwrap();
-    let updated = project(
+    let result = call(
+        &engine,
+        "saturated",
+        Command::SubmitInterview {
+            project_id: original.id.clone(),
+            message: "답변".into(),
+        },
+    );
+    assert_eq!(result.unwrap_err(), "interview context version exhausted");
+    drop(engine);
+    let reopened = Engine::open(&fixture.path).unwrap();
+    let saved = project(
         call(
-            &engine,
-            "saturated",
-            Command::SubmitInterview {
+            &reopened,
+            "get",
+            Command::GetProject {
                 project_id: original.id.clone(),
-                message: "답변".into(),
             },
         )
         .unwrap(),
     );
-    assert_eq!(updated.context_version, u64::MAX);
     assert_eq!(
-        updated.assessment.as_ref().unwrap().context_version,
-        u64::MAX
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(original).unwrap()
     );
-    assert_eq!(updated.interview, vec!["답변"]);
-    assert!(updated.approved.is_none());
 }
-
 #[test]
 fn updates_to_unknown_project_are_rejected_without_insertion() {
     let fixture = TestDatabase::new();

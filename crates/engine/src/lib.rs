@@ -3,8 +3,9 @@
 //! 실행 복구와 모델 제공자 등 나머지 엔진 기능은 아직 연결되지 않았다.
 
 pub mod agent_loop;
+mod worktree;
 
-use domain::{Command, Project, Request, Response, ResponseData, SpecDraft};
+use domain::{ApprovedSpec, Command, Project, Request, Response, ResponseData, SpecDraft};
 use redb::{Database, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
@@ -129,6 +130,10 @@ impl Engine {
                 if message.trim().is_empty() {
                     return Err("interview message is empty".into());
                 }
+                // 2026-11-15: 포화되면 입력 변화와 기존 평가의 선후 관계를 구분할 수 없다.
+                if project.context_version == u64::MAX {
+                    return Err("interview context version exhausted".into());
+                }
                 project.interview.push(message);
                 project.context_version = project.context_version.saturating_add(1);
                 project.approved = None;
@@ -139,6 +144,74 @@ impl Engine {
                 project.draft = draft;
                 project.approved = None;
                 Ok(ResponseData::Project(project.clone()))
+            }),
+            Command::ApproveSpec {
+                project_id,
+                expected_draft_hash,
+                accepted_optional,
+            } => self.update(&project_id, |p| {
+                if p.draft_hash != expected_draft_hash {
+                    return Err("draft changed since review".into());
+                }
+                // 2026-11-15: 기존 저장소의 포화된 문맥은 평가의 최신성을 증명하지 못한다.
+                if p.context_version == u64::MAX {
+                    return Err("interview context version exhausted".into());
+                }
+                // 2026-11-14: 다른 초안이나 입력에 대한 평가를 현재 승인 근거로 재사용하지 않는다.
+                if p.assessment.as_ref().is_some_and(|a| {
+                    a.draft_hash != p.draft_hash || a.context_version != p.context_version
+                }) {
+                    return Err("draft requires a new assessment".into());
+                }
+                let d = &p.draft;
+                if !d.mandatory_questions.is_empty() || !d.required_failures.is_empty() {
+                    return Err("mandatory questions or required checks remain unresolved".into());
+                }
+                if d.title.trim().is_empty()
+                    || d.base_revision.trim().is_empty()
+                    || d.scope.is_empty()
+                    || d.requirements.is_empty()
+                    || d.acceptance.is_empty()
+                    || d.scope
+                        .iter()
+                        .chain(&d.requirements)
+                        .chain(&d.acceptance)
+                        .any(|v| v.trim().is_empty())
+                {
+                    return Err(
+                        "title, base revision, scope, requirements and acceptance are required"
+                            .into(),
+                    );
+                }
+                provider::sdd::validate_draft_structure(d)
+                    .map_err(|_| "incomplete specification structure")?;
+                validate_tasks(&d.tasks, &d.scope)?;
+                if d.optional_issues
+                    .iter()
+                    .any(|issue| !accepted_optional.contains(issue))
+                {
+                    return Err("optional issues require explicit acceptance".into());
+                }
+                let hash = p.draft_hash.clone();
+                p.approval_version += 1;
+                let spec = ApprovedSpec {
+                    version: p.approval_version,
+                    hash,
+                    base_revision: d.base_revision.clone(),
+                    scope: d.scope.clone(),
+                    requirements: d.requirements.clone(),
+                    acceptance: d.acceptance.clone(),
+                    accepted_optional,
+                    markdown: d.markdown.clone(),
+                    source_links: d.source_links.clone(),
+                    constraints: d.constraints.clone(),
+                    tasks: d.tasks.clone(),
+                    reused_decisions: d.reused_decisions.clone(),
+                    task_bindings: d.task_bindings.clone(),
+                };
+                p.approval_history.push(spec.clone());
+                p.approved = Some(spec.clone());
+                Ok(ResponseData::Approved(spec))
             }),
             _ => Err("requested feature is not available".into()),
         }
@@ -198,4 +271,52 @@ fn initialize_schema(db: &Database) -> Result<(), String> {
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn validate_tasks(tasks: &[domain::TaskSpec], scope: &[String]) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    let mut by_id = HashMap::new();
+    for t in tasks {
+        if t.id.trim().is_empty()
+            || by_id.insert(t.id.as_str(), t).is_some()
+            || t.owned_paths.is_empty()
+            || t.validation.is_empty()
+            || t.validation.iter().any(|v| v.trim().is_empty())
+        {
+            return Err("invalid task definition".into());
+        }
+        for path in &t.owned_paths {
+            let p = std::path::Path::new(path);
+            if !worktree::safe_relative(path)
+                || p.components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                || worktree::protected(&path.replace('\\', "/"))
+                || path
+                    .split(['/', '\\'])
+                    .any(|c| c.eq_ignore_ascii_case(".git"))
+            {
+                return Err("unsafe task path".into());
+            }
+            let normalized = path.replace('\\', "/").to_lowercase();
+            if !scope.iter().any(|s| {
+                let s = s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+                !s.is_empty() && (normalized == s || normalized.starts_with(&(s + "/")))
+            }) {
+                return Err("task path outside approved scope".into());
+            }
+        }
+    }
+    let mut done = HashSet::new();
+    while done.len() < tasks.len() {
+        let before = done.len();
+        for task in tasks {
+            if task.dependencies.iter().all(|d| done.contains(d.as_str())) {
+                done.insert(task.id.as_str());
+            }
+        }
+        if done.len() == before {
+            return Err("task dependencies missing or cyclic".into());
+        }
+    }
+    Ok(())
 }
