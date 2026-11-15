@@ -7,6 +7,31 @@ use std::sync::{
 };
 
 pub enum Kind {
+    DecisionSave {
+        project_id: String,
+        epoch: u64,
+    },
+    DecisionList {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+    },
+    DecisionRevise {
+        project_id: String,
+        epoch: u64,
+        id: String,
+    },
+    DecisionSelect {
+        project_id: String,
+        epoch: u64,
+        id: String,
+        version: u64,
+    },
+    DecisionRefresh {
+        project_id: String,
+        epoch: u64,
+        generation: u64,
+    },
     KnowledgePut {
         project_id: String,
         epoch: u64,
