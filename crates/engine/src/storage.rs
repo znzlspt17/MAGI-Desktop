@@ -2088,4 +2088,337 @@ mod tests {
         std::fs::remove_dir(journal).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
+    #[cfg(windows)]
+    #[test]
+    fn patch_commit_failure_after_file_write_is_not_reexecuted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::env::temp_dir().join(format!("magi-patch-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        let target = worktree.join("src/file.txt");
+        std::fs::write(&target, "before").unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let manager = crate::completion::CompletionManager::empty(
+            root.join("state.redb.completion-journal"),
+            Arc::clone(&gate),
+        );
+        let engine = crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        };
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: root.to_string_lossy().into_owned(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let db = engine.db.get().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(crate::PROJECTS).unwrap();
+            let mut value = serde_json::to_value(&project).unwrap();
+            value["approved"] = serde_json::json!({"version":1,"hash":project.draft_hash,"base_revision":"fixture","scope":["src"],"requirements":["r"],"acceptance":["a"],"accepted_optional":[],"markdown":"","source_links":[],"constraints":[],"tasks":[],"reused_decisions":[],"task_bindings":[]});
+            projects
+                .insert(project.id.as_str(), value.to_string().as_str())
+                .unwrap();
+            let mut runs = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run = serde_json::json!({"id":run_id,"project_id":project.id,"spec_hash":project.draft_hash,"spec_version":1,"status":"awaiting_implementation","worktree":worktree,"scope":["src"],"events":[],"pending":null});
+            runs.insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let proposal = crate::runs::submit_patch(
+            &db,
+            &run_id,
+            "patch".into(),
+            serde_json::json!({"path":"src/file.txt","content":"after"}),
+        )
+        .unwrap();
+        let approval = proposal["approval_id"].as_str().unwrap().to_owned();
+        *crate::runs::TEST_FAIL_AFTER_PATCH.lock().unwrap() =
+            Some((run_id.clone(), Arc::clone(&broken)));
+        assert!(crate::runs::approve_patch(&db, &run_id, &approval, true).is_err());
+        *crate::runs::TEST_FAIL_AFTER_PATCH.lock().unwrap() = None;
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
+        drop(db);
+        broken.store(false, Ordering::SeqCst);
+        let reopened = engine.db.reopen_when_idle().unwrap();
+        let run = crate::runs::get(&reopened, &run_id).unwrap();
+        assert_eq!(run["status"], "executing");
+        std::fs::write(&target, "externally-changed").unwrap();
+        assert!(crate::runs::approve_patch(&reopened, &run_id, &approval, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "externally-changed"
+        );
+        drop(reopened);
+        drop(engine);
+        let reopened = crate::Engine::open(&path).unwrap();
+        let response = reopened
+            .handle(domain::Request {
+                id: "run".into(),
+                command: domain::Command::GetRun { run_id },
+            })
+            .result
+            .unwrap();
+        let run = match response {
+            domain::ResponseData::Data(v) => v,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["status"], "uncertain");
+        drop(reopened);
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(worktree.join("src")).unwrap();
+        std::fs::remove_dir(worktree).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn partial_patch_write_becomes_uncertain_and_is_not_reexecuted() {
+        use std::sync::atomic::AtomicBool;
+        let root = std::env::temp_dir().join(format!("magi-patch-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        let target = worktree.join("src/file.txt");
+        std::fs::write(&target, "before").unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let manager = crate::completion::CompletionManager::empty(
+            root.join("state.redb.completion-journal"),
+            Arc::clone(&gate),
+        );
+        let engine = crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        };
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: root.to_string_lossy().into_owned(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let db = engine.db.get().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(crate::PROJECTS).unwrap();
+            let mut value = serde_json::to_value(&project).unwrap();
+            value["approved"] = serde_json::json!({"version":1,"hash":project.draft_hash,"base_revision":"fixture","scope":["src"],"requirements":["r"],"acceptance":["a"],"accepted_optional":[],"markdown":"","source_links":[],"constraints":[],"tasks":[],"reused_decisions":[],"task_bindings":[]});
+            projects
+                .insert(project.id.as_str(), value.to_string().as_str())
+                .unwrap();
+            let mut runs = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run = serde_json::json!({"id":run_id,"project_id":project.id,"spec_hash":project.draft_hash,"spec_version":1,"status":"awaiting_implementation","worktree":worktree,"scope":["src"],"events":[],"pending":null});
+            runs.insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let proposal = crate::runs::submit_patch(
+            &db,
+            &run_id,
+            "patch".into(),
+            serde_json::json!({"path":"src/file.txt","content":"after"}),
+        )
+        .unwrap();
+        let approval = proposal["approval_id"].as_str().unwrap().to_owned();
+        *crate::runs::TEST_FAIL_AFTER_TRUNCATE.lock().unwrap() = Some(target.clone());
+        assert_eq!(
+            crate::runs::approve_patch(&db, &run_id, &approval, true).unwrap_err(),
+            "injected partial write failure"
+        );
+        *crate::runs::TEST_FAIL_AFTER_TRUNCATE.lock().unwrap() = None;
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+        let run = crate::runs::get(&db, &run_id).unwrap();
+        assert_eq!(run["status"], "uncertain");
+        std::fs::write(&target, "externally-changed").unwrap();
+        assert!(crate::runs::approve_patch(&db, &run_id, &approval, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "externally-changed"
+        );
+        drop(db);
+        drop(engine);
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(worktree.join("src")).unwrap();
+        std::fs::remove_dir(worktree).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn failed_execution_start_commit_never_writes_patch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::env::temp_dir().join(format!("magi-patch-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        let target = worktree.join("src/file.txt");
+        std::fs::write(&target, "before").unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let manager = crate::completion::CompletionManager::empty(
+            root.join("state.redb.completion-journal"),
+            Arc::clone(&gate),
+        );
+        let engine = crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(manager),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        };
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: root.to_string_lossy().into_owned(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        let db = engine.db.get().unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(crate::PROJECTS).unwrap();
+            let mut value = serde_json::to_value(&project).unwrap();
+            value["approved"] = serde_json::json!({"version":1,"hash":project.draft_hash,"base_revision":"fixture","scope":["src"],"requirements":["r"],"acceptance":["a"],"accepted_optional":[],"markdown":"","source_links":[],"constraints":[],"tasks":[],"reused_decisions":[],"task_bindings":[]});
+            projects
+                .insert(project.id.as_str(), value.to_string().as_str())
+                .unwrap();
+            let mut runs = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run = serde_json::json!({"id":run_id,"project_id":project.id,"spec_hash":project.draft_hash,"spec_version":1,"status":"awaiting_implementation","worktree":worktree,"scope":["src"],"events":[],"pending":null});
+            runs.insert(run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let proposal = crate::runs::submit_patch(
+            &db,
+            &run_id,
+            "patch".into(),
+            serde_json::json!({"path":"src/file.txt","content":"after"}),
+        )
+        .unwrap();
+        let approval = proposal["approval_id"].as_str().unwrap().to_owned();
+        broken.store(true, Ordering::SeqCst);
+        assert!(crate::runs::approve_patch(&db, &run_id, &approval, true).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        drop(db);
+        broken.store(false, Ordering::SeqCst);
+        let reopened = engine.db.reopen_when_idle().unwrap();
+        let run = crate::runs::get(&reopened, &run_id).unwrap();
+        assert_eq!(run["status"], "awaiting_approval");
+        assert_eq!(run["pending"]["id"], approval);
+        drop(reopened);
+        drop(engine);
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(worktree.join("src")).unwrap();
+        std::fs::remove_dir(worktree).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }
