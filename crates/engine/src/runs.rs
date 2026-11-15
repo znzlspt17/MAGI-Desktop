@@ -321,11 +321,24 @@ pub(crate) fn finish_worktree(
     completion_id: &str,
 ) -> Result<bool, String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
-    {
+    let previous = {
         let table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
-        if let Some(value) = table.get(completion_id).map_err(|e| e.to_string())? {
-            return Ok(value.value() != 0);
-        };
+        let value = table
+            .get(completion_id)
+            .map_err(|e| e.to_string())?
+            .map(|value| value.value());
+        value
+    };
+    if let Some(value) = previous {
+        // 2026-11-16: 이전 commit의 성공 여부가 불명확한 경우에도 marker를 다시 내구화한 뒤 반환한다.
+        {
+            let mut table = tx.open_table(COMPLETIONS).map_err(|e| e.to_string())?;
+            table
+                .insert(completion_id, value)
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(value != 0);
     }
     let applied = {
         let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
@@ -394,6 +407,7 @@ mod tests {
     fn applied_worktree_is_committed_once_and_preserves_other_run_fields() {
         let dir = std::env::temp_dir().join(format!("magi-run-finish-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let path = dir.join("state.redb");
         let db = Database::create(&path).unwrap();
         let tx = db.begin_write().unwrap();
@@ -424,6 +438,7 @@ mod tests {
     fn cancellation_becomes_uncertain_and_superseded_completion_is_marked() {
         let dir = std::env::temp_dir().join(format!("magi-run-states-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let path = dir.join("state.redb");
         let db = Database::create(&path).unwrap();
         let tx = db.begin_write().unwrap();
@@ -470,6 +485,7 @@ mod tests {
         };
         let root = std::env::temp_dir().join(format!("magi-git-serial-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -546,6 +562,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("magi-start-serial-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {

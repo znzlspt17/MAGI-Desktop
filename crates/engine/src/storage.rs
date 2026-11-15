@@ -55,6 +55,7 @@ mod tests {
     fn reopen_waits_for_live_handles_and_never_creates_missing_database() {
         let directory = std::env::temp_dir().join(format!("magi-slot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
         let path = directory.join("state.redb");
         let database = Database::create(&path).unwrap();
         crate::initialize_schema(&database).unwrap();
@@ -113,6 +114,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = std::env::temp_dir().join(format!("magi-poison-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let path = dir.join("state.redb");
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -176,6 +178,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("magi-poison-completion-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let path = dir.join("state.redb");
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -318,6 +321,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("magi-real-recovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -517,6 +521,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("magi-start-failure-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("state.redb");
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -617,6 +622,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = std::env::temp_dir().join(format!("magi-memory-retry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("state.redb");
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -709,6 +715,7 @@ mod tests {
         use redb::ReadableTableMetadata;
         let root = std::env::temp_dir().join(format!("magi-future-slot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("state.redb");
         let db = Database::create(&path).unwrap();
         let tx = db.begin_write().unwrap();
@@ -721,6 +728,7 @@ mod tests {
         drop(db);
         let dir = root.join("state.redb.completion-journal");
         std::fs::create_dir(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let project = uuid::Uuid::new_v4().to_string();
         let journal = dir.join(format!("{id}.json"));
@@ -770,5 +778,283 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn existing_marker_must_be_recommitted_before_success_is_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (initial_status, expected) in [("preparing", true), ("cancelled", false)] {
+            let root = std::env::temp_dir().join(format!("magi-marker-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let path = root.join("state.redb");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let broken = Arc::new(AtomicBool::new(false));
+            let db = Database::builder()
+                .set_cache_size(0)
+                .create_with_backend(FailingBackend {
+                    file: redb::backends::FileBackend::new(file).unwrap(),
+                    broken: Arc::clone(&broken),
+                })
+                .unwrap();
+            crate::initialize_schema(&db).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut table = tx
+                    .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                    .unwrap();
+                let value=serde_json::json!({"id":"run","project_id":"project","status":initial_status,"events":[]}).to_string();
+                table.insert("run", value.as_str()).unwrap();
+            }
+            tx.commit().unwrap();
+            assert_eq!(
+                crate::runs::finish_worktree(&db, "run", &Ok(()), "marker").unwrap(),
+                expected
+            );
+            broken.store(true, Ordering::SeqCst);
+            assert!(crate::runs::finish_worktree(&db, "run", &Ok(()), "marker").is_err());
+            broken.store(false, Ordering::SeqCst);
+            let slot = StorageSlot::new(path.clone(), db);
+            let reopened = slot.reopen_when_idle().unwrap();
+            assert_eq!(
+                crate::runs::finish_worktree(&reopened, "run", &Ok(()), "marker").unwrap(),
+                expected
+            );
+            let run = crate::runs::get(&reopened, "run").unwrap();
+            assert_eq!(
+                run["events"].as_array().unwrap().len(),
+                usize::from(expected)
+            );
+            drop(reopened);
+            drop(slot);
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
+    #[derive(Debug)]
+    struct ReadFaultBackend {
+        inner: FailingBackend,
+        fail_read: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl redb::StorageBackend for ReadFaultBackend {
+        fn len(&self) -> std::io::Result<u64> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+            if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("fake read failure"));
+            }
+            self.inner.read(offset, length)
+        }
+        fn set_len(&self, length: u64) -> std::io::Result<()> {
+            self.inner.set_len(length)
+        }
+        fn sync_data(&self, eventual: bool) -> std::io::Result<()> {
+            self.inner.sync_data(eventual)
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            self.inner.write(offset, data)
+        }
+    }
+    #[cfg(windows)]
+    fn check_startup_failure(fail_schema: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::env::temp_dir().join(format!("magi-startup-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let fail_write = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(ReadFaultBackend {
+                inner: FailingBackend {
+                    file: redb::backends::FileBackend::new(file).unwrap(),
+                    broken: Arc::clone(&fail_write),
+                },
+                fail_read: Arc::clone(&fail_read),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let run=serde_json::json!({"id":run_id,"project_id":project_id,"status":"preparing","events":[]}).to_string();
+            table.insert(run_id.as_str(), run.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let dir = root.join("state.redb.completion-journal");
+        std::fs::create_dir(&dir).unwrap();
+        let file = if fail_schema {
+            dir.join(format!("{run_id}.json"))
+        } else {
+            dir.join("preserve.tmp")
+        };
+        let bytes = if fail_schema {
+            serde_json::to_vec(&serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":{"Ok":null}}})).unwrap()
+        } else {
+            b"fixture".to_vec()
+        };
+        std::fs::write(&file, &bytes).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let manager = crate::completion::CompletionManager::load(&dir, Arc::clone(&gate)).unwrap();
+        if fail_schema {
+            fail_read.store(true, Ordering::SeqCst);
+        } else {
+            fail_write.store(true, Ordering::SeqCst);
+        }
+        let slot = crate::open_existing_storage(path.clone(), db, &manager)
+            .expect("I/O failure must preserve a diagnostic engine");
+        let engine = crate::Engine {
+            db: slot,
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(true),
+            completions: Arc::new(manager),
+        };
+        let status = engine
+            .handle(domain::Request {
+                id: "status".into(),
+                command: domain::Command::ListStorageFailures,
+            })
+            .result
+            .unwrap();
+        let status = match status {
+            domain::ResponseData::Data(v) => v,
+            _ => panic!("status"),
+        };
+        assert!(!status["failures"].as_array().unwrap().is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        fail_read.store(false, Ordering::SeqCst);
+        fail_write.store(false, Ordering::SeqCst);
+        let id = status["failures"][0]["run_id"].as_str().unwrap().to_owned();
+        let retry = engine
+            .handle(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave { run_id: id },
+            })
+            .result
+            .unwrap();
+        let retry = match retry {
+            domain::ResponseData::Data(v) => v,
+            _ => panic!("retry"),
+        };
+        assert_eq!(retry["state"], "saved");
+        if fail_schema {
+            assert!(!file.exists());
+        } else {
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+            std::fs::remove_file(file).unwrap();
+        }
+        drop(engine);
+        let log = dir.join("events.log");
+        if log.exists() {
+            std::fs::remove_file(log).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn startup_schema_read_failure_keeps_diagnostic_and_retries() {
+        check_startup_failure(true);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn startup_run_initialization_failure_keeps_diagnostic_and_retries() {
+        check_startup_failure(false);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn failed_marker_recommit_keeps_journal_and_original_outcome() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (state, applied) in [("preparing", true), ("cancelled", false)] {
+            let root =
+                std::env::temp_dir().join(format!("magi-marker-journal-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let path = root.join("state.redb");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let broken = Arc::new(AtomicBool::new(false));
+            let db = Database::builder()
+                .set_cache_size(0)
+                .create_with_backend(FailingBackend {
+                    file: redb::backends::FileBackend::new(file).unwrap(),
+                    broken: Arc::clone(&broken),
+                })
+                .unwrap();
+            crate::initialize_schema(&db).unwrap();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let project_id = uuid::Uuid::new_v4().to_string();
+            let marker = uuid::Uuid::new_v4().to_string();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx
+                    .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                    .unwrap();
+                let data=serde_json::json!({"id":run_id,"project_id":project_id,"status":state,"events":[]}).to_string();
+                t.insert(run_id.as_str(), data.as_str()).unwrap();
+            }
+            tx.commit().unwrap();
+            assert_eq!(
+                crate::runs::finish_worktree(&db, &run_id, &Ok(()), &marker).unwrap(),
+                applied
+            );
+            let dir = root.join("state.redb.completion-journal");
+            std::fs::create_dir(&dir).unwrap();
+            let journal = dir.join(format!("{run_id}.json"));
+            let bytes=serde_json::to_vec(&serde_json::json!({"version":1,"id":marker,"run_id":run_id,"project_id":project_id,"outcome":{"stage":"worktree","result":{"Ok":null}}})).unwrap();
+            std::fs::write(&journal, &bytes).unwrap();
+            let manager = crate::completion::CompletionManager::load(
+                &dir,
+                Arc::new(std::sync::Mutex::new(())),
+            )
+            .unwrap();
+            broken.store(true, Ordering::SeqCst);
+            assert_eq!(manager.retry(&db, &run_id).unwrap(), "pending");
+            assert_eq!(std::fs::read(&journal).unwrap(), bytes);
+            assert_eq!(manager.for_run(&run_id)["state"], "pending");
+            broken.store(false, Ordering::SeqCst);
+            let slot = StorageSlot::new(path.clone(), db);
+            let db = slot.reopen_when_idle().unwrap();
+            assert_eq!(
+                manager.retry(&db, &run_id).unwrap(),
+                if applied { "saved" } else { "superseded" }
+            );
+            let run = crate::runs::get(&db, &run_id).unwrap();
+            assert_eq!(
+                run["events"].as_array().unwrap().len(),
+                usize::from(applied)
+            );
+            assert!(!journal.exists());
+            drop(db);
+            drop(slot);
+            drop(manager);
+            std::fs::remove_dir(dir).unwrap();
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
     }
 }

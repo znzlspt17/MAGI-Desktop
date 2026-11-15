@@ -65,14 +65,7 @@ impl Engine {
         };
         let db = if journal_exists {
             match Database::open(&database_path) {
-                Ok(db) => {
-                    validate_existing_schema(&db)?;
-                    completions.replay(&db, None);
-                    if !completions.blocked() {
-                        runs::initialize(&db)?;
-                    }
-                    storage::StorageSlot::new(database_path, db)
-                }
+                Ok(db) => open_existing_storage(database_path, db, &completions)?,
                 Err(_) => {
                     if !completions.blocked() {
                         completions.add_startup_issue(false);
@@ -510,6 +503,31 @@ fn draft_hash(draft: &SpecDraft) -> Result<String, String> {
     ))
 }
 
+// 2026-11-16: 복구 중 일반 I/O 실패는 DB 핸들을 공개하지 않고 독립 진단과 재시도를 유지한다.
+fn open_existing_storage(
+    path: std::path::PathBuf,
+    db: Database,
+    completions: &completion::CompletionManager,
+) -> Result<storage::StorageSlot, String> {
+    match check_existing_schema(&db) {
+        Err(SchemaError::Invalid) => return Err("unsupported storage schema version".into()),
+        Err(SchemaError::Storage) => {
+            if !completions.blocked() {
+                completions.add_startup_issue(false);
+            }
+            drop(db);
+            return Ok(storage::StorageSlot::empty(path));
+        }
+        Ok(()) => {}
+    }
+    completions.replay(&db, None);
+    if !completions.blocked() && runs::initialize(&db).is_err() {
+        completions.add_startup_issue(false);
+        drop(db);
+        return Ok(storage::StorageSlot::empty(path));
+    }
+    Ok(storage::StorageSlot::new(path, db))
+}
 fn resources_released(run: &serde_json::Value) -> Result<bool, String> {
     let status = run["status"].as_str().ok_or("invalid run status")?;
     Ok(!run["agent_active"].as_bool().unwrap_or(false)
@@ -528,14 +546,36 @@ fn resources_released(run: &serde_json::Value) -> Result<bool, String> {
         ]
         .contains(&status))
 }
-fn validate_existing_schema(db: &Database) -> Result<(), String> {
-    let tx = db.begin_read().map_err(err)?;
-    let meta = tx.open_table(META).map_err(err)?;
-    if meta.get("schema_version").map_err(err)?.map(|v| v.value()) != Some(SCHEMA_VERSION) {
-        return Err("unsupported storage schema version".into());
+#[derive(Debug)]
+enum SchemaError {
+    Invalid,
+    Storage,
+}
+fn schema_table_error(error: redb::TableError) -> SchemaError {
+    match error {
+        redb::TableError::Storage(_) => SchemaError::Storage,
+        _ => SchemaError::Invalid,
     }
-    tx.open_table(PROJECTS).map_err(err)?;
+}
+fn check_existing_schema(db: &Database) -> Result<(), SchemaError> {
+    let tx = db.begin_read().map_err(|_| SchemaError::Storage)?;
+    let meta = tx.open_table(META).map_err(schema_table_error)?;
+    if meta
+        .get("schema_version")
+        .map_err(|_| SchemaError::Storage)?
+        .map(|value| value.value())
+        != Some(SCHEMA_VERSION)
+    {
+        return Err(SchemaError::Invalid);
+    }
+    tx.open_table(PROJECTS).map_err(schema_table_error)?;
     Ok(())
+}
+fn validate_existing_schema(db: &Database) -> Result<(), String> {
+    check_existing_schema(db).map_err(|error| match error {
+        SchemaError::Invalid => "unsupported storage schema version".into(),
+        SchemaError::Storage => "storage unavailable".into(),
+    })
 }
 fn initialize_schema(db: &Database) -> Result<(), String> {
     let tx = db.begin_write().map_err(err)?;

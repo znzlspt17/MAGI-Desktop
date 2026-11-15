@@ -419,6 +419,7 @@ mod journal_pin_tests {
     fn pin_can_create_missing_parents_only_when_allowed() {
         let root = std::env::temp_dir().join(format!("journal-pins-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         assert!(pin_directories(&root, Path::new("one/two"), false).is_err());
         let pins = pin_directories(&root, Path::new("one/two"), true).unwrap();
         assert!(root.join("one/two").is_dir());

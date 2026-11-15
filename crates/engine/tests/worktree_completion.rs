@@ -10,6 +10,7 @@ impl Fixture {
     fn new() -> Self {
         let directory = std::env::temp_dir().join(format!("magi-run-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
         let database = directory.join("state.redb");
         Self {
             directory,
@@ -826,5 +827,21 @@ fn retry_does_not_apply_journal_to_a_future_schema_database() {
     if log.exists() {
         std::fs::remove_file(log).unwrap();
     }
+    std::fs::remove_dir(journal).unwrap();
+}
+
+#[test]
+fn journal_with_missing_schema_is_rejected_without_modifying_database() {
+    let fixture = Fixture::new();
+    let db = redb::Database::create(&fixture.database).unwrap();
+    drop(db);
+    let before = std::fs::read(&fixture.database).unwrap();
+    let mut name = fixture.database.as_os_str().to_os_string();
+    name.push(".completion-journal");
+    let journal = PathBuf::from(name);
+    std::fs::create_dir(&journal).unwrap();
+    let result = Engine::open(&fixture.database);
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), before);
     std::fs::remove_dir(journal).unwrap();
 }

@@ -667,6 +667,7 @@ mod tests {
     fn journal_publish_does_not_overwrite_an_existing_result() {
         let root = std::env::temp_dir().join(format!("magi-journal-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let dir = root.join("state.redb.completion-journal");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
         let path = publish_worktree_record(&dir, &record).unwrap();
@@ -690,6 +691,7 @@ mod tests {
     fn journal_reader_rejects_multiple_hard_links_without_modifying_them() {
         let root = std::env::temp_dir().join(format!("magi-journal-read-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("entry.json");
         let alias = root.join("alias.json");
         let record = serde_json::json!({"version":1,"id":uuid::Uuid::new_v4().to_string(),"run_id":uuid::Uuid::new_v4().to_string(),"project_id":uuid::Uuid::new_v4().to_string(),"outcome":{"stage":"worktree","result":{"Ok":null}}});
@@ -709,6 +711,7 @@ mod tests {
     fn existing_journal_is_not_deleted_or_overwritten_by_another_completion() {
         let root = std::env::temp_dir().join(format!("journal-collision-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let dbpath = root.join("state.redb");
         let db = redb::Database::create(&dbpath).unwrap();
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -750,6 +753,7 @@ mod tests {
     fn journal_and_database_failures_leave_memory_only_diagnostic() {
         let root = std::env::temp_dir().join(format!("journal-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let dbpath = root.join("state.redb");
         let db = redb::Database::create(&dbpath).unwrap();
         let directory = root.join("blocked");
@@ -810,6 +814,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         let root = std::env::temp_dir().join(format!("magi-crash-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let dbpath = root.join("state.redb");
         drop(crate::Engine::open(&dbpath).unwrap());
         let db = redb::Database::open(&dbpath).unwrap();
