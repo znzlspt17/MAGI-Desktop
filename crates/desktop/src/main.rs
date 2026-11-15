@@ -921,17 +921,16 @@ impl App {
                                 egui::Button::new("명세 초안 생성"),
                             )
                             .clicked()
-                        {
-                            if self.send(worker::Work::new(
+                            && self.send(worker::Work::new(
                                 worker::Kind::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
                                 Command::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
-                            )) {
-                                self.state.spec_starting.insert(project.id.clone());
-                            }
+                            ))
+                        {
+                            self.state.spec_starting.insert(project.id.clone());
                         }
                         ui.heading("인터뷰");
                         egui::ScrollArea::vertical()
@@ -1029,6 +1028,7 @@ impl App {
                         ) {
                             match action {
                                 spec_review::Action::Save(Ok(draft)) => {
+                                    let draft = *draft;
                                     let submitted = draft.clone();
                                     if self.send(worker::Work::new(
                                         worker::Kind::SaveDraft {
