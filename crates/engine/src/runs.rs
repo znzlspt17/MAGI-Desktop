@@ -34,6 +34,7 @@ fn append_event(
 // 2026-11-15: 완료 기록을 먼저 반영한 후 외부 작업 결과가 불명확한 실행만 중단 상태로 표시한다.
 pub(crate) fn initialize(db: &Database) -> Result<(), String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let mut interrupted_calls = Vec::new();
     {
         let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
         let mut changes = Vec::new();
@@ -49,6 +50,17 @@ pub(crate) fn initialize(db: &Database) -> Result<(), String> {
             if run.get("resources_unknown").is_none() && status == "uncertain" {
                 run["resources_unknown"] = true.into();
                 modified = true;
+            }
+            if ["executing", "cancelling"].contains(&status.as_str())
+                && run["pending"]["tool"] == "patch"
+            {
+                if let Some(call_id) = run["pending"]["call_id"].as_str() {
+                    interrupted_calls.push((
+                        key.value().to_owned(),
+                        call_id.to_owned(),
+                        run["pending"]["id"].clone(),
+                    ));
+                }
             }
             if ["preparing", "cancelling", "executing", "generating"].contains(&status.as_str()) {
                 if status != "generating" {
@@ -95,6 +107,28 @@ pub(crate) fn initialize(db: &Database) -> Result<(), String> {
             table
                 .insert(id.as_str(), json.as_str())
                 .map_err(|e| e.to_string())?;
+        }
+    }
+    // 2026-11-16: 중단된 patch 효과는 재실행하지 않도록 Run과 호출 결과를 함께 불명확 상태로 둔다.
+    if !interrupted_calls.is_empty() {
+        let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        for (run_id, call_id, approval_id) in interrupted_calls {
+            let key = format!("{run_id}:{call_id}");
+            let existing = {
+                calls
+                    .get(key.as_str())
+                    .map_err(|e| e.to_string())?
+                    .map(|value| value.value().to_owned())
+            };
+            let mut call: serde_json::Value =
+                serde_json::from_str(&existing.ok_or("interrupted call not found")?)
+                    .map_err(|e| e.to_string())?;
+            if call["status"] == "waiting" && call["approval_id"] == approval_id {
+                call["status"] = "uncertain".into();
+                calls
+                    .insert(key.as_str(), call.to_string().as_str())
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
     tx.open_table(CHECKPOINTS).map_err(|e| e.to_string())?;
@@ -697,6 +731,9 @@ pub(crate) fn complete_call(
 #[cfg(test)]
 #[path = "checkpoint_storage_tests.rs"]
 mod checkpoint_storage_tests;
+#[cfg(test)]
+#[path = "durable_patch_tests.rs"]
+mod durable_patch_tests;
 
 #[cfg(test)]
 pub(crate) static TEST_FAIL_AFTER_PATCH: std::sync::Mutex<
@@ -714,6 +751,228 @@ type PatchReadBarrier = (
 #[cfg(test)]
 static TEST_PAUSE_AFTER_PATCH_READ: std::sync::Mutex<Option<PatchReadBarrier>> =
     std::sync::Mutex::new(None);
+// 2026-11-16: 논리 호출과 승인 요청을 같은 트랜잭션에 기록해 중단 후 파일 효과를 추정해 재실행하지 않는다.
+#[allow(dead_code)]
+pub(crate) fn submit_bound_patch(
+    db: &Database,
+    id: &str,
+    role: &str,
+    task_id: &str,
+    call_id: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    if id.len() > 128 || call_id.is_empty() || call_id.len() > 1024 {
+        return Err("invalid call identity".into());
+    }
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("path required")?;
+    let content = arguments
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("content required")?;
+    if content.len() > 1024 * 1024 {
+        return Err("content too large".into());
+    }
+    let identity =
+        serde_json::to_vec(&(role, task_id, "patch", &arguments)).map_err(|e| e.to_string())?;
+    let hash = format!("{:x}", Sha256::digest(identity));
+    let key = format!("{id}:{call_id}");
+    let snapshot = get(db, id)?;
+    let already_exists = {
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        match tx.open_table(CALLS) {
+            Ok(table) => table
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .is_some(),
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let before_hash = if already_exists {
+        None
+    } else {
+        if snapshot["status"] != "awaiting_implementation" || !snapshot["pending"].is_null() {
+            return Err("run not ready for call".into());
+        }
+        let run: PatchRun = serde_json::from_value(snapshot.clone()).map_err(|e| e.to_string())?;
+        let (path, missing) = target_path(&run, path)?;
+        Some(if missing {
+            "missing".into()
+        } else {
+            file_hash(&run, &path)?
+        })
+    };
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let response = {
+        let mut runs = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let value = runs
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        // 2026-11-16: 이전 Run 형식의 선택 필드는 기존 조회와 동일한 기본값으로 처리한다.
+        normalize_run(&mut run)?;
+        let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        let existing = {
+            calls
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(existing) = existing {
+            let record: serde_json::Value =
+                serde_json::from_str(&existing).map_err(|e| e.to_string())?;
+            if record["hash"] != hash {
+                return Err("call identity conflict".into());
+            }
+            // 2026-11-16: 중단된 호출은 활동이 끝나도 같은 identity와 문맥에서 결과 불명을 알려준다.
+            let require_active = !(record["status"] == "uncertain" && run["status"] == "uncertain");
+            validate_bound_patch(&tx, &run, role, task_id, &arguments, require_active)?;
+            match record["status"].as_str() {
+                Some("completed") => {
+                    serde_json::json!({"status":"completed","result":record["result"]})
+                }
+                Some("waiting")
+                    if run["status"] == "awaiting_approval"
+                        && run["pending"]["call_id"].as_str() == Some(call_id)
+                        && run["pending"]["id"] == record["approval_id"] =>
+                {
+                    serde_json::json!({"status":"waiting","approval_id":record["approval_id"]})
+                }
+                Some("waiting")
+                    if ["executing", "cancelling", "uncertain"]
+                        .contains(&run["status"].as_str().unwrap_or("")) =>
+                {
+                    return Err("previous tool outcome uncertain".into())
+                }
+                Some("waiting") => return Err("approval is no longer pending".into()),
+                Some("uncertain") => return Err("previous tool outcome uncertain".into()),
+                Some("planned") => return Err("call is not ready for approval".into()),
+                _ => return Err("invalid call state".into()),
+            }
+        } else {
+            validate_bound_patch(&tx, &run, role, task_id, &arguments, true)?;
+            if run["status"] != "awaiting_implementation"
+                || !run["pending"].is_null()
+                || [
+                    "project_id",
+                    "spec_hash",
+                    "spec_version",
+                    "context_version",
+                    "worktree",
+                    "scope",
+                    "agent_configs",
+                ]
+                .iter()
+                .any(|k| run[*k] != snapshot[*k])
+            {
+                return Err("run not ready for call".into());
+            }
+            let before = before_hash.ok_or("call changed during request")?;
+            if run["used_calls"]
+                .as_array()
+                .is_none_or(|items| items.iter().any(|v| v.as_str() == Some(call_id)))
+            {
+                return Err("run not ready for call".into());
+            }
+            let approval = uuid::Uuid::new_v4().to_string();
+            let record = serde_json::json!({"status":"waiting","hash":hash,"approval_id":approval,"role":role,"task_id":task_id});
+            calls
+                .insert(key.as_str(), record.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+            run["used_calls"]
+                .as_array_mut()
+                .unwrap()
+                .push(call_id.into());
+            run["pending"] = serde_json::json!({"id":approval,"tool":"patch","arguments":arguments,"before_hash":before,"call_id":call_id,"authorized":false});
+            run["status"] = "awaiting_approval".into();
+            append_event(
+                &mut run,
+                id,
+                "approval_required",
+                "도구 요청에 사용자 승인이 필요합니다.",
+            )?;
+            runs.insert(id, run.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+            serde_json::json!({"status":"waiting","approval_id":approval})
+        }
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(response)
+}
+
+// 2026-11-16: 승인본·문맥·역할과 작업 소유권을 DB 쓰기 트랜잭션의 현재 상태로 검증한다.
+fn validate_bound_patch(
+    tx: &redb::WriteTransaction,
+    run: &serde_json::Value,
+    role: &str,
+    task_id: &str,
+    arguments: &serde_json::Value,
+    require_active: bool,
+) -> Result<(), String> {
+    if require_active && run["agent_active"] != true {
+        return Err("run not ready for call".into());
+    }
+    let configs = run["agent_configs"]
+        .as_array()
+        .ok_or("role not configured")?;
+    let config = configs
+        .iter()
+        .find(|v| v["role"].as_str() == Some(role))
+        .ok_or("role not configured")?;
+    if config["tools"]
+        .as_array()
+        .is_none_or(|tools| !tools.iter().any(|v| v == "patch"))
+    {
+        return Err("tool not allowed for role".into());
+    }
+    let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+    let project_id = run["project_id"].as_str().ok_or("invalid run project")?;
+    let value = projects
+        .get(project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("project not found")?;
+    let project: domain::Project =
+        serde_json::from_str(value.value()).map_err(|e| e.to_string())?;
+    let spec = project
+        .approved
+        .as_ref()
+        .ok_or("approved specification changed")?;
+    if run["spec_hash"].as_str() != Some(spec.hash.as_str())
+        || run["spec_version"].as_u64() != Some(spec.version)
+        || run["context_version"].as_u64() != Some(project.context_version)
+        || project.draft_hash != spec.hash
+        || run["scope"] != serde_json::to_value(&spec.scope).map_err(|e| e.to_string())?
+    {
+        return Err("approved specification changed".into());
+    }
+    let task = spec
+        .tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .ok_or("task not found")?;
+    let path = arguments["path"]
+        .as_str()
+        .ok_or("path required")?
+        .replace('\\', "/")
+        .to_lowercase();
+    if !task.owned_paths.iter().any(|owned| {
+        let owned = owned
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase();
+        !owned.is_empty() && (path == owned || path.starts_with(&(owned + "/")))
+    }) {
+        return Err("path outside task ownership".into());
+    }
+    Ok(())
+}
 // 2026-11-16: 파일 읽기와 승인 대기 전환 사이의 취소·새 요청은 같은 트랜잭션에서 다시 확인한다.
 pub(crate) fn submit_patch(
     db: &Database,
@@ -847,6 +1106,31 @@ pub(crate) fn approve_patch(
             {
                 return Err("approved specification changed".into());
             }
+            if let Some(call_id) = pending["call_id"].as_str() {
+                use sha2::{Digest, Sha256};
+                let key = format!("{id}:{call_id}");
+                let record: serde_json::Value = {
+                    let calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+                    let value = calls
+                        .get(key.as_str())
+                        .map_err(|e| e.to_string())?
+                        .ok_or("call not found")?;
+                    serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+                };
+                let role = record["role"].as_str().ok_or("invalid call identity")?;
+                let task = record["task_id"].as_str().ok_or("invalid call identity")?;
+                let identity = serde_json::to_vec(&(role, task, "patch", &pending["arguments"]))
+                    .map_err(|e| e.to_string())?;
+                if record["status"] != "waiting"
+                    || record["approval_id"].as_str() != Some(approval)
+                    || record["hash"] != format!("{:x}", Sha256::digest(identity))
+                {
+                    return Err("call identity conflict".into());
+                }
+                drop(value);
+                drop(projects);
+                validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
+            }
             current["status"] = "executing".into();
             append_event(
                 &mut current,
@@ -931,6 +1215,7 @@ fn finish_patch(
         {
             return Err("patch execution state changed".into());
         }
+        let call_id = run["pending"]["call_id"].as_str().map(str::to_owned);
         let cancelled = run["status"] == "cancelling";
         run["pending"] = serde_json::Value::Null;
         let (state, kind, message) = if result.is_ok() && !cancelled {
@@ -959,6 +1244,29 @@ fn finish_patch(
         };
         run["status"] = state.into();
         append_event(&mut run, id, kind, message)?;
+        if let Some(call_id) = call_id {
+            let key = format!("{id}:{call_id}");
+            let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+            let mut record: serde_json::Value = {
+                let value = calls
+                    .get(key.as_str())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("call not found")?;
+                serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+            };
+            if record["status"] != "waiting" || record["approval_id"].as_str() != Some(approval) {
+                return Err("call identity conflict".into());
+            }
+            if result.is_ok() && !cancelled {
+                record["status"] = "completed".into();
+                record["result"] = serde_json::json!({"status":"applied"});
+            } else {
+                record["status"] = "uncertain".into();
+            }
+            calls
+                .insert(key.as_str(), record.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+        }
         table
             .insert(id, run.to_string().as_str())
             .map_err(|e| e.to_string())?;
