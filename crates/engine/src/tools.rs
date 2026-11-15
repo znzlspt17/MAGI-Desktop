@@ -23,7 +23,7 @@ pub struct ToolResult {
 }
 
 // 2026-11-15: 작업 루트 또는 상위 경로가 junction으로 바뀌면 승인한 경로 밖을 열지 않는다.
-fn checked_root(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn checked_root(path: &Path) -> Result<PathBuf, String> {
     use std::path::Component;
     if !path.is_absolute() {
         return Err("worktree path must be absolute".into());
@@ -248,7 +248,8 @@ struct SearchArguments {
 #[cfg(windows)]
 pub(crate) struct DirectoryPins {
     _handles: Vec<std::os::windows::io::OwnedHandle>,
-    root: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) parent: PathBuf,
 }
 
 // 2026-11-15: 속성 전용 핸들은 공유 제한이 적용되지 않으므로 목록 접근을 요청해 교체를 막는다.
@@ -349,6 +350,7 @@ pub(crate) fn pin_directories(
     Ok(DirectoryPins {
         _handles: handles,
         root,
+        parent,
     })
 }
 
