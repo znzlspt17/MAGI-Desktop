@@ -474,14 +474,16 @@ pub(crate) fn cancel(db: &Database, id: &str) -> Result<(), String> {
         };
         let next = match run["status"].as_str() {
             Some("executing") => Some(("cancelling", "외부 작업 취소를 요청했습니다.")),
-            Some("awaiting_approval") => Some(("cancelled", "대기 중인 승인을 취소했습니다.")),
+            Some("awaiting_approval" | "approved_mcp") => {
+                Some(("cancelled", "대기 중인 승인을 취소했습니다."))
+            }
             Some("generating") => Some(("cancelled", "작업을 취소했습니다.")),
             Some("preparing") => Some(("cancelling", "취소를 요청했습니다.")),
             Some("awaiting_implementation") => Some(("cancelled", "작업을 취소했습니다.")),
             _ => None,
         };
         if let Some((state, message)) = next {
-            if run["status"] == "awaiting_approval" {
+            if run["status"] == "awaiting_approval" || run["status"] == "approved_mcp" {
                 run["pending"] = serde_json::Value::Null;
             }
             run["status"] = state.into();
@@ -1253,7 +1255,7 @@ pub(crate) fn approve_patch(
         if pending["id"].as_str() != Some(approval) {
             return Err("approval does not match pending request".into());
         }
-        if pending["tool"] != "patch" {
+        if pending["tool"] != "patch" && pending["tool"] != "mcp" {
             return Err("unsupported tool".into());
         }
         if approved {
@@ -1304,13 +1306,24 @@ pub(crate) fn approve_patch(
                 drop(projects);
                 validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
             }
-            current["status"] = "executing".into();
-            append_event(
-                &mut current,
-                id,
-                "tool_started",
-                "승인된 파일 변경을 시작합니다.",
-            )?;
+            if pending["tool"] == "mcp" {
+                current["pending"]["authorized"] = true.into();
+                current["status"] = "approved_mcp".into();
+                append_event(
+                    &mut current,
+                    id,
+                    "tool_approved",
+                    "MCP 요청을 승인했습니다.",
+                )?;
+            } else {
+                current["status"] = "executing".into();
+                append_event(
+                    &mut current,
+                    id,
+                    "tool_started",
+                    "승인된 파일 변경을 시작합니다.",
+                )?;
+            }
         } else {
             current["pending"] = serde_json::Value::Null;
             current["status"] = "awaiting_implementation".into();
@@ -1329,6 +1342,9 @@ pub(crate) fn approve_patch(
     tx.commit().map_err(|e| e.to_string())?;
     if !approved {
         return Ok(serde_json::json!({"status":"denied"}));
+    }
+    if pending["tool"] == "mcp" {
+        return Ok(serde_json::json!({"status":"approved_mcp"}));
     }
     let run: PatchRun = serde_json::from_value(run).map_err(|e| e.to_string())?;
     let result = (|| {
@@ -2499,4 +2515,165 @@ mod diff_snapshot_tests {
             .starts_with("magi-diff-race-"));
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+// 2026-11-16: 승인 대상 전체를 같은 트랜잭션에 고정해 경합 중 요청이 바뀌지 않게 한다.
+pub(crate) fn request_mcp(
+    db: &Database,
+    id: &str,
+    endpoint: String,
+    name: String,
+    arguments: serde_json::Value,
+    cwd: String,
+) -> Result<serde_json::Value, String> {
+    integrations::mcp::validate_endpoint(&endpoint)?;
+    if name.trim().is_empty() || !arguments.is_object() || cwd != "." {
+        return Err("invalid MCP approval request".into());
+    }
+    let approval = uuid::Uuid::new_v4().to_string();
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if run["status"] != "awaiting_implementation"
+            || !run["pending"].is_null()
+            || run["agent_active"] == true
+        {
+            return Err("run not ready for tool approval".into());
+        }
+        run["pending"] = serde_json::json!({"id":approval,"tool":"mcp","arguments":{"endpoint":endpoint,"name":name,"arguments":arguments,"cwd":cwd},"call_id":null,"authorized":false});
+        run["status"] = "awaiting_approval".into();
+        append_event(
+            &mut run,
+            id,
+            "approval_required",
+            "MCP 요청에 사용자 승인이 필요합니다.",
+        )?;
+        table
+            .insert(id, run.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"approval_id":approval}))
+}
+
+// 2026-11-16: 외부 요청 전에 승인을 내구적으로 소비하여 중단이나 동시 호출에서 재전송하지 않는다.
+pub(crate) fn consume_mcp(
+    db: &Database,
+    id: &str,
+    approval: &str,
+) -> Result<serde_json::Value, String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let request = {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if run["status"] != "approved_mcp"
+            || run["pending"]["tool"] != "mcp"
+            || run["pending"]["id"].as_str() != Some(approval)
+            || run["pending"]["authorized"] != true
+        {
+            return Err("approval unavailable or already consumed".into());
+        }
+        let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+        let row = projects
+            .get(run["project_id"].as_str().ok_or("invalid project")?)
+            .map_err(|e| e.to_string())?
+            .ok_or("project not found")?;
+        let project: domain::Project =
+            serde_json::from_str(row.value()).map_err(|e| e.to_string())?;
+        let spec = project
+            .approved
+            .as_ref()
+            .ok_or("approved specification changed")?;
+        if run["spec_hash"].as_str() != Some(spec.hash.as_str())
+            || run["spec_version"].as_u64() != Some(spec.version)
+            || project.draft_hash != spec.hash
+            || run["scope"] != serde_json::json!(spec.scope)
+        {
+            return Err("approved specification changed".into());
+        }
+        let request = run["pending"]["arguments"].clone();
+        run["status"] = "executing".into();
+        append_event(
+            &mut run,
+            id,
+            "tool_started",
+            "승인된 MCP 요청을 시작합니다.",
+        )?;
+        table
+            .insert(id, run.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+        request
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(request)
+}
+
+// 2026-11-16: 요청 실패나 취소는 외부 효과의 유무를 단정하지 않고 재실행을 막는다.
+pub(crate) fn finish_mcp(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    success: bool,
+) -> Result<bool, String> {
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let complete = {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = {
+            let value = table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?;
+            serde_json::from_str(value.value()).map_err(|e| e.to_string())?
+        };
+        if !["executing", "cancelling"].contains(&run["status"].as_str().unwrap_or(""))
+            || run["pending"]["tool"] != "mcp"
+            || run["pending"]["id"].as_str() != Some(approval)
+        {
+            return Err("MCP execution not active".into());
+        }
+        let complete = success && run["status"] == "executing";
+        run["pending"] = serde_json::Value::Null;
+        run["status"] = if complete {
+            "awaiting_implementation"
+        } else {
+            "uncertain"
+        }
+        .into();
+        if !complete {
+            run["resources_unknown"] = true.into();
+        }
+        append_event(
+            &mut run,
+            id,
+            if complete {
+                "tool_complete"
+            } else {
+                "uncertain"
+            },
+            if complete {
+                "승인된 MCP 호출이 완료되었습니다."
+            } else {
+                "MCP 호출 결과를 확인해야 합니다."
+            },
+        )?;
+        table
+            .insert(id, run.to_string().as_str())
+            .map_err(|e| e.to_string())?;
+        complete
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(complete)
 }

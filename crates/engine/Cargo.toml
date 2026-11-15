@@ -8,6 +8,7 @@ license.workspace = true
 futures-util = "0.3"
 domain = { package = "core", path = "../core" }
 provider = { path = "../provider" }
+integrations = { path = "../integrations" }
 transport = { path = "../transport" }
 redb = "2"
 serde.workspace = true
