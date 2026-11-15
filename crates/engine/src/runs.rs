@@ -2,6 +2,14 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
+#[cfg(all(test, windows))]
+struct DiffTestHook {
+    run_id: String,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(all(test, windows))]
+static TEST_DIFF_HOOK: std::sync::Mutex<Option<DiffTestHook>> = std::sync::Mutex::new(None);
 const CHECKPOINTS: TableDefinition<&str, &str> = TableDefinition::new("checkpoints");
 const CALLS: TableDefinition<&str, &str> = TableDefinition::new("calls");
 const MAX_DURABLE_RECORD_BYTES: usize = 2 * 1024 * 1024;
@@ -1590,5 +1598,424 @@ mod tests {
             .to_string_lossy()
             .starts_with("magi-start-serial-"));
         std::fs::remove_dir_all(resolved).unwrap();
+    }
+}
+
+// 2026-11-16: 외부 설정과 표준 입력을 차단하고 출력과 실행 시간을 제한해 읽기 전용 Git 조회만 수행한다.
+#[cfg(windows)]
+fn diff_git(root: &std::path::Path, args: &[&str], limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut command = Command::new("git");
+    command
+        .creation_flags(0x08000000)
+        .current_dir(root)
+        .env_clear();
+    for name in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "-c",
+            "core.hooksPath=NUL",
+            "-c",
+            "core.attributesFile=NUL",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+        ])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "cannot start Git")?;
+    let stdout = child.stdout.take().ok_or("Git output unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Git output unavailable")?;
+        Ok::<_, &str>(bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().map_err(|_| "Git output unavailable")??;
+    if bytes.len() as u64 > limit {
+        return Err("Git output exceeds limit".into());
+    }
+    if !status.is_some_and(|s| s.success()) {
+        return Err(
+            "Git inspection failed; --no-lazy-fetch support and local objects are required".into(),
+        );
+    }
+    Ok(bytes)
+}
+
+// 2026-11-16: 디렉터리 탐색 전 보호 이름·링크를 거부하고 검증된 읽기 경로로 내용을 해시한다.
+#[cfg(windows)]
+fn diff_snapshot(
+    root: &std::path::Path,
+    scope: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    use std::path::{Component, Path};
+    fn inspect(root: &Path, path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+        let relative = path.strip_prefix(root).map_err(|_| "scope escaped")?;
+        let name = relative.to_str().ok_or("invalid path")?.replace('\\', "/");
+        if !crate::worktree::safe_relative(&name)
+            || crate::worktree::protected(&name)
+            || name
+                .split('/')
+                .any(|part| part.eq_ignore_ascii_case(".git"))
+        {
+            return Err("unsafe scope path".into());
+        }
+        let mut current = root.to_path_buf();
+        for part in relative.components() {
+            if !matches!(part, Component::Normal(_)) {
+                return Err("invalid scope path".into());
+            }
+            current.push(part);
+            let meta = match std::fs::symlink_metadata(&current) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err("scope unavailable".into()),
+            };
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0 {
+                return Err("scope contains link".into());
+            }
+        }
+        Ok(Some(
+            std::fs::symlink_metadata(path).map_err(|_| "scope unavailable")?,
+        ))
+    }
+    fn walk(root: &Path, path: &Path, files: &mut BTreeSet<String>) -> Result<(), String> {
+        let Some(meta) = inspect(root, path)? else {
+            return Ok(());
+        };
+        if meta.is_dir() {
+            let relative = path.strip_prefix(root).map_err(|_| "scope escaped")?;
+            let _pins = crate::tools::pin_directories(root, relative, false)?;
+            for entry in std::fs::read_dir(path).map_err(|_| "scope unavailable")? {
+                let entry = entry.map_err(|_| "scope unavailable")?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(".git")
+                {
+                    continue;
+                }
+                walk(root, &entry.path(), files)?;
+            }
+        } else if meta.is_file() {
+            let name = path
+                .strip_prefix(root)
+                .map_err(|_| "scope escaped")?
+                .to_str()
+                .ok_or("invalid path")?
+                .replace('\\', "/");
+            files.insert(name);
+            if files.len() > 10_000 {
+                return Err("scope too large".into());
+            }
+        } else {
+            return Err("unsupported scope entry".into());
+        }
+        Ok(())
+    }
+    let mut names = BTreeSet::new();
+    for item in scope {
+        walk(root, &root.join(item), &mut names)?;
+    }
+    let context = crate::tools::ToolContext {
+        worktree: root.to_path_buf(),
+        allowed_paths: scope.to_vec(),
+        owned_paths: scope.to_vec(),
+        allowlist: vec![],
+        timeout: std::time::Duration::from_secs(15),
+        max_output_bytes: 1024 * 1024,
+        side_effect_authorized: false,
+    };
+    let mut result = std::collections::BTreeMap::new();
+    for name in names {
+        let text = crate::tools::read_checked(&context, &name)?;
+        result.insert(name, format!("{:x}", Sha256::digest(text.as_bytes())));
+    }
+    Ok(result)
+}
+
+// 2026-11-16: 승인된 기준과 현재 HEAD 및 범위를 묶고 읽기 전후 스냅샷이 달라지면 결과를 폐기한다.
+#[cfg(windows)]
+pub(crate) fn diff(db: &Database, id: &str) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    let run = get(db, id)?;
+    let revision = run["revision"].as_str().ok_or("invalid revision")?;
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid revision".into());
+    }
+    let spec_hash = run["spec_hash"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("invalid spec hash")?;
+    let spec_version = run["spec_version"]
+        .as_u64()
+        .filter(|v| *v > 0)
+        .ok_or("invalid spec version")?;
+    let scope: Vec<String> =
+        serde_json::from_value(run["scope"].clone()).map_err(|_| "invalid scope")?;
+    if scope.is_empty() {
+        return Err("invalid scope".into());
+    }
+    let root = Path::new(run["worktree"].as_str().ok_or("invalid worktree")?);
+    let _pins = crate::tools::pin_directories(root, Path::new(""), false)?;
+    let head = String::from_utf8(diff_git(root, &["rev-parse", "--verify", "HEAD"], 128)?)
+        .map_err(|_| "invalid Git revision")?
+        .trim()
+        .to_owned();
+    if !head.eq_ignore_ascii_case(revision) {
+        return Err("worktree revision changed".into());
+    }
+    let before = diff_snapshot(root, &scope)?;
+    #[cfg(test)]
+    {
+        let hook = {
+            let mut hook = TEST_DIFF_HOOK.lock().unwrap();
+            if hook.as_ref().is_some_and(|hook| hook.run_id == id) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.reached
+                .send(())
+                .map_err(|_| "test synchronization failed")?;
+            hook.proceed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| "test synchronization failed")?;
+        }
+    }
+    let tree = diff_git(
+        root,
+        &["ls-tree", "-r", "-z", "--full-tree", revision],
+        4 * 1024 * 1024,
+    )?;
+    let in_scope = |name: &str| {
+        let name = name.to_lowercase();
+        scope.iter().any(|s| {
+            let s = s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+            !s.is_empty() && (name == s || name.starts_with(&(s + "/")))
+        })
+    };
+    let mut baseline = BTreeSet::new();
+    for entry in tree.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+        let pos = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid Git tree")?;
+        let name = std::str::from_utf8(&entry[pos + 1..]).map_err(|_| "invalid Git path")?;
+        if in_scope(name) {
+            let metadata = std::str::from_utf8(&entry[..pos]).map_err(|_| "invalid Git tree")?;
+            if !crate::worktree::safe_relative(name)
+                || crate::worktree::protected(name)
+                || name.split('/').any(|s| s.eq_ignore_ascii_case(".git"))
+                || !(metadata.starts_with("100644 blob ") || metadata.starts_with("100755 blob "))
+            {
+                return Err("unsafe tracked path".into());
+            }
+            baseline.insert(name.to_owned());
+            if baseline.len() > 10_000 {
+                return Err("scope too large".into());
+            }
+        }
+    }
+    let context = crate::tools::ToolContext {
+        worktree: root.to_path_buf(),
+        allowed_paths: scope.clone(),
+        owned_paths: scope.clone(),
+        allowlist: vec![],
+        timeout: std::time::Duration::from_secs(15),
+        max_output_bytes: 1024 * 1024,
+        side_effect_authorized: false,
+    };
+    let names: BTreeSet<_> = baseline.iter().chain(before.keys()).cloned().collect();
+    let mut changes = Vec::new();
+    let mut total = 0usize;
+    for name in names {
+        let previous = if baseline.contains(&name) {
+            let object = format!("{revision}:{name}");
+            let size = diff_git(root, &["cat-file", "-s", &object], 128)?;
+            let size = std::str::from_utf8(&size)
+                .map_err(|_| "invalid blob size")?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "invalid blob size")?;
+            if size > 1024 * 1024 {
+                return Err("baseline file too large".into());
+            }
+            Some(
+                String::from_utf8(diff_git(
+                    root,
+                    &["show", "--no-ext-diff", "--no-textconv", &object],
+                    1024 * 1024,
+                )?)
+                .map_err(|_| "binary baseline unsupported")?,
+            )
+        } else {
+            None
+        };
+        let next = if let Some(expected) = before.get(&name) {
+            let content = crate::tools::read_checked(&context, &name)?;
+            if format!("{:x}", Sha256::digest(content.as_bytes())) != *expected {
+                return Err("worktree changed during diff".into());
+            }
+            Some(content)
+        } else {
+            None
+        };
+        if previous != next {
+            total +=
+                previous.as_ref().map_or(0, String::len) + next.as_ref().map_or(0, String::len);
+            if total > 4 * 1024 * 1024 {
+                return Err("diff too large".into());
+            }
+            changes.push(serde_json::json!({"path":name,"before":previous,"after":next}));
+        }
+    }
+    let after = diff_snapshot(root, &scope)?;
+    let final_head = String::from_utf8(diff_git(root, &["rev-parse", "--verify", "HEAD"], 128)?)
+        .map_err(|_| "invalid Git revision")?;
+    if before != after || !final_head.trim().eq_ignore_ascii_case(&head) || get(db, id)? != run {
+        return Err("worktree changed during diff".into());
+    }
+    let mut hash = Sha256::new();
+    for (name, digest) in after {
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update(digest.as_bytes());
+    }
+    Ok(
+        serde_json::json!({"revision":revision,"current_revision":head,"spec_hash":spec_hash,"spec_version":spec_version,"scope":scope,"worktree_hash":format!("{:x}",hash.finalize()),"changes":changes}),
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn diff(_db: &Database, _id: &str) -> Result<serde_json::Value, String> {
+    Err("diff is supported only on Windows".into())
+}
+
+#[cfg(all(test, windows))]
+mod diff_snapshot_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        sync::{mpsc, Arc},
+    };
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .creation_flags(0x08000000)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    #[test]
+    fn detects_mutation_between_scope_snapshots() {
+        let root = std::env::temp_dir().join(format!("magi-diff-race-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/a.txt"), "before").unwrap();
+        git(&root, &["add", "src/a.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        let revision = git(&root, &["rev-parse", "HEAD"]);
+        let path = root.join("fixture.redb");
+        let db = Arc::new(Database::create(&path).unwrap());
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(RUNS).unwrap();
+            let value=serde_json::json!({"id":run_id,"revision":revision,"spec_hash":"fixture","spec_version":1,"scope":["src"],"worktree":root.to_string_lossy()}).to_string();
+            table.insert(run_id.as_str(), value.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        *TEST_DIFF_HOOK.lock().unwrap() = Some(DiffTestHook {
+            run_id: run_id.clone(),
+            reached: reached_tx,
+            proceed: proceed_rx,
+        });
+        let worker = {
+            let db = Arc::clone(&db);
+            let id = run_id.clone();
+            std::thread::spawn(move || diff(&db, &id))
+        };
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        fs::write(root.join("src/a.txt"), "changed during lookup").unwrap();
+        proceed_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err(),
+            "worktree changed during diff"
+        );
+        drop(db);
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-diff-race-"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

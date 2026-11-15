@@ -72,7 +72,7 @@ pub(crate) fn checked_root(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 // 2026-11-15: 보호 경로와 링크를 거부하고 실제 열린 파일의 위치 및 hardlink 수를 확인한다.
-fn read_checked(ctx: &ToolContext, name: &str) -> Result<String, String> {
+pub(crate) fn read_checked(ctx: &ToolContext, name: &str) -> Result<String, String> {
     if !crate::worktree::safe_relative(name)
         || crate::worktree::protected(&name.replace('\\', "/"))
         || name
