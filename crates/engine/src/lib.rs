@@ -193,7 +193,11 @@ impl Engine {
                     return Err("optional issues require explicit acceptance".into());
                 }
                 let hash = p.draft_hash.clone();
-                p.approval_version += 1;
+                // 2026-11-15: 버전 소진 시 이력을 덮거나 0으로 순환하지 않는다.
+                p.approval_version = p
+                    .approval_version
+                    .checked_add(1)
+                    .ok_or("approval version exhausted")?;
                 let spec = ApprovedSpec {
                     version: p.approval_version,
                     hash,

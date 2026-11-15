@@ -398,3 +398,39 @@ fn changed_normal_context_requires_a_new_assessment() {
         "draft requires a new assessment"
     );
 }
+
+#[test]
+fn exhausted_approval_version_rejects_without_changing_project() {
+    let fixture = TestDatabase::new();
+    let engine = Engine::open(&fixture.path).unwrap();
+    let project = saved_project(&engine, valid_draft());
+    approve(&engine, &project, vec![]).unwrap();
+    drop(engine);
+    let db = Database::open(&fixture.path).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(PROJECTS).unwrap();
+        let mut value: serde_json::Value = {
+            let stored = table.get(project.id.as_str()).unwrap().unwrap();
+            serde_json::from_str(stored.value()).unwrap()
+        };
+        value["approval_version"] = serde_json::json!(u64::MAX);
+        let encoded = value.to_string();
+        table.insert(project.id.as_str(), encoded.as_str()).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let engine = Engine::open(&fixture.path).unwrap();
+    let before = get_project(&engine, &project.id);
+    assert_eq!(
+        approve(&engine, &before, vec![]).unwrap_err(),
+        "approval version exhausted"
+    );
+    drop(engine);
+    let engine = Engine::open(&fixture.path).unwrap();
+    let after = get_project(&engine, &project.id);
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
