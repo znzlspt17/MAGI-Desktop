@@ -4,6 +4,7 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod model_settings;
 mod storage;
 mod worker;
 
@@ -28,6 +29,11 @@ struct State {
     spec_runs: std::collections::HashMap<String, String>,
     spec_starting: std::collections::HashSet<String>,
     spec_notices: std::collections::HashMap<String, String>,
+    model_forms: std::collections::HashMap<String, model_settings::Form>,
+    model_baselines: std::collections::HashMap<String, model_settings::Form>,
+    model_pending: std::collections::HashSet<String>,
+    credential_forms: std::collections::HashMap<String, model_settings::CredentialForm>,
+    credential_pending: std::collections::HashSet<String>,
     spec_poll_at: std::collections::HashMap<String, std::time::Instant>,
 }
 
@@ -388,6 +394,55 @@ impl App {
                     }
                 }
             }
+            Kind::ModelSettings {
+                project_id,
+                submitted,
+            } => {
+                self.state.model_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project)) if project.id == project_id => {
+                        if self.state.project.as_ref().is_some_and(|current| {
+                            current.id == project_id
+                                && current.context_version > project.context_version
+                        }) {
+                            return;
+                        }
+                        if self.state.model_forms.get(&project_id) == Some(&submitted) {
+                            self.state.model_forms.insert(
+                                project_id.clone(),
+                                model_settings::Form::from_project(&project),
+                            );
+                        }
+                        if self.state.selected.as_deref() == Some(&project_id) {
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.project = Some(project);
+                            self.state.status = "모델 설정을 저장했습니다.".into();
+                        }
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("모델 설정 저장 실패: {error}")
+                    }
+                    _ if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = "모델 설정 응답이 올바르지 않습니다".into()
+                    }
+                    _ => {}
+                }
+            }
+            Kind::Credential { project_id } => {
+                self.state.credential_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Empty) => {
+                        self.state.credential_forms.remove(&project_id);
+                        if self.state.selected.as_deref() == Some(&project_id) {
+                            self.state.status = "런타임 키를 설정했습니다.".into();
+                        }
+                    }
+                    _ if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = "런타임 키 설정에 실패했습니다.".into()
+                    }
+                    _ => {}
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -619,6 +674,49 @@ impl App {
                             }
                         }
                         ui.label("답변을 저장하면 기존 명세 승인이 해제됩니다.");
+                        if let Some(result) = model_settings::render(
+                            ui,
+                            &project,
+                            &mut self.state.model_forms,
+                            &mut self.state.model_baselines,
+                            self.state.model_pending.contains(&project.id),
+                        ) {
+                            match result {
+                                Ok((submitted, command)) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::ModelSettings {
+                                            project_id: project.id.clone(),
+                                            submitted,
+                                        },
+                                        command,
+                                    )) {
+                                        self.state.model_pending.insert(project.id.clone());
+                                    }
+                                }
+                                Err(error) => self.state.status = error,
+                            }
+                        }
+                        if let Some(result) = model_settings::credentials(
+                            ui,
+                            &project,
+                            &mut self.state.credential_forms,
+                            self.state.credential_pending.contains(&project.id),
+                        ) {
+                            match result {
+                                Ok(command) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::Credential {
+                                            project_id: project.id.clone(),
+                                        },
+                                        command,
+                                    )) {
+                                        self.state.credential_pending.insert(project.id.clone());
+                                    }
+                                }
+                                Err(error) => self.state.status = error,
+                            }
+                        }
+
                         ui.heading("명세 초안");
                         ui.label(format!("제목: {}", project.draft.title));
                         ui.label(format!("기준 revision: {}", project.draft.base_revision));
@@ -2197,6 +2295,226 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert!(!output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text.contains("일시 오류"))));
+    }
+
+    #[test]
+    fn model_settings_are_visible_for_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.model_settings = Some(domain::ModelSettings {
+            provider: "mock".into(),
+            model: "모델 예시".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(4096),
+            },
+        });
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "모델 설정 저장")));
+        for expected in ["모델 예시", "4096"] {
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == expected)), "{expected}");
+        }
+    }
+
+    #[test]
+    fn model_save_button_sends_explicit_capabilities() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.model_settings = Some(domain::ModelSettings {
+            provider: "mock".into(),
+            model: "model".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(4096),
+            },
+        });
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 800.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "모델 설정 저장" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::ConfigureModel { project_id, provider, model, capabilities } if project_id == "a" && provider == "mock" && model == "model" && capabilities.streaming && !capabilities.tools && capabilities.context_tokens == Some(4096))
+        );
+        app.state.model_pending.clear();
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        assert!(!app.state.model_pending.contains("a"));
+        let out = frame(&mut app, vec![]);
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "model")
+        ));
+    }
+
+    #[test]
+    fn saved_model_response_updates_matching_project_only() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let submitted = app.state.model_forms["a"].clone();
+        app.state.model_pending.insert("a".into());
+        let old = app.state.generation;
+        let mut updated = project("a");
+        updated.context_version = 4;
+        app.apply(worker::Reply {
+            kind: worker::Kind::ModelSettings {
+                project_id: "a".into(),
+                submitted,
+            },
+            result: Ok(ResponseData::Project(updated)),
+        });
+        app.state.receive_project(old, project("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().context_version, 4);
+        assert!(!app.state.model_pending.contains("a"));
+        assert!(app.state.status.contains("저장"));
+    }
+
+    #[test]
+    fn late_model_reply_preserves_newer_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut current = project("a");
+        current.context_version = 5;
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(current),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        let submitted = app.state.model_forms["a"].clone();
+        let mut old = project("a");
+        old.context_version = 3;
+        app.apply(worker::Reply {
+            kind: worker::Kind::ModelSettings {
+                project_id: "a".into(),
+                submitted,
+            },
+            result: Ok(ResponseData::Project(old)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().context_version, 5);
+    }
+
+    #[test]
+    fn runtime_credential_entry_is_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "런타임 키 설정")));
     }
 
     #[test]
