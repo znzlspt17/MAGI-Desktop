@@ -75,3 +75,20 @@ fn secret_is_transmitted_but_redacted_in_debug_output() {
     assert!(debug.contains("[redacted]"));
     assert!(!debug.contains("FAKE_ONLY"));
 }
+
+#[test]
+fn oauth_callback_is_transmitted_but_hidden_from_command_and_request_debug() {
+    let fake_callback = "http://127.0.0.1/callback?code=FAKE_CODE&state=FAKE_STATE";
+    let wire = json!({"id":"oauth-1", "command":{"type":"complete_mcp_o_auth", "data":{
+        "project_id":"project", "callback": fake_callback
+    }}});
+    let request: Request = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    let command_debug = format!("{:?}", request.command);
+    let request_debug = format!("{request:?}");
+    for debug in [command_debug, request_debug] {
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("FAKE_CODE"));
+        assert!(!debug.contains("FAKE_STATE"));
+    }
+}

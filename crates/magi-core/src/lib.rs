@@ -172,7 +172,8 @@ pub enum Command {
     },
     CompleteMcpOAuth {
         project_id: String,
-        callback: String,
+        // 2026-11-15: callback의 code와 state가 Debug 출력으로 노출되지 않게 한다.
+        callback: SecretString,
     },
     ConfigureMcpPolicy {
         project_id: String,
