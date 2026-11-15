@@ -7,6 +7,17 @@ use std::sync::{
 };
 
 pub enum Kind {
+    SaveDraft {
+        project_id: String,
+        base_hash: String,
+        context: u64,
+        generation: u64,
+    },
+    ApproveDraft {
+        project_id: String,
+        context: u64,
+        generation: u64,
+    },
     Storage,
     RetrySave {
         run_id: String,
