@@ -16,6 +16,8 @@ pub fn search_text(documents: &[(&str, &str)], query: &str) -> Vec<String> {
 }
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+// 2026-11-15: 생성한 checkpoint가 같은 버전의 복원 한도에 맞도록 양쪽에서 공유한다.
+const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
@@ -43,10 +45,14 @@ pub struct KnowledgeIndex {
 }
 impl KnowledgeIndex {
     pub fn checkpoint(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|e| e.to_string())
+        let data = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if data.len() > MAX_CHECKPOINT_BYTES {
+            return Err("checkpoint too large".into());
+        }
+        Ok(data)
     }
     pub fn restore(data: &[u8]) -> Result<Self, String> {
-        if data.len() > 64 * 1024 * 1024 {
+        if data.len() > MAX_CHECKPOINT_BYTES {
             return Err("checkpoint too large".into());
         }
         let saved: Self = serde_json::from_slice(data).map_err(|e| e.to_string())?;
@@ -204,6 +210,28 @@ impl KnowledgeIndex {
         }
         self.pending.remove(&ticket.id);
         self.set_embedding(&ticket.id, ticket.version, model, vector)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub document_id: String,
+    pub document_version: u64,
+}
+// 2026-11-14: 실제 원본 연결만 노출해 문서 유사도를 출처 관계로 오인하지 않는다.
+impl KnowledgeIndex {
+    pub fn graph(&self, offset: usize, limit: usize) -> Vec<GraphEdge> {
+        self.documents
+            .values()
+            .skip(offset)
+            .take(limit.min(100))
+            .map(|d| GraphEdge {
+                source: d.source.clone(),
+                document_id: d.id.clone(),
+                document_version: d.version,
+            })
+            .collect()
     }
 }
 
