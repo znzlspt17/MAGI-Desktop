@@ -240,6 +240,15 @@ mod tests {
     }
 }
 
+#[cfg(all(test, windows))]
+type ApprovalHook = (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(all(test, windows))]
+static TEST_AUTO_APPROVAL_HOOK: std::sync::Mutex<Option<ApprovalHook>> =
+    std::sync::Mutex::new(None);
 // 2026-11-16: StartAgent 연결 시 이 진입점으로 승인과 실행 세대를 고정한다.
 #[allow(dead_code)]
 pub(crate) struct Runtime {
@@ -440,17 +449,44 @@ impl Runtime {
                             .to_owned();
                         let engine = Arc::clone(&self.engine);
                         let run_id = self.identity.run_id.clone();
+                        let identity = self.identity.clone();
+                        let approval_cancel = cancel.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            engine
-                                .handle(domain::Request {
-                                    id: "agent".into(),
-                                    command: domain::Command::ApproveTool {
-                                        run_id,
-                                        approval_id,
-                                        approved: true,
-                                    },
-                                })
-                                .result
+                            #[cfg(all(test, windows))]
+                            {
+                                let hook = {
+                                    let mut hook = TEST_AUTO_APPROVAL_HOOK.lock().unwrap();
+                                    if hook.as_ref().is_some_and(|entry| entry.0 == run_id) {
+                                        hook.take()
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some((_, reached, proceed)) = hook {
+                                    reached.send(()).map_err(|_| "test hook failed")?;
+                                    proceed
+                                        .recv_timeout(std::time::Duration::from_secs(10))
+                                        .map_err(|_| "test hook timed out")?;
+                                }
+                            }
+                            // 2026-11-16: gate 대기 중 취소나 시도 변경이 생기면 승인 효과를 시작하지 않는다.
+                            let _guard = engine
+                                .mutation_gate
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if approval_cancel.is_cancelled() {
+                                return Err("cancelled".into());
+                            }
+                            let db = engine.db.get().ok_or("storage unavailable")?;
+                            check_identity(&db, &identity)?;
+                            if approval_cancel.is_cancelled() {
+                                return Err("cancelled".into());
+                            }
+                            engine.execute(domain::Command::ApproveTool {
+                                run_id,
+                                approval_id,
+                                approved: true,
+                            })
                         })
                         .await
                         .map_err(|_| "approval worker failed".to_owned())?;
@@ -1174,6 +1210,77 @@ mod bridge_integration_tests {
         assert_eq!(
             std::fs::read_to_string(fixture.work.join("src/a.txt")).unwrap(),
             "before"
+        );
+    }
+    #[tokio::test]
+    async fn queued_auto_approval_rechecks_cancel_and_attempt_before_file_effect() {
+        let mut outcomes = Vec::new();
+        for change_attempt in [false, true] {
+            let fixture = Fixture::new("approved_scope");
+            let runtime = fixture.runtime();
+            let token = CancellationToken::new();
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+            *TEST_AUTO_APPROVAL_HOOK.lock().unwrap() =
+                Some((fixture.run_id.clone(), reached_tx, proceed_rx));
+            let task = &fixture.spec.tasks[0];
+            let work = runtime.execute_durable(
+                "implementer",
+                task,
+                "patch",
+                "race-call",
+                json!({"path":"src/a.txt","content":"after"}),
+                token.clone(),
+            );
+            let controller = async {
+                tokio::task::spawn_blocking(move || {
+                    reached_rx.recv_timeout(Duration::from_secs(10)).unwrap()
+                })
+                .await
+                .unwrap();
+                if change_attempt {
+                    let engine = Arc::clone(&fixture.engine);
+                    let id = fixture.run_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _gate = engine.mutation_gate.lock().unwrap();
+                        let db = engine.db.get().unwrap();
+                        let tx = db.begin_write().unwrap();
+                        {
+                            let mut table = tx
+                                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                                .unwrap();
+                            let mut run: Value = {
+                                let row = table.get(id.as_str()).unwrap().unwrap();
+                                serde_json::from_str(row.value()).unwrap()
+                            };
+                            run["agent_attempt"] = json!(2);
+                            table.insert(id.as_str(), run.to_string().as_str()).unwrap();
+                        }
+                        tx.commit().unwrap();
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    token.cancel()
+                }
+                proceed_tx.send(()).unwrap();
+            };
+            let (result, _) = tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::join!(work, controller)
+            })
+            .await
+            .unwrap();
+            outcomes.push((
+                change_attempt,
+                result.is_err(),
+                std::fs::read_to_string(fixture.work.join("src/a.txt")).unwrap(),
+            ));
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, error, content)| *error && content == "before"),
+            "outcomes: {outcomes:?}"
         );
     }
 }
