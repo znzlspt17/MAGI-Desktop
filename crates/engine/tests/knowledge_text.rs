@@ -379,3 +379,228 @@ async fn text_search_caps_pages_at_one_hundred_documents() {
     );
     assert_eq!(tail["results"].as_array().unwrap().len(), 5);
 }
+
+#[tokio::test]
+async fn vectors_survive_restart_and_are_isolated_by_project_and_model() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let a = fixture.project(&engine, "a");
+    let b = fixture.project(&engine, "b");
+    for (id, text) in [("near", "near original"), ("far", "far original")] {
+        send(
+            &engine,
+            Command::PutKnowledge {
+                project_id: a.clone(),
+                document: doc(id, 1, id, text),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let model = serde_json::json!({"model":"fixture","version":"v1","dimensions":2});
+    for (id, vector) in [("near", vec![1.0, 0.0]), ("far", vec![0.0, 1.0])] {
+        send(
+            &engine,
+            Command::SetKnowledgeEmbedding {
+                project_id: a.clone(),
+                document_id: id.into(),
+                version: 1,
+                model: model.clone(),
+                vector,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    drop(engine);
+    let engine = fixture.engine();
+    let result = data(
+        send(
+            &engine,
+            Command::SearchKnowledgeVector {
+                project_id: a.clone(),
+                model: model.clone(),
+                vector: vec![1.0, 0.0],
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(result["mode"], "semantic");
+    assert_eq!(result["results"][0]["document"]["id"], "near");
+    assert_eq!(result["results"][0]["document"]["source"], "near");
+    assert!(send(
+        &engine,
+        Command::SearchKnowledgeVector {
+            project_id: b,
+            model: model.clone(),
+            vector: vec![1.0, 0.0],
+            offset: 0,
+            limit: 10
+        }
+    )
+    .await
+    .is_err());
+    assert!(send(
+        &engine,
+        Command::SearchKnowledgeVector {
+            project_id: a,
+            model: serde_json::json!({"model":"fixture","version":"other","dimensions":2}),
+            vector: vec![1.0, 0.0],
+            offset: 0,
+            limit: 10
+        }
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn vector_validation_rejects_invalid_input_and_document_updates_invalidate_vectors() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let id = fixture.project(&engine, "project");
+    send(
+        &engine,
+        Command::PutKnowledge {
+            project_id: id.clone(),
+            document: doc("one", 1, "source", "text"),
+        },
+    )
+    .await
+    .unwrap();
+    let model = serde_json::json!({"model":"fixture","version":"v1","dimensions":2});
+    for (version, candidate_model, vector) in [
+        (2, model.clone(), vec![1.0, 0.0]),
+        (1, model.clone(), vec![1.0]),
+        (1, model.clone(), vec![0.0, 0.0]),
+        (1, model.clone(), vec![f32::NAN, 1.0]),
+        (
+            1,
+            serde_json::json!({"model":"","version":"v1","dimensions":2}),
+            vec![1.0, 0.0],
+        ),
+    ] {
+        assert!(send(
+            &engine,
+            Command::SetKnowledgeEmbedding {
+                project_id: id.clone(),
+                document_id: "one".into(),
+                version,
+                model: candidate_model,
+                vector
+            }
+        )
+        .await
+        .is_err());
+    }
+    send(
+        &engine,
+        Command::SetKnowledgeEmbedding {
+            project_id: id.clone(),
+            document_id: "one".into(),
+            version: 1,
+            model: model.clone(),
+            vector: vec![1.0, 0.0],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(send(
+        &engine,
+        Command::SearchKnowledgeVector {
+            project_id: id.clone(),
+            model: model.clone(),
+            vector: vec![f32::INFINITY, 0.0],
+            offset: 0,
+            limit: 10
+        }
+    )
+    .await
+    .is_err());
+    send(
+        &engine,
+        Command::PutKnowledge {
+            project_id: id.clone(),
+            document: doc("one", 2, "updated", "new text"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(send(
+        &engine,
+        Command::SearchKnowledgeVector {
+            project_id: id.clone(),
+            model: model.clone(),
+            vector: vec![1.0, 0.0],
+            offset: 0,
+            limit: 10
+        }
+    )
+    .await
+    .is_err());
+    let text = data(
+        send(
+            &engine,
+            Command::SearchKnowledgePage {
+                project_id: id,
+                query: "new".into(),
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(text["results"][0]["source"], "updated");
+}
+
+#[tokio::test]
+async fn damaged_vector_checkpoint_is_not_overwritten_by_embedding_update() {
+    use redb::{Database, TableDefinition};
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let id = fixture.project(&engine, "project");
+    send(
+        &engine,
+        Command::PutKnowledge {
+            project_id: id.clone(),
+            document: doc("one", 1, "source", "text"),
+        },
+    )
+    .await
+    .unwrap();
+    drop(engine);
+    let db = Database::open(&fixture.db).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx
+            .open_table(TableDefinition::<&str, &str>::new("integration_knowledge"))
+            .unwrap();
+        table.insert(id.as_str(), "damaged").unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let engine = fixture.engine();
+    let result = send(
+        &engine,
+        Command::SetKnowledgeEmbedding {
+            project_id: id.clone(),
+            document_id: "one".into(),
+            version: 1,
+            model: serde_json::json!({"model":"fixture","version":"v1","dimensions":2}),
+            vector: vec![1.0, 0.0],
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    drop(engine);
+    let db = Database::open(&fixture.db).unwrap();
+    let tx = db.begin_read().unwrap();
+    let table = tx
+        .open_table(TableDefinition::<&str, &str>::new("integration_knowledge"))
+        .unwrap();
+    assert_eq!(table.get(id.as_str()).unwrap().unwrap().value(), "damaged");
+}
