@@ -219,3 +219,5 @@ pub fn inspect<R: Read + Seek>(input: &mut R) -> Result<ModelInfo, String> {
 mod ternary;
 
 pub use ternary::ternary_dot;
+
+pub mod hip;
