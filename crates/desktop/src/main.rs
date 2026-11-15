@@ -4,7 +4,10 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod knowledge_text_ui;
 mod model_settings;
+mod run_history;
+mod spec_review;
 mod storage;
 mod worker;
 
@@ -35,6 +38,11 @@ struct State {
     credential_forms: std::collections::HashMap<String, model_settings::CredentialForm>,
     credential_pending: std::collections::HashSet<String>,
     spec_poll_at: std::collections::HashMap<String, std::time::Instant>,
+    spec_forms: std::collections::HashMap<String, spec_review::Form>,
+    spec_review_pending: std::collections::HashSet<String>,
+    spec_submitted: std::collections::HashMap<String, domain::SpecDraft>,
+    history: run_history::History,
+    knowledge: knowledge_text_ui::State,
 }
 
 impl State {
@@ -45,6 +53,8 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.knowledge.select(id);
+        self.history.project(id);
         self.selected = Some(id.to_owned());
         self.project = None;
         self.generation = self.generation.wrapping_add(1);
@@ -443,6 +453,245 @@ impl App {
                     _ => {}
                 }
             }
+            Kind::SaveDraft {
+                project_id,
+                base_hash,
+                context,
+                generation,
+            } => {
+                self.state.spec_review_pending.remove(&project_id);
+                let submitted = self.state.spec_submitted.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project))
+                        if project.id == project_id
+                            && self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                            && self.state.project.as_ref().is_some_and(|p| {
+                                p.draft_hash == base_hash && p.context_version == context
+                            }) =>
+                    {
+                        if submitted.as_ref().is_some_and(|d| {
+                            serde_json::to_value(d).ok()
+                                == serde_json::to_value(&project.draft).ok()
+                        }) {
+                            if let Some(form) = self.state.spec_forms.get_mut(&project_id) {
+                                form.acknowledge_saved(&project.draft);
+                            }
+                        }
+                        self.state.generation = self.state.generation.wrapping_add(1);
+                        self.state.project = Some(project);
+                        self.state.status =
+                            "명세 초안을 저장했습니다. 승인이 해제되었습니다.".into();
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("명세 저장 실패: {error}")
+                    }
+                    Ok(_) if self.state.selected.as_deref() == Some(&project_id) => self.state.status = "명세 상태가 변경되어 저장 결과를 적용하지 않았습니다. 프로젝트를 다시 확인하세요.".into(),
+                    _ => {}
+                }
+            }
+            Kind::ApproveDraft {
+                project_id,
+                context,
+                generation,
+            } => {
+                self.state.spec_review_pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Approved(approved))
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation =>
+                    {
+                        if let Some(project) = self.state.project.as_mut().filter(|p| {
+                            p.id == project_id
+                                && p.draft_hash == approved.hash
+                                && p.context_version == context
+                                && p.approval_version < approved.version
+                        }) {
+                            project.approval_version = approved.version;
+                            project.approval_history.push(approved.clone());
+                            project.approved = Some(approved);
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.status = "저장된 명세를 승인했습니다.".into();
+                        }
+                    }
+                    Err(error) if self.state.selected.as_deref() == Some(&project_id) => {
+                        self.state.status = format!("명세 승인 실패: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            Kind::HistoryPage {
+                project_id,
+                request,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["offset"].as_u64() == Some(offset as u64)
+                                && data["limit"].as_u64()
+                                    == Some(run_history::PAGE_SIZE as u64)
+                                && data["total"].as_u64().is_some()
+                                && data["runs"].as_array().is_some_and(|runs| {
+                                    runs.len() <= run_history::PAGE_SIZE
+                                        && runs.iter().all(|run| {
+                                            run["project_id"] == project_id
+                                                && run["id"].as_str().is_some()
+                                                && run["status"].as_str().is_some()
+                                        })
+                                }) =>
+                        {
+                            self.state.history.runs = data["runs"].as_array().unwrap().clone();
+                            self.state.history.offset = offset;
+                            self.state.history.total = data["total"].as_u64().unwrap() as usize;
+                            self.state.history.loaded = true;
+                            self.state.history.error = None;
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 기록 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 기록 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryDetail {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["id"] == run_id
+                                && data["project_id"] == project_id
+                                && data["status"].as_str().is_some() =>
+                        {
+                            self.state.history.detail = Some(data);
+                        }
+                        Err(error) => {
+                            self.state.history.error = Some(format!("실행 상태 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 상태 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::HistoryEvents {
+                project_id,
+                run_id,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == request
+                {
+                    match reply.result {
+                        Ok(ResponseData::Events(events))
+                            if events.iter().all(|event| event.run_id == run_id) =>
+                        {
+                            self.state.history.events = events;
+                        }
+                        Err(error) => {
+                            self.state.history.error =
+                                Some(format!("실행 이벤트 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.history.error =
+                                Some("실행 이벤트 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
+            Kind::KnowledgePut { project_id, epoch } => {
+                self.state.knowledge.put_pending.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                {
+                    self.state.status = match reply.result {
+                        Ok(ResponseData::Empty) => "원문을 저장했습니다.".into(),
+                        Err(error) => format!("원문 저장 실패: {error}"),
+                        _ => "원문 저장 응답이 올바르지 않습니다.".into(),
+                    };
+                }
+            }
+            Kind::KnowledgeSearch {
+                project_id,
+                epoch,
+                request,
+                query,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                    && self.state.knowledge.search_request == request
+                {
+                    let form = self.state.knowledge.forms.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["mode"] == "text"
+                                && data["results"].as_array().is_some_and(|docs| {
+                                    docs.len() <= 20
+                                        && docs.iter().all(|d| {
+                                            d["id"].as_str().is_some()
+                                                && d["source"].as_str().is_some()
+                                                && d["text"].as_str().is_some()
+                                                && d["version"].as_u64().is_some()
+                                        })
+                                }) =>
+                        {
+                            form.results = data["results"].as_array().unwrap().clone();
+                            form.result_query = query;
+                            form.offset = offset;
+                            form.loaded = true;
+                            form.error = None;
+                        }
+                        Err(error) => form.error = Some(format!("텍스트 검색 실패: {error}")),
+                        _ => form.error = Some("텍스트 검색 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
+            Kind::KnowledgeSource {
+                project_id,
+                epoch,
+                request,
+                document_id,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                    && self.state.knowledge.source_request == request
+                {
+                    let form = self.state.knowledge.forms.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(doc))
+                            if doc["id"] == document_id
+                                && doc["source"].as_str().is_some()
+                                && doc["text"].as_str().is_some()
+                                && doc["version"].as_u64().is_some() =>
+                        {
+                            form.source_document = Some(doc);
+                            form.error = None;
+                        }
+                        Err(error) => form.error = Some(format!("원문 조회 실패: {error}")),
+                        _ => form.error = Some("원문 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -608,6 +857,55 @@ impl App {
                     if let Some(project) = self.state.project.clone() {
                         ui.heading(&project.name);
                         ui.label(&project.path);
+                        self.state.history.project(&project.id);
+                        if let Some(action) = run_history::render(ui, &self.state.history) {
+                            match action {
+                                run_history::Action::Page(offset) => {
+                                    let request = self.state.history.request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::HistoryPage {
+                                            project_id: project.id.clone(),
+                                            request,
+                                            offset,
+                                        },
+                                        Command::ListRuns {
+                                            project_id: project.id.clone(),
+                                            offset,
+                                            limit: run_history::PAGE_SIZE,
+                                        },
+                                    )) {
+                                        self.state.history.request = request;
+                                    }
+                                }
+                                run_history::Action::Select(run_id) => {
+                                    self.state.history.selected = Some(run_id.clone());
+                                    self.state.history.detail = None;
+                                    self.state.history.events.clear();
+                                    self.state.history.error = None;
+                                    self.state.history.selection_request =
+                                        self.state.history.selection_request.wrapping_add(1);
+                                    let request = self.state.history.selection_request;
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryDetail {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::GetRun {
+                                            run_id: run_id.clone(),
+                                        },
+                                    ));
+                                    self.send(worker::Work::new(
+                                        worker::Kind::HistoryEvents {
+                                            project_id: project.id.clone(),
+                                            run_id: run_id.clone(),
+                                            request,
+                                        },
+                                        Command::ListEvents { run_id, after: 0 },
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(notice) = self.state.spec_notices.get(&project.id) {
                             ui.label(notice);
                         }
@@ -623,17 +921,16 @@ impl App {
                                 egui::Button::new("명세 초안 생성"),
                             )
                             .clicked()
-                        {
-                            if self.send(worker::Work::new(
+                            && self.send(worker::Work::new(
                                 worker::Kind::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
                                 Command::GenerateSpec {
                                     project_id: project.id.clone(),
                                 },
-                            )) {
-                                self.state.spec_starting.insert(project.id.clone());
-                            }
+                            ))
+                        {
+                            self.state.spec_starting.insert(project.id.clone());
                         }
                         ui.heading("인터뷰");
                         egui::ScrollArea::vertical()
@@ -718,6 +1015,58 @@ impl App {
                         }
 
                         ui.heading("명세 초안");
+                        let review_busy = self.state.spec_review_pending.contains(&project.id)
+                            || self.state.interview_pending.contains(&project.id)
+                            || self.state.model_pending.contains(&project.id)
+                            || self.state.spec_starting.contains(&project.id)
+                            || self.state.spec_runs.contains_key(&project.id);
+                        if let Some(action) = spec_review::render(
+                            ui,
+                            &project,
+                            &mut self.state.spec_forms,
+                            review_busy,
+                        ) {
+                            match action {
+                                spec_review::Action::Save(Ok(draft)) => {
+                                    let draft = *draft;
+                                    let submitted = draft.clone();
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::SaveDraft {
+                                            project_id: project.id.clone(),
+                                            base_hash: project.draft_hash.clone(),
+                                            context: project.context_version,
+                                            generation: self.state.generation,
+                                        },
+                                        Command::SaveDraft {
+                                            project_id: project.id.clone(),
+                                            draft,
+                                        },
+                                    )) {
+                                        self.state.spec_review_pending.insert(project.id.clone());
+                                        self.state
+                                            .spec_submitted
+                                            .insert(project.id.clone(), submitted);
+                                    }
+                                }
+                                spec_review::Action::Save(Err(error)) => self.state.status = error,
+                                spec_review::Action::Approve(accepted_optional) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::ApproveDraft {
+                                            project_id: project.id.clone(),
+                                            context: project.context_version,
+                                            generation: self.state.generation,
+                                        },
+                                        Command::ApproveSpec {
+                                            project_id: project.id.clone(),
+                                            expected_draft_hash: project.draft_hash.clone(),
+                                            accepted_optional,
+                                        },
+                                    )) {
+                                        self.state.spec_review_pending.insert(project.id.clone());
+                                    }
+                                }
+                            }
+                        }
                         ui.label(format!("제목: {}", project.draft.title));
                         ui.label(format!("기준 revision: {}", project.draft.base_revision));
                         for (label, values) in [
@@ -758,6 +1107,77 @@ impl App {
                                 .chain(&binding.acceptance_ids)
                             {
                                 ui.label(value);
+                            }
+                        }
+                        self.state.knowledge.select(&project.id);
+                        if let Some(action) =
+                            knowledge_text_ui::render(ui, &mut self.state.knowledge, &project.id)
+                        {
+                            match action {
+                                knowledge_text_ui::Action::Put(result) => match result {
+                                    Ok(document) => {
+                                        if self.send(worker::Work::new(
+                                            worker::Kind::KnowledgePut {
+                                                project_id: project.id.clone(),
+                                                epoch: self.state.knowledge.epoch,
+                                            },
+                                            Command::PutKnowledge {
+                                                project_id: project.id.clone(),
+                                                document,
+                                            },
+                                        )) {
+                                            self.state
+                                                .knowledge
+                                                .put_pending
+                                                .insert(project.id.clone());
+                                        }
+                                    }
+                                    Err(error) => self.state.status = error,
+                                },
+                                knowledge_text_ui::Action::Search(query, offset) => {
+                                    let request =
+                                        self.state.knowledge.search_request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::KnowledgeSearch {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.knowledge.epoch,
+                                            request,
+                                            query: query.clone(),
+                                            offset,
+                                        },
+                                        Command::SearchKnowledgePage {
+                                            project_id: project.id.clone(),
+                                            query,
+                                            offset,
+                                            limit: 20,
+                                        },
+                                    )) {
+                                        self.state.knowledge.search_request = request;
+                                    }
+                                }
+                                knowledge_text_ui::Action::Source(document_id) => {
+                                    let request =
+                                        self.state.knowledge.source_request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::KnowledgeSource {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.knowledge.epoch,
+                                            request,
+                                            document_id: document_id.clone(),
+                                        },
+                                        Command::GetKnowledgeSource {
+                                            project_id: project.id.clone(),
+                                            document_id,
+                                        },
+                                    )) {
+                                        self.state.knowledge.source_request = request;
+                                        if let Some(form) =
+                                            self.state.knowledge.forms.get_mut(&project.id)
+                                        {
+                                            form.source_document = None;
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -2515,6 +2935,1078 @@ mod tests {
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
         assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "런타임 키 설정")));
+    }
+
+    #[test]
+    fn spec_editor_exposes_save_control() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "초안 저장")
+        ));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.job.text == "작업 JSON")
+        ));
+    }
+
+    #[test]
+    fn spec_save_sends_current_draft() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "저장할 제목".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "초안 저장" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::SaveDraft {project_id,draft} if project_id == "a" && draft.title == "저장할 제목")
+        );
+        app.state.spec_review_pending.clear();
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        assert!(!app.state.spec_review_pending.contains("a"));
+        let out = frame(&mut app, vec![]);
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="저장할 제목")
+        ));
+    }
+
+    #[test]
+    fn spec_approval_sends_viewed_draft_identifier() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "제목".into();
+        p.draft.base_revision = "rev".into();
+        p.draft.scope = vec!["src".into()];
+        p.draft.requirements = vec!["요구".into()];
+        p.draft.acceptance = vec!["기준".into()];
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("승인 버튼");
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::ApproveSpec {project_id,expected_draft_hash,..} if project_id == "a" && expected_draft_hash == "h")
+        );
+    }
+
+    #[test]
+    fn approval_is_blocked_while_interview_is_saving() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "제목".into();
+        p.draft.base_revision = "rev".into();
+        p.draft.scope = vec!["src".into()];
+        p.draft.requirements = vec!["요구".into()];
+        p.draft.acceptance = vec!["기준".into()];
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.interview_pending.insert("a".into());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 2500.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(work.try_recv().is_err());
+    }
+
+    #[test]
+    fn saved_draft_response_updates_selected_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        let old = app.state.generation;
+        let mut saved = project("a");
+        saved.draft_hash = "new".into();
+        saved.draft.title = "저장된 명세".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::SaveDraft {
+                project_id: "a".into(),
+                base_hash: "h".into(),
+                context: 0,
+                generation: old,
+            },
+            result: Ok(ResponseData::Project(saved)),
+        });
+        app.state.receive_project(old, project("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "new");
+        assert!(!app.state.spec_review_pending.contains("a"));
+    }
+
+    #[test]
+    fn late_save_reply_does_not_replace_newer_draft() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut newer = project("a");
+        newer.draft_hash = "newer".into();
+        newer.draft.title = "새 버전".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(newer),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let mut older = project("a");
+        older.draft_hash = "saved-old".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::SaveDraft {
+                project_id: "a".into(),
+                base_hash: "h".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Project(older)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "newer");
+        assert!(app.state.status.contains("다시 확인"));
+    }
+
+    #[test]
+    fn approved_response_marks_reviewed_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        let approved: domain::ApprovedSpec=serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap();
+        app.apply(worker::Reply {
+            kind: worker::Kind::ApproveDraft {
+                project_id: "a".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Approved(approved)),
+        });
+        assert!(app.state.project.as_ref().unwrap().approved.is_some());
+        assert!(!app.state.spec_review_pending.contains("a"));
+    }
+
+    #[test]
+    fn late_approval_does_not_mark_a_newer_draft_approved() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut newer = project("a");
+        newer.draft_hash = "new".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(newer),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let approved:domain::ApprovedSpec=serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap();
+        app.apply(worker::Reply {
+            kind: worker::Kind::ApproveDraft {
+                project_id: "a".into(),
+                context: 0,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Approved(approved)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "new");
+        assert!(app.state.project.as_ref().unwrap().approved.is_none());
+    }
+
+    #[test]
+    fn run_history_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록 조회")));
+    }
+
+    #[test]
+    fn history_button_requests_selected_project_page() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "실행 기록 조회" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let first = work.try_recv().unwrap();
+        assert!(
+            matches!(first.command,Command::ListRuns{project_id,offset:0,limit:20} if project_id=="a")
+        );
+        assert!(app.send(worker::Work::new(worker::Kind::List, Command::ListProjects)));
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.status.contains("가득"));
+        app.apply(worker::Reply{kind:first.kind,result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"kept","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        assert_eq!(app.state.history.runs[0]["id"], "kept");
+    }
+
+    #[test]
+    fn history_page_displays_runs_for_current_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"completed","persistence":null}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1"))));
+    }
+
+    #[test]
+    fn history_next_page_requests_next_offset() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":41,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "다음 페이지" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("다음 페이지");
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListRuns{project_id,offset:20,limit:20} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn selecting_run_requests_detail_and_events() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"run-1","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("run-1") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="run-1")
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListEvents{run_id,after:0} if run_id=="run-1")
+        );
+    }
+
+    #[test]
+    fn selected_run_shows_events_and_unsaved_completion() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let request = app.state.history.selection_request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryDetail{project_id:"a".into(),run_id:"r".into(),request},result:Ok(ResponseData::Data(serde_json::json!({"id":"r","project_id":"a","status":"completed","persistence":{"state":"pending"}})))});
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "r".into(),
+                request,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "r".into(),
+                attempt: 1,
+                kind: "progress".into(),
+                message: "이벤트 내용".into(),
+            }])),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("결과 저장 대기"))));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("이벤트 내용"))));
+    }
+
+    #[test]
+    fn project_switch_invalidates_old_history_response_even_when_switched_back() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.select("a");
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"old","project_id":"a","status":"completed"}],"total":1,"offset":0,"limit":20}))) });
+        assert!(app.state.history.runs.is_empty());
+    }
+
+    #[test]
+    fn selecting_another_run_clears_prior_error_and_detail() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"new","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":20}))) });
+        app.state.history.error = Some("기존 오류".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"old","status":"completed"}));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains("new") => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.error.is_none());
+    }
+
+    #[test]
+    fn late_run_detail_and_events_do_not_replace_current_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("new".into());
+        app.state.history.selection_request = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryDetail {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"old","project_id":"a","status":"completed"}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryEvents {
+                project_id: "a".into(),
+                run_id: "old".into(),
+                request: 1,
+            },
+            result: Ok(ResponseData::Events(vec![domain::RunEvent {
+                sequence: 1,
+                run_id: "old".into(),
+                attempt: 1,
+                kind: "test".into(),
+                message: "old".into(),
+            }])),
+        });
+        assert_eq!(app.state.history.selected.as_deref(), Some("new"));
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.history.events.is_empty());
+    }
+
+    #[test]
+    fn history_empty_page_and_failure_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"runs":[],"total":0,"offset":0,"limit":20}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 기록이 없습니다.")));
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryPage {
+                project_id: "a".into(),
+                request,
+                offset: 0,
+            },
+            result: Err("임시 오류".into()),
+        });
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("임시 오류"))));
+    }
+
+    #[test]
+    fn malformed_history_page_is_not_shown_as_valid() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        let request = app.state.history.request;
+        app.apply(worker::Reply{kind:worker::Kind::HistoryPage{project_id:"a".into(),request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"runs":[{"id":"r","project_id":"a","status":"running"}],"total":1,"offset":0,"limit":99}))) });
+        assert!(app.state.history.runs.is_empty());
+        assert!(app
+            .state
+            .history
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("올바르지"));
+    }
+
+    #[test]
+    fn knowledge_text_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in [
+            "원문 저장",
+            "텍스트 검색",
+            "문서 ID",
+            "버전",
+            "출처",
+            "원문",
+            "검색어",
+        ] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn knowledge_search_displays_document_hits() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        let request = app.state.knowledge.search_request;
+        app.apply(worker::Reply{kind:worker::Kind::KnowledgeSearch{project_id:"a".into(),epoch,request,query:"검색".into(),offset:0},result:Ok(ResponseData::Data(serde_json::json!({"mode":"text","results":[{"id":"doc1","version":1,"source":"가상 출처","text":"첫 줄\n둘째 줄"}]})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("doc1"))));
+    }
+
+    #[test]
+    fn knowledge_source_displays_exact_multiline_text_and_provenance() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        let request = app.state.knowledge.source_request;
+        app.apply(worker::Reply{kind:worker::Kind::KnowledgeSource{project_id:"a".into(),epoch,request,document_id:"doc".into()},result:Ok(ResponseData::Data(serde_json::json!({"id":"doc","version":2,"source":"출처 예시","text":"첫 줄\n  다음 줄"})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in ["출처 예시", "첫 줄\n  다음 줄"] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn knowledge_empty_results_and_source_error_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSearch {
+                project_id: "a".into(),
+                epoch,
+                request: 0,
+                query: "없는 단어".into(),
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"mode":"text","results":[]}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="검색 결과가 없습니다.")));
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 0,
+                document_id: "doc".into(),
+            },
+            result: Err("document not found".into()),
+        });
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("document not found"))));
+    }
+    #[test]
+    fn older_source_reply_does_not_replace_newer_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        app.state.knowledge.source_request = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 2,
+                document_id: "new".into(),
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"new","version":1,"source":"s","text":"new"}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 1,
+                document_id: "old".into(),
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"old","version":1,"source":"s","text":"old"}),
+            )),
+        });
+        assert_eq!(
+            app.state.knowledge.forms["a"]
+                .source_document
+                .as_ref()
+                .unwrap()["id"],
+            "new"
+        );
     }
 
     #[test]
