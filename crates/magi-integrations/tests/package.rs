@@ -1,4 +1,4 @@
-use magi_integrations::{export_package, PackageInput};
+use magi_integrations::{export_package, export_zip, PackageInput};
 use std::path::PathBuf;
 
 fn input() -> PackageInput {
@@ -110,5 +110,47 @@ fn export_refuses_existing_file_and_preserves_contents() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "sentinel");
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     std::fs::remove_file(dest).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn zip_contains_package_documents_and_never_replaces_existing_destination() {
+    use std::io::Read;
+    let root = create_test_root();
+    let dest = root.join("bundle.zip");
+    export_zip(&input(), &dest).unwrap();
+    let before = std::fs::read(&dest).unwrap();
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+    assert_eq!(archive.len(), 6);
+    for (name, expected) in [
+        ("README.ko.md", "readme"),
+        ("SPEC.ko.md", "spec"),
+        ("TASKS.md", "tasks"),
+        ("CONSTRAINTS.md", "constraints"),
+        ("VERIFICATION.md", "verification"),
+    ] {
+        let mut text = String::new();
+        archive
+            .by_name(name)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, expected);
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_reader(archive.by_name("manifest.json").unwrap()).unwrap();
+    assert_eq!(manifest["completed_id"], "approved");
+    assert_eq!(manifest["files"].as_array().unwrap().len(), 5);
+    drop(archive);
+    assert!(export_zip(&input(), &dest).is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), before);
+    let existing_dir = root.join("existing");
+    std::fs::create_dir(&existing_dir).unwrap();
+    assert!(export_zip(&input(), &existing_dir).is_err());
+    assert_eq!(std::fs::read_dir(&existing_dir).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    std::fs::remove_file(dest).unwrap();
+    std::fs::remove_dir(existing_dir).unwrap();
     std::fs::remove_dir(root).unwrap();
 }
