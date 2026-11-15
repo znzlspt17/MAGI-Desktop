@@ -156,3 +156,32 @@ fn checkpoint_never_returns_unrestorable_oversized_data() {
         KnowledgeIndex::rebuild(vec![document("x".repeat(MAX_BYTES - overhead + 1))]).unwrap();
     assert!(too_large.checkpoint().is_err());
 }
+
+#[test]
+fn selected_decision_is_a_versioned_snapshot() {
+    let mut store = DecisionStore::default();
+    store
+        .save(Decision {
+            id: "d".into(),
+            version: 1,
+            text: "first".into(),
+        })
+        .unwrap();
+    let selected = store.select("d", 1).unwrap();
+    store
+        .save(Decision {
+            id: "d".into(),
+            version: 2,
+            text: "revised".into(),
+        })
+        .unwrap();
+    assert_eq!(selected.text, "first");
+    assert_eq!(store.select("d", 1).unwrap(), selected);
+    assert!(store
+        .save(Decision {
+            id: "d".into(),
+            version: 1,
+            text: "overwrite".into()
+        })
+        .is_err());
+}
