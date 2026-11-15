@@ -57,6 +57,10 @@ impl Drop for GenerationLease {
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
+#[cfg(all(test, windows))]
+static GENERATION_HANDOFF_TEST_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 impl Engine {
     pub fn open(path: &Path) -> Result<Self, String> {
         let parent = path
@@ -192,10 +196,24 @@ impl Engine {
                             }
                             Ok(report)
                         });
-                        let completions = Arc::clone(&engine.completions);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            completions.register_generation(&db, &worker_id, &project_id, result)
-                        })
+                        save_generation_result(
+                            Arc::clone(&engine.completions),
+                            db,
+                            worker_id,
+                            project_id,
+                            result,
+                            |manager, db, record| {
+                                #[cfg(test)]
+                                if GENERATION_HANDOFF_TEST_FAILURES
+                                    .lock()
+                                    .unwrap()
+                                    .remove(record["run_id"].as_str().unwrap())
+                                {
+                                    panic!("fake handoff failure");
+                                }
+                                manager.register_generation_record(db, record)
+                            },
+                        )
                         .await;
                         let _ = drain.await;
                     });
@@ -447,9 +465,10 @@ impl Engine {
                 Ok(ResponseData::Data(serde_json::json!({"state":state})))
             }
             Command::CancelRun { run_id } => {
+                // 2026-11-16: 저장 실패가 진행 중인 모델 작업의 취소 전달을 막지 않게 한다.
+                if let Some(token) = self.cancellations.lock().unwrap_or_else(|e| e.into_inner()).get(&run_id) { token.cancel(); }
                 let db = self.db.get().ok_or("storage unavailable")?;
                 runs::cancel(&db, &run_id)?;
-                if let Some(token) = self.cancellations.lock().unwrap_or_else(|e| e.into_inner()).get(&run_id) { token.cancel(); }
                 Ok(ResponseData::Empty)
             }
             Command::ListEvents { run_id, after } => {
@@ -755,6 +774,31 @@ impl Engine {
     }
 }
 
+// 2026-11-16: 완료 payload는 저장 작업자 외부에도 보존해 JoinError 때 같은 ID로 재시도한다.
+#[cfg(windows)]
+async fn save_generation_result<F>(
+    manager: Arc<completion::CompletionManager>,
+    db: Arc<Database>,
+    run_id: String,
+    project_id: String,
+    result: Result<provider::sdd::SpecResult, String>,
+    save: F,
+) where
+    F: FnOnce(&completion::CompletionManager, &Database, serde_json::Value) + Send + 'static,
+{
+    let record = completion::CompletionManager::generation_record(&run_id, &project_id, result);
+    let worker_record = record.clone();
+    let worker_manager = Arc::clone(&manager);
+    if tokio::task::spawn_blocking(move || save(&worker_manager, &db, worker_record))
+        .await
+        .is_err()
+        && tokio::task::spawn_blocking(move || manager.preserve_failed_handoff(record))
+            .await
+            .is_err()
+    {
+        eprintln!("명세 완료 결과의 저장 진단 작업이 중단되었습니다.");
+    }
+}
 fn draft_hash(draft: &SpecDraft) -> Result<String, String> {
     Ok(format!(
         "{:x}",

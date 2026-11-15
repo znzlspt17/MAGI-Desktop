@@ -1716,4 +1716,376 @@ mod tests {
         }
         std::fs::remove_dir(root).unwrap();
     }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_reaches_stalled_provider_when_database_is_poisoned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let journal = root.join("state.redb.completion-journal");
+        let engine = Arc::new(crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(crate::completion::CompletionManager::empty(
+                journal.clone(),
+                Arc::clone(&gate),
+            )),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        });
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-io-secret".into()),
+        });
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "generate".into(),
+                command: domain::Command::GenerateSpec {
+                    project_id: project.id.clone(),
+                },
+            })
+            .await;
+        let run_id = match response.result.unwrap() {
+            domain::ResponseData::Run { run_id } => run_id,
+            _ => panic!("run"),
+        };
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut request = [0; 16384];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        let before = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => serde_json::to_value(project).unwrap(),
+            _ => panic!("project"),
+        };
+        let db = engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, u64>::new("dummy"))
+                .unwrap();
+            table.insert("x", 1).unwrap();
+        }
+        broken.store(true, Ordering::SeqCst);
+        assert!(tx.commit().is_err());
+        drop(db);
+        let token = engine
+            .cancellations
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .unwrap()
+            .clone();
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "cancel".into(),
+                command: domain::Command::CancelRun {
+                    run_id: run_id.clone(),
+                },
+            })
+            .await;
+        assert!(response.result.is_err());
+        assert!(
+            token.is_cancelled(),
+            "DB failure prevented cancellation signal"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while engine.generation_active(&run_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled worker retained DB handle");
+        broken.store(false, Ordering::SeqCst);
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .await;
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let after = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => serde_json::to_value(project).unwrap(),
+            _ => panic!("project"),
+        };
+        assert_eq!(after, before);
+        drop(socket);
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn loopback_handoff_panic_preserves_result_and_retry_never_repeats_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root =
+            std::env::temp_dir().join(format!("magi-generation-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join("state.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let broken = Arc::new(AtomicBool::new(false));
+        let db = Database::builder()
+            .set_cache_size(0)
+            .create_with_backend(FailingBackend {
+                file: redb::backends::FileBackend::new(file).unwrap(),
+                broken: Arc::clone(&broken),
+            })
+            .unwrap();
+        crate::initialize_schema(&db).unwrap();
+        crate::runs::initialize(&db).unwrap();
+        let gate = Arc::new(std::sync::Mutex::new(()));
+        let journal = root.join("state.redb.completion-journal");
+        let engine = Arc::new(crate::Engine {
+            db: StorageSlot::new(path.clone(), db),
+            completions: Arc::new(crate::completion::CompletionManager::empty(
+                journal.clone(),
+                Arc::clone(&gate),
+            )),
+            credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_root: root.clone(),
+            git_gate: Arc::new(std::sync::Mutex::new(())),
+            mutation_gate: gate,
+            slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
+        });
+        let call = |command| {
+            engine
+                .handle(domain::Request {
+                    id: "fixture".into(),
+                    command,
+                })
+                .result
+                .unwrap()
+        };
+        let project = match call(domain::Command::CreateProject {
+            name: "fixture".into(),
+            path: "not-created".into(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        call(domain::Command::SubmitInterview {
+            project_id: project.id.clone(),
+            message: "검색 제공".into(),
+        });
+        call(domain::Command::SaveDraft {
+            project_id: project.id.clone(),
+            draft: domain::SpecDraft {
+                base_revision: "abc".into(),
+                acceptance: vec!["검색 제공".into()],
+                ..Default::default()
+            },
+        });
+        call(domain::Command::ConfigureModel {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            model: "gpt-6".into(),
+            capabilities: domain::ModelCapabilities {
+                streaming: true,
+                tools: false,
+                context_tokens: Some(32000),
+            },
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        call(domain::Command::SetProviderCredential {
+            project_id: project.id.clone(),
+            endpoint: format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            credential: domain::SecretString("fake-io-secret".into()),
+        });
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "generate".into(),
+                command: domain::Command::GenerateSpec {
+                    project_id: project.id.clone(),
+                },
+            })
+            .await;
+        let run_id = match response.result.unwrap() {
+            domain::ResponseData::Run { run_id } => run_id,
+            _ => panic!("run"),
+        };
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut request = [0; 16384];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        crate::GENERATION_HANDOFF_TEST_FAILURES
+            .lock()
+            .unwrap()
+            .insert(run_id.clone());
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":generation_candidate().to_string()}]}]}})
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !engine.generation_active(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("generation worker did not finish");
+        let status = engine.completions.status();
+        assert_eq!(status["failures"][0]["stage"], "generation");
+        assert_eq!(status["failures"][0]["journaled"], false);
+        assert_eq!(status["log_attempted"], true);
+        broken.store(false, Ordering::SeqCst);
+        let response = engine
+            .clone()
+            .handle_async(domain::Request {
+                id: "retry".into(),
+                command: domain::Command::RetryCompletionSave {
+                    run_id: run_id.clone(),
+                },
+            })
+            .await;
+        let value = match response.result.unwrap() {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("retry"),
+        };
+        assert_eq!(value["state"], "saved");
+        let run = match call(domain::Command::GetRun {
+            run_id: run_id.clone(),
+        }) {
+            domain::ResponseData::Data(value) => value,
+            _ => panic!("run"),
+        };
+        assert_eq!(run["status"], "generated");
+        assert_eq!(run["report"]["draft"]["title"], "검색");
+        let db = engine.db.get().unwrap();
+        assert_eq!(
+            crate::runs::get(&db, &run_id).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "generated")
+                .count(),
+            1
+        );
+        drop(db);
+        let saved = match call(domain::Command::GetProject {
+            project_id: project.id.clone(),
+        }) {
+            domain::ResponseData::Project(project) => project,
+            _ => panic!("project"),
+        };
+        assert_eq!(saved.draft.title, "검색");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(engine);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(journal.join("events.log")).unwrap();
+        std::fs::remove_dir(journal).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }
