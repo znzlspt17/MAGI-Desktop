@@ -463,3 +463,129 @@ pub fn parse_candidate(raw: &str, input: &SpecInput) -> Result<SpecResult, Provi
     c.draft_hash = hash(&serde_json::to_vec(&c.draft).map_err(|_| bad())?);
     Ok(c)
 }
+
+// 2026-11-14: 정체가 두 번 이어지면 같은 기준으로 평가한 최고점 초안을 복원한다.
+pub async fn generate_spec(
+    provider: &crate::OpenAiProvider,
+    input: SpecInput,
+    cancel: tokio_util::sync::CancellationToken,
+    events: tokio::sync::mpsc::Sender<crate::ProviderEvent>,
+) -> Result<SpecResult, ProviderError> {
+    generate_spec_inner(
+        provider,
+        input,
+        cancel,
+        events,
+        None,
+        crate::DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+    .await
+}
+/// 직렬화 바이트에 고정 여유분을 더해 추정하며 정확한 토크나이저 결과는 아니다.
+pub async fn generate_spec_with_context(
+    provider: &crate::OpenAiProvider,
+    input: SpecInput,
+    cancel: tokio_util::sync::CancellationToken,
+    events: tokio::sync::mpsc::Sender<crate::ProviderEvent>,
+    context_tokens: u64,
+    max_output_tokens: u64,
+) -> Result<SpecResult, ProviderError> {
+    if context_tokens == 0 || max_output_tokens == 0 {
+        return Err(ProviderError("Invalid specification input"));
+    }
+    generate_spec_inner(
+        provider,
+        input,
+        cancel,
+        events,
+        Some(context_tokens),
+        max_output_tokens,
+    )
+    .await
+}
+async fn generate_spec_inner(
+    provider: &crate::OpenAiProvider,
+    input: SpecInput,
+    cancel: tokio_util::sync::CancellationToken,
+    events: tokio::sync::mpsc::Sender<crate::ProviderEvent>,
+    context_tokens: Option<u64>,
+    max_output_tokens: u64,
+) -> Result<SpecResult, ProviderError> {
+    if input.max_revisions > 5 {
+        return Err(ProviderError("Invalid specification input"));
+    }
+    let mut best: Option<SpecResult> = None;
+    let mut feedback = String::new();
+    let mut stale = 0;
+    for _ in 0..=input.max_revisions {
+        if cancel.is_cancelled() {
+            return Err(ProviderError("Request cancelled"));
+        }
+        let prompt = serde_json::json!({"instruction":"입력에서 확인된 근거와 추정을 구분하여 JSON만 반환하세요. draft에는 기본 명세 필드와 markdown, source_links, constraints, tasks, reused_decisions, task_bindings를 포함하고 각 task_bindings는 task_id, goal, requirement_ids, acceptance_ids를 갖습니다. ID는 draft.requirements의 0부터 시작하는 requirement-0, requirement-1과 draft.acceptance의 acceptance-0, acceptance-1 형식이며 각 task마다 하나의 binding과 비어 있지 않은 goal, 두 ID 목록이 필요합니다. markdown에는 headings 전체를 순서대로 채우세요. 각 tasks 항목의 owned_paths는 프로젝트 상대 경로로 적고 validation은 실행 가능한 형식만 허용합니다. 예: read_contains:src/readme.txt:기대문구 또는 exec_json:{\"program\":\"cargo\",\"args\":[\"test\"],\"cwd\":\"src\"}. 경로와 cwd는 해당 작업 owned_paths 범위 내부여야 합니다. exec_json은 shell 없이 program과 문자열 args를 직접 실행합니다. 검증 절차가 불명확하면 성공을 추정하지 말고 mandatory_questions에 질문하세요. policy_version은 4입니다. rubric 항목마다 verdicts에 rubric_id, passed, section, quote, reason, issue_checklist_id를 넣고 실패는 issues의 checklist_id, requirement_id, rubric_ids, severity, evidence(source,quote)에 연결하세요. evidence에는 각 requirement_id와 실제 request, answer:인덱스, decision:인덱스의 원문 인용을 넣으세요. assumptions는 추정, revision_directives는 실패 개선 지침, score_reason과 proposed_score는 0~10 판정, score는 proposed_score와 같은 값입니다. 새 사용자 결정은 mandatory_questions로 남기세요.","headings":HEADINGS,"input":input,"feedback":feedback});
+        // 2026-11-14: 보완 이력이 늘어나는 매 요청마다 입력 바이트와 출력 예산을 함께 검사한다.
+        let prompt = prompt.to_string();
+        if let Some(limit) = context_tokens {
+            let encoded = serde_json::to_vec(&prompt).map_err(|_| bad())?;
+            let encoded_model = serde_json::to_vec(&provider.config.model).map_err(|_| bad())?;
+            let estimate = u64::try_from(encoded.len())
+                .ok()
+                .and_then(|n| n.checked_add(encoded_model.len() as u64))
+                .and_then(|n| n.checked_add(1024))
+                .and_then(|n| n.checked_add(max_output_tokens))
+                .ok_or(ProviderError("Specification context limit exceeded"))?;
+            if estimate > limit {
+                return Err(ProviderError("Specification context limit exceeded"));
+            }
+        }
+        let response = provider
+            .generate_with_limit(
+                serde_json::Value::String(prompt),
+                vec![],
+                cancel.clone(),
+                events.clone(),
+                max_output_tokens,
+            )
+            .await?;
+        let candidate = parse_candidate(&response.text, &input)?;
+        if !candidate.draft.mandatory_questions.is_empty() {
+            if let Some(mut prior) = best.filter(|b| b.score >= candidate.score) {
+                for q in candidate.draft.mandatory_questions {
+                    if !prior.draft.mandatory_questions.contains(&q) {
+                        prior.draft.mandatory_questions.push(q);
+                    }
+                }
+                for f in candidate.draft.required_failures {
+                    if !prior.draft.required_failures.contains(&f) {
+                        prior.draft.required_failures.push(f);
+                    }
+                }
+                for issue in candidate.draft.optional_issues {
+                    if !prior.draft.optional_issues.contains(&issue) {
+                        prior.draft.optional_issues.push(issue);
+                    }
+                }
+                if !prior.draft.required_failures.is_empty() {
+                    prior.score = prior.score.min(7);
+                }
+                if !prior.draft.optional_issues.is_empty() {
+                    prior.score = prior.score.min(9);
+                }
+                prior.draft_hash = hash(&serde_json::to_vec(&prior.draft).map_err(|_| bad())?);
+                return Ok(prior);
+            }
+            return Ok(candidate);
+        }
+        let improved = best.as_ref().is_none_or(|b| candidate.score > b.score);
+        if improved {
+            best = Some(candidate.clone());
+            stale = 0;
+        } else {
+            stale += 1;
+        }
+        if (candidate.score == 10 && candidate.draft.required_failures.is_empty()) || stale >= 2 {
+            break;
+        }
+        feedback = serde_json::to_string(&candidate).map_err(|_| bad())?;
+    }
+    best.ok_or_else(bad)
+}
