@@ -20,7 +20,7 @@ pub(crate) struct AgentWorkers {
     changed: tokio::sync::Notify,
 }
 impl AgentWorkers {
-    fn register(self: &Arc<Self>) -> AgentWorker {
+    pub(crate) fn register(self: &Arc<Self>) -> AgentWorker {
         self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         AgentWorker(Arc::clone(self))
     }
@@ -34,7 +34,7 @@ impl AgentWorkers {
         }
     }
 }
-struct AgentWorker(Arc<AgentWorkers>);
+pub(crate) struct AgentWorker(Arc<AgentWorkers>);
 impl Drop for AgentWorker {
     fn drop(&mut self) {
         self.0
