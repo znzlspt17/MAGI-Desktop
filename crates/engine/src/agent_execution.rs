@@ -38,7 +38,7 @@ fn preflight(
             return Err("role model missing".into());
         }
         if config.tools.iter().any(|t| {
-            !["read", "search", "patch", "mcp"].contains(&t.as_str())
+            !["read", "search", "patch", "mcp", "exec"].contains(&t.as_str())
                 || (config.role == "reviewer" && !["read", "search"].contains(&t.as_str()))
         }) {
             return Err("unsupported agent tool".into());
@@ -403,6 +403,10 @@ fn tool_schema(name: &str) -> serde_json::Value {
         "patch" => (
             serde_json::json!({"path":{"type":"string"},"content":{"type":"string"}}),
             vec!["path", "content"],
+        ),
+        "exec" => (
+            serde_json::json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}}),
+            vec!["program", "args", "cwd"],
         ),
         "mcp" => (
             serde_json::json!({"endpoint":{"type":"string"},"name":{"type":"string"},"arguments":{"type":"object"},"cwd":{"type":"string"},"side_effect":{"type":"boolean","const":true}}),
@@ -862,8 +866,8 @@ pub(crate) async fn start(
             }
             Err(error) => Err(error),
         };
-        // 2026-11-16: 중단된 외부 MCP worker의 기록과 실제 종료가 끝난 뒤에만 완료와 슬롯 반환을 진행한다.
-        runtime.wait_mcp_workers().await;
+        // 2026-11-16: 중단된 외부 도구 worker의 기록과 실제 종료가 끝난 뒤에만 완료와 슬롯 반환을 진행한다.
+        runtime.wait_effect_workers().await;
         let record = crate::completion::CompletionManager::agent_record(
             &run_id,
             &project_id,
@@ -919,10 +923,18 @@ mod tests {
         assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_err());
     }
     #[test]
+    fn allows_exec_for_implementer_but_not_reviewer() {
+        let (spec, mut configs) = fixture();
+        configs[1].tools.push("exec".into());
+        assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_ok());
+        configs[2].tools.push("exec".into());
+        assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_err());
+    }
+    #[test]
     fn supports_only_explicit_initial_tool_and_validation_contract() {
         let (spec, configs) = fixture();
         assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_ok());
-        for name in ["exec", "git", "knowledge"] {
+        for name in ["git", "knowledge"] {
             let mut invalid = configs.clone();
             invalid[1].tools.push(name.into());
             assert!(
