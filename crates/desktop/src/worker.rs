@@ -7,6 +7,14 @@ use std::sync::{
 };
 
 pub enum Kind {
+    PackageExport {
+        project_id: String,
+        target: crate::package_export_ui::Target,
+        destination: String,
+        expected: String,
+        generation: u64,
+        selection: u64,
+    },
     SemanticSearch {
         project_id: String,
         query: String,
@@ -83,6 +91,13 @@ pub enum Kind {
     StartExecution {
         project_id: String,
         generation: u64,
+    },
+    GraphSource {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        document_id: String,
+        version: u64,
     },
     GraphPage {
         project_id: String,

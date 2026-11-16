@@ -524,4 +524,39 @@ mod tests {
             assert!(work.try_recv().is_err());
         }
     }
+    #[test]
+    fn late_request_response_after_endpoint_edit_does_not_update_current_state() {
+        let (p, r, f) = fixture();
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = crate::App {
+            state: crate::State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(r);
+        app.state.manual_mcp.forms.insert("a".into(), f);
+        app.manual_mcp_action(&p, Action::Request);
+        let sent = work.try_recv().unwrap();
+        app.state.mcp.edit("a", "https://example.test/new");
+        app.state.status = "현재 주소".into();
+        app.apply(crate::worker::Reply {
+            kind: sent.kind,
+            result: Ok(domain::ResponseData::Data(
+                serde_json::json!({"approval_id":"old"}),
+            )),
+        });
+        assert_eq!(app.state.status, "현재 주소");
+        assert!(app.state.manual_mcp.binding.is_none());
+        assert!(app.state.history.detail.is_none());
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
 }
