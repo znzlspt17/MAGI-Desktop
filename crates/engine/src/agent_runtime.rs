@@ -1358,6 +1358,47 @@ mod bridge_integration_tests {
         }
     }
     #[tokio::test]
+    async fn exec_agent_requests_bound_approval_before_starting_process() {
+        let fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let mut run: Value =
+                serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value())
+                    .unwrap();
+            run["agent_configs"][1]["tools"] = json!(["read", "patch", "exec"]);
+            table
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let runtime = fixture.runtime();
+        let task = fixture.spec.tasks[0].clone();
+        let token = CancellationToken::new();
+        let child = token.clone();
+        let work = tokio::spawn(async move {
+            runtime
+                .execute_durable(
+                    "implementer",
+                    &task,
+                    "exec",
+                    "exec-1",
+                    json!({"program":"fixture.exe","args":[],"cwd":"src"}),
+                    child,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let run = runs::get(&db, &fixture.run_id).unwrap();
+        token.cancel();
+        let _ = work.await;
+        assert_eq!(run["status"], "awaiting_approval");
+        assert_eq!(run["pending"]["call_id"], "exec-1");
+    }
+    #[tokio::test]
     async fn checkpoint_loop_applies_patch_once_and_reuses_real_evidence() {
         let fixture = Fixture::new("approved_scope");
         let runtime = fixture.runtime();
