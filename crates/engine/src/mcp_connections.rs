@@ -8,6 +8,29 @@ const GENERATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("integration_mcp_endpoint_versions");
 const POLICIES: TableDefinition<&str, &str> = TableDefinition::new("integration_mcp_policy");
 
+// 2026-11-16: 승인 생성과 소비에서 주소 세대를 같은 트랜잭션으로 비교한다.
+pub(crate) fn endpoint_in_write(
+    tx: &redb::WriteTransaction,
+    project: &str,
+) -> Result<(String, Option<String>), String> {
+    let endpoints = tx.open_table(ENDPOINTS).map_err(err)?;
+    let endpoint = endpoints
+        .get(project)
+        .map_err(err)?
+        .ok_or("MCP not configured")?
+        .value()
+        .to_owned();
+    let generation = match tx.open_table(GENERATIONS) {
+        Ok(table) => table
+            .get(project)
+            .map_err(err)?
+            .map(|v| v.value().to_owned()),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(err(e)),
+    };
+    Ok((endpoint, generation))
+}
+
 // 2026-11-16: endpoint 변경과 이전 정책 무효화를 같은 트랜잭션에 기록해 다른 서버에 과거 권한이 적용되지 않게 한다.
 pub(crate) fn configure(
     db: &Database,
