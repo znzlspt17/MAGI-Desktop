@@ -21,7 +21,7 @@ pub(crate) fn pending(
     let item = run.get("pending")?.as_object()?;
     let id = item.get("id")?.as_str()?.to_owned();
     let tool = item.get("tool")?.as_str()?.to_owned();
-    if id.is_empty() || !["patch", "mcp"].contains(&tool.as_str()) {
+    if id.is_empty() || !["patch", "mcp", "exec"].contains(&tool.as_str()) {
         return None;
     }
     let arguments = item.get("arguments")?.clone();
@@ -42,6 +42,47 @@ pub(crate) fn pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exec_request_preserves_bound_command_and_rejects_unknown_tools() {
+        let p:Project=serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":null})).unwrap();
+        let mut run = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","pending":{"id":"id1","tool":"exec","arguments":{"program":"fake-program","args":["a b","둘째"],"cwd":"src"},"call_id":"call1","authorized":false}});
+        let item = pending(&p, &run, "r").expect("bound exec must be visible");
+        assert_eq!(item.raw, run["pending"]);
+        assert_eq!(item.arguments["args"][0], "a b");
+        assert!(pending(&p, &run, "other").is_none());
+        run["pending"]["tool"] = "unknown".into();
+        assert!(pending(&p, &run, "r").is_none());
+    }
+    #[test]
+    fn exec_requires_active_agent_and_valid_bound_identity_for_approval() {
+        let mut item = Pending {
+            id: "id".into(),
+            tool: "exec".into(),
+            arguments: serde_json::json!({"program":"fake-program","args":["x"],"cwd":"src"}),
+            call_id: "call".into(),
+            raw: serde_json::json!({"call_id":"call"}),
+        };
+        assert!(!tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":false})
+        ));
+        assert!(!tool_active_permitted(&item, &serde_json::json!({})));
+        assert!(tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":true})
+        ));
+        item.raw = serde_json::json!({"call_id":null});
+        assert!(!tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":true})
+        ));
+        item.raw = serde_json::json!({"call_id":"call"});
+        item.arguments = serde_json::json!({"program":"fake-program","args":[]});
+        assert!(!tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":true})
+        ));
+    }
     #[test]
     fn pending_preserves_exact_request_and_only_selected_project_run() {
         let p:Project=serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":null})).unwrap();
@@ -110,7 +151,7 @@ pub(crate) fn render(
         }
         let matches = approval_matches(project, run);
         let active = tool_active_permitted(&item, run);
-        if item.tool == "patch"
+        if ["patch", "exec"].contains(&item.tool.as_str())
             && !active
             && !item
                 .raw
@@ -119,7 +160,9 @@ pub(crate) fn render(
                 .is_some_and(|id| !id.is_empty())
         {
             ui.label("요청 연결 정보 확인 필요");
-        } else if item.tool == "patch" && !active {
+        } else if item.tool == "exec" && !active && run["agent_active"] == true {
+            ui.label("실행 요청 인수를 확인할 수 없습니다.");
+        } else if ["patch", "exec"].contains(&item.tool.as_str()) && !active {
             match run["agent_active"].as_bool() {
                 Some(false) => {
                     ui.label("실행을 재개한 후 승인할 수 있습니다.");
@@ -158,6 +201,37 @@ pub(crate) fn render(
 mod display_tests {
     use super::*;
     #[test]
+    fn exec_details_are_visible_without_automatic_approval() {
+        let p:Project=serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":{"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]}})).unwrap();
+        let r = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"approval","tool":"exec","arguments":{"program":"fake-program","args":["arg one","둘째"],"cwd":"src"},"call_id":"call-1","authorized":false}});
+        let mut action = None;
+        let out = eframe::egui::Context::default().run(eframe::egui::RawInput::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                action = render(ui, &p, &r, "r", false);
+            });
+        });
+        let labels: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                eframe::egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "fake-program",
+            "arg one",
+            "둘째",
+            "src",
+            "call-1",
+            "승인",
+            "거절",
+        ] {
+            assert!(labels.iter().any(|s| s.contains(expected)), "{expected}");
+        }
+        assert!(action.is_none());
+    }
+    #[test]
     fn displays_full_pending_request_and_run_context() {
         let p:Project=serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":null})).unwrap();
         let r = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","scope":["src"],"worktree":"C:/work","pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"첫 줄\n둘째 줄"},"call_id":"call1"}});
@@ -194,6 +268,22 @@ mod display_tests {
     }
 }
 pub(crate) fn tool_active_permitted(item: &Pending, run: &serde_json::Value) -> bool {
+    if item.tool == "exec" {
+        let arguments = &item.arguments;
+        return item
+            .raw
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+            && run["agent_active"].as_bool() == Some(true)
+            && arguments["program"]
+                .as_str()
+                .is_some_and(|program| !program.trim().is_empty())
+            && arguments["args"]
+                .as_array()
+                .is_some_and(|args| args.iter().all(serde_json::Value::is_string))
+            && arguments["cwd"].as_str().is_some();
+    }
     if item.tool != "patch" {
         return true;
     }
