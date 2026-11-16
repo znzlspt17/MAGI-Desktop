@@ -1026,19 +1026,108 @@ mod bridge_integration_tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let temp = std::env::temp_dir().canonicalize().unwrap();
-            assert_eq!(self.root.parent(), Some(temp.as_path()));
-            assert!(self
-                .root
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("magi-bridge-integration-"));
-            if let Some(engine) = Arc::get_mut(&mut self.engine) {
-                engine.db = crate::storage::StorageSlot::empty(self.root.join("closed.redb"));
+            // 2026-11-16: 본문 실패 중 정리 실패가 두 번째 panic으로 원래 진단을 지우지 않게 한다.
+            let cleanup = (|| -> Result<(), String> {
+                let temp = std::env::temp_dir()
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+                if self.root.parent() != Some(temp.as_path())
+                    || self.root.file_name().is_none_or(|name| {
+                        !name
+                            .to_string_lossy()
+                            .starts_with("magi-bridge-integration-")
+                    })
+                {
+                    return Err("fixture 정리 경로가 올바르지 않습니다".into());
+                }
+                if let Some(engine) = Arc::get_mut(&mut self.engine) {
+                    engine.db = crate::storage::StorageSlot::empty(self.root.join("closed.redb"));
+                }
+                std::fs::remove_dir_all(&self.root).map_err(|e| e.to_string())
+            })();
+            if let Err(error) = cleanup {
+                if std::thread::panicking() {
+                    eprintln!("fixture 정리 실패: {error}");
+                } else {
+                    panic!("fixture 정리 실패: {error}");
+                }
             }
-            std::fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+    #[test]
+    fn fixture_original_panic_child() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let Some(marker) = std::env::var_os("MAGI_FIXTURE_TEST_MARKER") else {
+            return;
+        };
+        let fixture = Fixture::new("step_by_step");
+        std::fs::write(marker, fixture.root.to_string_lossy().as_bytes()).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(fixture.root.join("locked-fixture"))
+            .unwrap();
+        std::mem::forget(locked);
+        if std::env::var_os("MAGI_FIXTURE_TEST_NORMAL").is_some() {
+            drop(fixture);
+            return;
+        }
+        panic!("original fixture test panic");
+    }
+    #[test]
+    fn fixture_cleanup_preserves_original_panic() {
+        let output = run_cleanup_probe(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("original fixture test panic"));
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "fixture unwind aborted instead of preserving original failure"
+        );
+    }
+    #[test]
+    fn fixture_cleanup_failure_still_fails_without_prior_panic() {
+        let output = run_cleanup_probe(true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("fixture 정리 실패"));
+        assert_eq!(output.status.code(), Some(101));
+    }
+    fn run_cleanup_probe(normal: bool) -> std::process::Output {
+        use std::os::windows::process::CommandExt;
+        let marker =
+            std::env::temp_dir().join(format!("magi-fixture-marker-{}", uuid::Uuid::new_v4()));
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "agent_runtime::bridge_integration_tests::fixture_original_panic_child",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("MAGI_FIXTURE_TEST_MARKER", &marker)
+        .creation_flags(0x08000000);
+        if normal {
+            cmd.env("MAGI_FIXTURE_TEST_NORMAL", "1");
+        }
+        for name in ["PATH", "SystemRoot", "TEMP", "TMP", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+        let output = cmd.output().unwrap();
+        let root = std::path::PathBuf::from(std::fs::read_to_string(&marker).unwrap())
+            .canonicalize()
+            .unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("magi-bridge-integration-"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(marker).unwrap();
+        output
     }
     struct Model(AtomicUsize);
 
