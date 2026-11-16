@@ -7,6 +7,17 @@ use std::sync::{
 };
 
 pub enum Kind {
+    McpSave {
+        project_id: String,
+        endpoint: String,
+        epoch: u64,
+        sequence: u64,
+    },
+    McpList {
+        project_id: String,
+        epoch: u64,
+        sequence: u64,
+    },
     AgentStart {
         project_id: String,
         run_id: String,
