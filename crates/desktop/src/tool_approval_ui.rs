@@ -109,13 +109,36 @@ pub(crate) fn render(
             ui.label(content);
         }
         let matches = approval_matches(project, run);
+        let active = tool_active_permitted(&item, run);
+        if item.tool == "patch"
+            && !active
+            && !item
+                .raw
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        {
+            ui.label("요청 연결 정보 확인 필요");
+        } else if item.tool == "patch" && !active {
+            match run["agent_active"].as_bool() {
+                Some(false) => {
+                    ui.label("실행을 재개한 후 승인할 수 있습니다.");
+                }
+                _ => {
+                    ui.label("에이전트 상태 확인 필요");
+                }
+            }
+        }
         if !matches {
             ui.label("현재 승인된 명세와 실행 범위가 다릅니다. 승인은 사용할 수 없습니다.");
         }
         let mut result = None;
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!busy && matches, eframe::egui::Button::new("승인"))
+                .add_enabled(
+                    !busy && matches && active,
+                    eframe::egui::Button::new("승인"),
+                )
                 .clicked()
             {
                 result = Some((item.clone(), true));
@@ -168,5 +191,117 @@ mod display_tests {
         ] {
             assert!(labels.iter().any(|s| s.contains(fragment)), "{fragment}");
         }
+    }
+}
+pub(crate) fn tool_active_permitted(item: &Pending, run: &serde_json::Value) -> bool {
+    if item.tool != "patch" {
+        return true;
+    }
+    match item.raw.get("call_id") {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(id)) if !id.is_empty() => {
+            run["agent_active"].as_bool() == Some(true)
+        }
+        _ => false,
+    }
+}
+#[cfg(test)]
+mod active_tests {
+    use super::*;
+    #[test]
+    fn patch_requires_explicit_active_agent_but_mcp_does_not() {
+        let mut item = Pending {
+            id: "id".into(),
+            tool: "patch".into(),
+            arguments: serde_json::json!({}),
+            call_id: serde_json::Value::Null,
+            raw: serde_json::json!({"call_id":"call"}),
+        };
+        assert!(!tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":false})
+        ));
+        assert!(!tool_active_permitted(&item, &serde_json::json!({})));
+        assert!(tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":true})
+        ));
+        item.tool = "mcp".into();
+        assert!(tool_active_permitted(
+            &item,
+            &serde_json::json!({"agent_active":false})
+        ));
+        assert!(tool_active_permitted(&item, &serde_json::json!({})));
+    }
+}
+#[cfg(test)]
+mod inactive_display_tests {
+    use super::*;
+    #[test]
+    fn inactive_or_missing_patch_state_is_explained_without_blocking_mcp() {
+        let p:Project=serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":{"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]}})).unwrap();
+        for (active, expected) in [
+            (Some(false), "실행을 재개한 후 승인"),
+            (None, "에이전트 상태 확인 필요"),
+        ] {
+            let mut r = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":[],"pending":{"id":"id","tool":"patch","arguments":{},"call_id":"call"}});
+            if let Some(value) = active {
+                r["agent_active"] = value.into();
+            }
+            let out =
+                eframe::egui::Context::default().run(eframe::egui::RawInput::default(), |ctx| {
+                    eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                        render(ui, &p, &r, "r", false);
+                    });
+                });
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,eframe::egui::epaint::Shape::Text(t) if t.galley.job.text.contains(expected))),"{expected}");
+        }
+    }
+}
+#[cfg(test)]
+mod bound_shape_tests {
+    use super::*;
+    #[test]
+    fn bound_unbound_and_unknown_call_identity_are_distinct() {
+        let mut p = Pending {
+            id: "i".into(),
+            tool: "patch".into(),
+            arguments: serde_json::json!({}),
+            call_id: serde_json::Value::Null,
+            raw: serde_json::json!({"call_id":null}),
+        };
+        assert!(tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":false})
+        ));
+        p.raw = serde_json::json!({"call_id":"call"});
+        assert!(!tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":false})
+        ));
+        assert!(tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":true})
+        ));
+        p.raw = serde_json::json!({});
+        assert!(!tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":true})
+        ));
+        p.raw = serde_json::json!({"call_id":42});
+        assert!(!tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":true})
+        ));
+        p.raw = serde_json::json!({"call_id":""});
+        assert!(!tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":true})
+        ));
+        p.tool = "mcp".into();
+        assert!(tool_active_permitted(
+            &p,
+            &serde_json::json!({"agent_active":false})
+        ));
     }
 }

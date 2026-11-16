@@ -2,6 +2,36 @@ use crate::{err, runs, Engine};
 use domain::ResponseData;
 use std::sync::Arc;
 
+type AuthStamp = (String, (String, Option<String>), Option<(String, bool)>);
+
+// 2026-11-16: 승인 실행의 프로젝트와 정확히 같은 MCP 주소에만 세대가 결박된 토큰을 사용한다.
+fn run_auth(
+    engine: &Engine,
+    run_id: &str,
+    target: &str,
+) -> Result<(Option<AuthStamp>, Option<domain::SecretString>), String> {
+    let _gate = engine
+        .mutation_gate
+        .lock()
+        .map_err(|_| "OAuth state unavailable")?;
+    let db = engine.db.get().ok_or("storage unavailable")?;
+    let run = runs::get(&db, run_id)?;
+    let project = run["project_id"]
+        .as_str()
+        .ok_or("invalid run project")?
+        .to_owned();
+    let endpoint = match crate::mcp_connections::endpoint(&db, &project) {
+        Ok(endpoint) => endpoint,
+        Err(error) if error == "MCP not configured" => return Ok((None, None)),
+        Err(error) => return Err(error),
+    };
+    if endpoint.0 != target {
+        return Ok((None, None));
+    }
+    let (stamp, token) = crate::mcp_oauth::authentication(engine, &project, &endpoint)?;
+    Ok((Some((project, endpoint, stamp)), token))
+}
+
 struct CancellationLease {
     engine: Arc<Engine>,
     run_id: String,
@@ -82,9 +112,19 @@ pub(crate) async fn call(
             let name=request["name"].as_str().ok_or("invalid tool name")?;
             let arguments=request.get("arguments").cloned().ok_or("invalid arguments")?;
             let cwd=request["cwd"].as_str().ok_or("invalid cwd")?;
-            let client=integrations::mcp::McpClient::connect_cancelable(endpoint, token.as_ref().clone()).await?;
+            let e=engine.clone();let r=run_id.clone();let target=endpoint.to_owned();
+            let (auth_stamp, credential)=tokio::task::spawn_blocking(move || run_auth(&e,&r,&target)).await.map_err(err)??;
+            let client=match credential {
+                Some(credential) => tokio::select! { biased; _ = token.cancelled() => return Err("MCP connection cancelled".into()), result = integrations::mcp::McpClient::connect_authenticated(endpoint,credential.0.clone()) => result? },
+                None => integrations::mcp::McpClient::connect_cancelable(endpoint, token.as_ref().clone()).await?,
+            };
             let tools=client.list_tools_cancelable(token.as_ref().clone()).await?;
             let schema=tools.iter().find(|tool|tool["name"].as_str()==Some(name)).and_then(|tool|tool.get("inputSchema")).ok_or("MCP tool schema missing")?;
+            if auth_stamp.is_some() {
+                let e=engine.clone();let r=run_id.clone();let target=endpoint.to_owned();
+                let (current, _)=tokio::task::spawn_blocking(move || run_auth(&e,&r,&target)).await.map_err(err)??;
+                if current != auth_stamp { return Err("MCP endpoint or authentication changed".into()); }
+            }
             let authorization=integrations::mcp::CallAuthorization::Approved{name:name.into(),arguments:arguments.clone(),cwd:cwd.into()};
             let output=client.call_tool_cancelable(name,arguments,schema,cwd,&authorization,token.as_ref().clone()).await?;
             Ok(ResponseData::Data(serde_json::json!({"content":output.content,"structured_content":output.structured_content,"is_error":output.is_error})))

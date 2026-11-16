@@ -230,9 +230,11 @@ mod tests {
         assert!(dir_journal.join(format!("{run_id}.json")).exists());
         broken.store(false, Ordering::SeqCst);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: slot,
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: dir.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -376,6 +378,7 @@ mod tests {
             Arc::clone(&gate),
         );
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -384,6 +387,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let invoke = |command| {
@@ -549,6 +553,7 @@ mod tests {
             Arc::clone(&gate),
         );
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -557,6 +562,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let project = match engine
@@ -674,6 +680,7 @@ mod tests {
             crate::completion::CompletionManager::empty(journal.clone(), Arc::clone(&gate));
         manager.register(&db, &id, &project, Ok(()));
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -682,6 +689,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -745,6 +753,7 @@ mod tests {
         let gate = Arc::new(std::sync::Mutex::new(()));
         let manager = crate::completion::CompletionManager::load(&dir, Arc::clone(&gate)).unwrap();
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::empty(path.clone()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -753,6 +762,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let retry = engine
@@ -930,6 +940,7 @@ mod tests {
         let slot = crate::open_existing_storage(path.clone(), db, &manager)
             .expect("I/O failure must preserve a diagnostic engine");
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: slot,
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -938,6 +949,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(true),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let status = engine
@@ -1128,9 +1140,11 @@ mod tests {
         assert_eq!(status["failures"][0]["journaled"], true);
         broken.store(false, Ordering::SeqCst);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: slot,
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1228,12 +1242,14 @@ mod tests {
         let gate = Arc::new(std::sync::Mutex::new(()));
         let journal = root.join("state.redb.completion-journal");
         let engine = Arc::new(crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(crate::completion::CompletionManager::empty(
                 journal.clone(),
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1523,12 +1539,14 @@ mod tests {
         let gate = Arc::new(std::sync::Mutex::new(()));
         let journal = root.join("state.redb.completion-journal");
         let engine = Arc::new(crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(crate::completion::CompletionManager::empty(
                 journal.clone(),
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1745,12 +1763,14 @@ mod tests {
         let gate = Arc::new(std::sync::Mutex::new(()));
         let journal = root.join("state.redb.completion-journal");
         let engine = Arc::new(crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(crate::completion::CompletionManager::empty(
                 journal.clone(),
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1925,12 +1945,14 @@ mod tests {
         let gate = Arc::new(std::sync::Mutex::new(()));
         let journal = root.join("state.redb.completion-journal");
         let engine = Arc::new(crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(crate::completion::CompletionManager::empty(
                 journal.clone(),
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2123,9 +2145,11 @@ mod tests {
             Arc::clone(&gate),
         );
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2246,9 +2270,11 @@ mod tests {
             Arc::clone(&gate),
         );
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2354,9 +2380,11 @@ mod tests {
             Arc::clone(&gate),
         );
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
