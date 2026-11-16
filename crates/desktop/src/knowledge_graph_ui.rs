@@ -42,6 +42,10 @@ pub(crate) struct State {
     pub page_request: u64,
     pub pages: std::collections::HashMap<String, Page>,
     selected: std::collections::HashMap<String, Node>,
+    pub source_request: u64,
+    pub source_intent: Option<(String, u64)>,
+    source: Option<(String, u64, serde_json::Value)>,
+    pub source_error: Option<String>,
     canvas: std::collections::HashMap<String, Canvas>,
 }
 struct Canvas {
@@ -57,8 +61,52 @@ impl Default for Canvas {
     }
 }
 impl State {
+    fn select_node(&mut self, project: &str, node: Node) {
+        self.invalidate_source();
+        if let Node::Document(id, version) = &node {
+            self.source_intent = Some((id.clone(), *version));
+        }
+        self.selected.insert(project.into(), node);
+    }
+    pub fn apply_source(
+        &mut self,
+        project: &str,
+        epoch: u64,
+        request: u64,
+        id: &str,
+        version: u64,
+        result: Result<serde_json::Value, String>,
+    ) {
+        if self.active.as_deref() != Some(project)
+            || self.epoch != epoch
+            || self.source_request != request
+            || self.selected.get(project) != Some(&Node::Document(id.into(), version))
+        {
+            return;
+        }
+        match result {
+            Ok(doc)
+                if doc["id"] == id
+                    && doc["version"].as_u64().is_some()
+                    && doc["source"].as_str().is_some()
+                    && doc["text"].as_str().is_some() =>
+            {
+                self.source = Some((id.into(), version, doc));
+                self.source_error = None;
+            }
+            Err(error) => self.source_error = Some(format!("원문 조회 실패: {error}")),
+            _ => self.source_error = Some("원문 응답이 올바르지 않습니다.".into()),
+        }
+    }
+    pub fn invalidate_source(&mut self) {
+        self.source_request = self.source_request.wrapping_add(1);
+        self.source_intent = None;
+        self.source = None;
+        self.source_error = None;
+    }
     pub fn select(&mut self, id: &str) {
         if self.active.as_deref() != Some(id) {
+            self.invalidate_source();
             self.active = Some(id.into());
             self.epoch = self.epoch.wrapping_add(1);
         }
@@ -68,6 +116,8 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
     ui.heading("지식 출처 관계");
     let page = state.pages.entry(project_id.into()).or_default();
     let mut action = ui.button("출처 관계 불러오기").clicked().then_some(0);
+    let mut clicked_node = None;
+    let mut clear_source = false;
     if let Some(error) = &page.error {
         ui.label(error);
     }
@@ -78,6 +128,7 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
             .is_some_and(|node| !page.nodes().contains(node))
         {
             state.selected.remove(project_id);
+            clear_source = true;
         }
         ui.label(format!(
             "현재 페이지: {}부터 (전체 건수 미제공)",
@@ -159,7 +210,7 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
                         )
                         .clicked()
                 {
-                    state.selected.insert(project_id.into(), node);
+                    clicked_node = Some(node);
                 }
             }
         }
@@ -177,7 +228,7 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
                         .selectable_label(state.selected.get(project_id) == Some(&node), label)
                         .clicked()
                     {
-                        state.selected.insert(project_id.into(), node);
+                        clicked_node = Some(node);
                     }
                 }
             });
@@ -196,6 +247,42 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
                 edge.source, edge.document_id, edge.document_version
             ));
         }
+        if let Some((id, edge_version, doc)) = state
+            .source
+            .as_ref()
+            .filter(|_| !clear_source && clicked_node.is_none())
+        {
+            ui.label(format!(
+                "선택 관계: {id} (v{edge_version}) / 현재 원문 버전: {}",
+                doc["version"]
+            ));
+            if doc["version"].as_u64() != Some(*edge_version) {
+                ui.label("현재 원문 버전이 선택한 관계의 버전과 다릅니다.");
+            }
+            ui.label(format!(
+                "현재 출처: {}",
+                doc["source"].as_str().unwrap_or("")
+            ));
+            ui.label("현재 원문");
+            let lines: Vec<_> = doc["text"].as_str().unwrap_or("").split('\n').collect();
+            egui::ScrollArea::vertical()
+                .id_salt("graph_current_source")
+                .max_height(240.0)
+                .show_rows(ui, 20.0, lines.len(), |ui, range| {
+                    for i in range {
+                        ui.label(lines[i]);
+                    }
+                });
+        }
+        if let Some(error) = &state.source_error {
+            ui.label(error);
+        }
+    }
+    if clear_source {
+        state.invalidate_source();
+    }
+    if let Some(node) = clicked_node {
+        state.select_node(project_id, node);
     }
     action
 }
@@ -258,6 +345,132 @@ impl Page {
 #[cfg(test)]
 mod node_tests {
     use super::*;
+    #[test]
+    fn selected_graph_document_sends_explicit_source_request_and_preserves_errors() {
+        for capacity in [0, 1] {
+            let (tx, work) = std::sync::mpsc::sync_channel(capacity);
+            let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+            let mut app = crate::App {
+                state: crate::State {
+                    selected: Some("a".into()),
+                    ..Default::default()
+                },
+                tx,
+                rx,
+                cancel_startup: Default::default(),
+            };
+            app.state.graph.select("a");
+            app.state
+                .graph
+                .select_node("a", Node::Document("doc".into(), 2));
+            app.request_graph_source("a");
+            if capacity == 0 {
+                assert!(app.state.graph.source_error.is_some());
+            } else {
+                let sent = work
+                    .try_recv()
+                    .expect("explicit selection must request source");
+                assert!(
+                    matches!(&sent.command,domain::Command::GetKnowledgeSource{project_id,document_id} if project_id=="a" && document_id=="doc")
+                );
+                app.apply(crate::worker::Reply{kind:sent.kind,result:Ok(domain::ResponseData::Data(serde_json::json!({"id":"doc","version":3,"source":"current","text":"line 1\nline 2"})))});
+                assert_eq!(app.state.graph.source.as_ref().unwrap().2["version"], 3);
+            }
+        }
+    }
+    #[test]
+    fn selected_document_requests_exact_id_and_stale_reply_cannot_overwrite_new_selection() {
+        let mut s = State::default();
+        s.select("a");
+        s.select_node("a", Node::Document("doc".into(), 1));
+        assert_eq!(s.source_intent, Some(("doc".into(), 1)));
+        let old = s.source_request;
+        let epoch = s.epoch;
+        s.select_node("a", Node::Document("doc".into(), 2));
+        s.apply_source(
+            "a",
+            epoch,
+            old,
+            "doc",
+            1,
+            Ok(serde_json::json!({"id":"doc","version":1,"source":"old","text":"old"})),
+        );
+        assert!(s.source.is_none());
+        let current = s.source_request;
+        s.apply_source(
+            "a",
+            epoch,
+            current,
+            "doc",
+            2,
+            Ok(serde_json::json!({"id":"doc","version":3,"source":"current","text":"new\nline"})),
+        );
+        assert_eq!(s.source.as_ref().unwrap().2["version"], 3);
+        assert_eq!(s.source.as_ref().unwrap().1, 2);
+        s.select("b");
+        s.select("a");
+        assert!(s.source.is_none());
+    }
+    #[test]
+    fn current_source_version_is_distinguished_from_selected_edge_version() {
+        let mut s = State::default();
+        s.select("a");
+        s.pages.insert(
+            "a".into(),
+            Page {
+                loaded: true,
+                edges: vec![Edge {
+                    source: "origin".into(),
+                    document_id: "doc".into(),
+                    document_version: 2,
+                }],
+                ..Default::default()
+            },
+        );
+        s.select_node("a", Node::Document("doc".into(), 2));
+        s.apply_source("a",s.epoch,s.source_request,"doc",2,Ok(serde_json::json!({"id":"doc","version":3,"source":"current source","text":"first\nsecond"})));
+        let out = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &mut s, "a");
+            });
+        });
+        let labels: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for text in [
+            "선택 관계: doc (v2)",
+            "현재 원문 버전: 3",
+            "버전과 다릅니다",
+            "current source",
+            "first",
+            "second",
+        ] {
+            assert!(labels.iter().any(|s| s.contains(text)), "{text}");
+        }
+    }
+    #[test]
+    fn changing_to_source_node_or_page_invalidates_old_document_reply() {
+        let mut s = State::default();
+        s.select("a");
+        s.select_node("a", Node::Document("doc".into(), 1));
+        assert_eq!(s.source_intent, Some(("doc".into(), 1)));
+        let old = s.source_request;
+        let epoch = s.epoch;
+        s.select_node("a", Node::Source("src".into()));
+        assert!(s.source_intent.is_none());
+        s.apply_source("a", epoch, old, "doc", 1, Err("old".into()));
+        assert!(s.source_error.is_none());
+        s.select_node("a", Node::Document("doc".into(), 1));
+        let old = s.source_request;
+        s.invalidate_source();
+        s.apply_source("a", epoch, old, "doc", 1, Err("old".into()));
+        assert!(s.source_error.is_none());
+    }
     #[test]
     fn graph_page_renders_interactive_canvas_with_original_navigation_hint() {
         let ctx = egui::Context::default();

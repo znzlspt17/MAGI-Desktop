@@ -7,6 +7,13 @@ use std::sync::{
 };
 
 pub enum Kind {
+    GraphSource {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        document_id: String,
+        version: u64,
+    },
     McpOAuth {
         project_id: String,
         epoch: u64,
