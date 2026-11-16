@@ -425,7 +425,8 @@ mod tests {
         assert_eq!(evidence.requirement_ids, vec!["requirement-0"]);
         assert_eq!(evidence.acceptance_ids, vec!["acceptance-0"]);
         assert_eq!(
-            crate::runs::get(&db, &run_id).unwrap()["evidence_contexts"]["verify-1"],
+            crate::runs::get(&db, &run_id).unwrap()["evidence_contexts_by_attempt"]["1"]
+                ["verify-1"],
             serde_json::json!({"schema_version":1,"spec_version":1,"context_version":2,"agent_attempt":1,"task_id":"task"})
         );
         assert_eq!(

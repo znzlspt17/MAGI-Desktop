@@ -8,6 +8,75 @@ fn checkpoint_has_inflight(value: &serde_json::Value) -> bool {
             .as_object()
             .is_some_and(|states| states.values().any(checkpoint_has_inflight))
 }
+
+// 2026-11-16: 미소모 patch 승인만 체크포인트 커서·인자·ledger와 결박해 재개한다.
+fn waiting_checkpoint_call(
+    run: &serde_json::Value,
+    saved: &crate::agent_loop::LoopCheckpoint,
+    spec: &domain::ApprovedSpec,
+) -> Result<(String, String, String, String, String), String> {
+    use sha2::{Digest, Sha256};
+    if run["status"] != "awaiting_approval"
+        || run["pending"]["tool"] != "patch"
+        || run["pending"]["authorized"] != false
+    {
+        return Err("pending approval cannot resume safely".into());
+    }
+    let expected = run["pending"]["call_id"]
+        .as_str()
+        .ok_or("pending call missing")?;
+    let approval = run["pending"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("pending approval missing")?;
+    let ordered = crate::agent_loop::validate_plan(spec)?;
+    let states: Vec<(String, &crate::agent_loop::LoopCheckpoint)> = if saved.schema_version == 1 {
+        vec![(
+            ordered
+                .get(saved.task_index)
+                .ok_or("checkpoint task missing")?
+                .clone(),
+            saved,
+        )]
+    } else {
+        saved
+            .task_states
+            .iter()
+            .map(|(id, state)| (id.clone(), state.as_ref()))
+            .collect()
+    };
+    let mut found = None;
+    for (task, state) in states {
+        let Some(call) = state.pending_calls.get(state.pending_index) else {
+            continue;
+        };
+        let role = match state.role_index {
+            0 => "coordinator",
+            1 => "implementer",
+            2 => "reviewer",
+            _ => return Err("invalid checkpoint role".into()),
+        };
+        let logical = serde_json::to_string(&(&task, role, state.round, &call.call_id))
+            .map_err(|_| "invalid call identity")?;
+        if logical != expected {
+            continue;
+        }
+        if found.is_some() || call.name != "patch" || call.arguments != run["pending"]["arguments"]
+        {
+            return Err("pending call mismatch".into());
+        }
+        let identity = serde_json::to_vec(&(role, &task, "patch", &call.arguments))
+            .map_err(|_| "invalid call identity")?;
+        found = Some((
+            logical,
+            approval.to_owned(),
+            format!("{:x}", Sha256::digest(identity)),
+            role.to_owned(),
+            task,
+        ));
+    }
+    found.ok_or("pending checkpoint mismatch".into())
+}
 // 2026-11-16: 시작 호출이 연결되기 전 CAS 경계를 독립적으로 검증한다.
 pub(crate) fn begin_agent(
     db: &Database,
@@ -46,10 +115,12 @@ fn begin_agent_inner(
     normalize_run(&mut run)?;
     if &run != expected
         || (run["status"] != "awaiting_implementation"
-            && !(resume.is_some() && run["status"] == "interrupted"))
+            && !(resume.is_some()
+                && (run["status"] == "interrupted" || run["status"] == "awaiting_approval")))
         || run["agent_active"] != false
         || (resume.is_some() && run["resources_unknown"] == true)
-        || !run["pending"].is_null()
+        || (!run["pending"].is_null()
+            && !(resume.is_some() && run["status"] == "awaiting_approval"))
     {
         return Err("run not ready for agent".into());
     }
@@ -106,12 +177,37 @@ fn begin_agent_inner(
         {
             return Err("checkpoint does not match run configuration".into());
         }
-        if run["evidence"]
-            .as_array()
-            .is_none_or(|evidence| !evidence.is_empty())
-        {
-            return Err("previous attempt evidence cannot be reused safely".into());
+        for item in run["evidence"].as_array().ok_or("invalid evidence")? {
+            let id = item["verification_id"]
+                .as_str()
+                .ok_or("invalid verification id")?;
+            let (attempt, _) = crate::evidence::context(&run, item)?;
+            crate::evidence::resolve(&run, id, attempt)?.ok_or("invalid evidence")?;
         }
+        let waiting = if run["status"] == "awaiting_approval" {
+            let waiting = waiting_checkpoint_call(&run, &saved, spec)?;
+            validate_bound_patch(
+                &tx,
+                &run,
+                &waiting.3,
+                &waiting.4,
+                &run["pending"]["arguments"],
+                false,
+            )?;
+            if run["used_calls"]
+                .as_array()
+                .ok_or("invalid calls")?
+                .iter()
+                .filter(|id| id.as_str() == Some(waiting.0.as_str()))
+                .count()
+                != 1
+            {
+                return Err("pending call mismatch".into());
+            }
+            Some(waiting)
+        } else {
+            None
+        };
         let calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
         let prefix = format!("{id}:");
         for item in calls.iter().map_err(|e| e.to_string())? {
@@ -119,8 +215,18 @@ fn begin_agent_inner(
             if key.value().starts_with(&prefix) {
                 let record: serde_json::Value =
                     serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
-                if key.value() == format!("{id}:final-review") {
-                    return Err("previous review cannot be reused safely".into());
+                if let Some((logical, approval, hash, role, task)) = &waiting {
+                    if key.value() == format!("{id}:{logical}") {
+                        if record["status"] != "waiting"
+                            || record["approval_id"] != *approval
+                            || record["hash"] != *hash
+                            || record["role"] != *role
+                            || record["task_id"] != *task
+                        {
+                            return Err("pending call mismatch".into());
+                        }
+                        continue;
+                    }
                 }
                 if record["status"] != "completed" || record.get("result").is_none() {
                     return Err("previous tool outcome uncertain".into());
@@ -136,11 +242,26 @@ fn begin_agent_inner(
                 .ok_or("previous tool outcome uncertain")?;
             let record: serde_json::Value =
                 serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
+            if let Some((logical, approval, hash, role, task)) = &waiting {
+                if call_id == logical {
+                    if record["status"] != "waiting"
+                        || record["approval_id"] != *approval
+                        || record["hash"] != *hash
+                        || record["role"] != *role
+                        || record["task_id"] != *task
+                    {
+                        return Err("pending call mismatch".into());
+                    }
+                    continue;
+                }
+            }
             if record["status"] != "completed" || record.get("result").is_none() {
                 return Err("previous tool outcome uncertain".into());
             }
         }
-        run["status"] = "awaiting_implementation".into();
+        if waiting.is_none() {
+            run["status"] = "awaiting_implementation".into();
+        }
     }
     let attempt = run["agent_attempt"]
         .as_u64()
@@ -211,14 +332,18 @@ pub(crate) fn record_verification(
         if cancel.is_cancelled() {
             return Err("cancelled".into());
         }
-        let items = run["evidence"].as_array_mut().ok_or("invalid evidence")?;
-        if items
-            .iter()
-            .any(|item| item["verification_id"] == evidence.verification_id)
-        {
+        let attempt = run["agent_attempt"]
+            .as_u64()
+            .ok_or("invalid agent attempt")?;
+        if crate::evidence::resolve(&run, &evidence.verification_id, attempt)?.is_some() {
             return Err("duplicate verification id".into());
         }
-        items.push(serde_json::to_value(evidence).map_err(|_| "invalid evidence")?);
+        let mut row = serde_json::to_value(evidence).map_err(|_| "invalid evidence")?;
+        row["agent_attempt"] = attempt.into();
+        run["evidence"]
+            .as_array_mut()
+            .ok_or("invalid evidence")?
+            .push(row);
         let context = serde_json::json!({
             "schema_version": 1,
             "spec_version": run["spec_version"].as_u64().ok_or("invalid spec version")?,
@@ -229,7 +354,12 @@ pub(crate) fn record_verification(
         let contexts = run
             .as_object_mut()
             .ok_or("invalid run")?
-            .entry("evidence_contexts")
+            .entry("evidence_contexts_by_attempt")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("invalid evidence contexts")?;
+        let contexts = contexts
+            .entry(attempt.to_string())
             .or_insert_with(|| serde_json::json!({}))
             .as_object_mut()
             .ok_or("invalid evidence contexts")?;
@@ -293,6 +423,10 @@ fn append_event(
     kind: &str,
     message: &str,
 ) -> Result<(), String> {
+    let attempt = run["agent_attempt"]
+        .as_u64()
+        .filter(|attempt| *attempt > 0)
+        .unwrap_or(1);
     let events = run["events"].as_array_mut().ok_or("invalid run events")?;
     let sequence = events.last().map_or(Ok(1), |event| {
         event["sequence"]
@@ -300,7 +434,7 @@ fn append_event(
             .and_then(|v| v.checked_add(1))
             .ok_or("invalid event sequence")
     })?;
-    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":1,"kind":kind,"message":message}));
+    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":attempt,"kind":kind,"message":message}));
     Ok(())
 }
 
@@ -1781,6 +1915,81 @@ fn create_checked(_run: &PatchRun, _path: &Path, _content: &str) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_identity_is_scoped_to_actual_attempt() {
+        let root =
+            std::env::temp_dir().join(format!("magi-evidence-attempt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let engine = crate::Engine::open(&root.join("state.redb")).unwrap();
+        let project = match engine
+            .handle(domain::Request {
+                id: "create".into(),
+                command: domain::Command::CreateProject {
+                    name: "fixture".into(),
+                    path: "fixture".into(),
+                },
+            })
+            .result
+            .unwrap()
+        {
+            domain::ResponseData::Project(p) => p,
+            _ => panic!("project"),
+        };
+        let db = engine.db.get().unwrap();
+        let evidence: domain::VerificationEvidence = serde_json::from_value(serde_json::json!({"verification_id":"verify","revision":"fixture-revision","spec_hash":"fixture-spec","command":"fixture-command","passed":true,"output":"fixture-output","worktree_hash":"fixture-snapshot","requirement_ids":[],"acceptance_ids":[]})).unwrap();
+        let old = serde_json::to_value(&evidence).unwrap();
+        let old_context = serde_json::json!({"schema_version":1,"spec_version":1,"context_version":0,"agent_attempt":1,"task_id":"task"});
+        let run = serde_json::json!({"id":"run","project_id":project.id,"status":"awaiting_implementation","spec_version":1,"context_version":0,"agent_attempt":2,"evidence":[old],"evidence_contexts":{"verify":old_context}});
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(RUNS)
+                .unwrap()
+                .insert("run", run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let expected = get(&db, "run").unwrap();
+        record_verification(
+            &db,
+            "run",
+            &expected,
+            &project,
+            &evidence,
+            "task",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let saved = get(&db, "run").unwrap();
+        assert_eq!(saved["evidence"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["evidence"][0], old);
+        assert_eq!(saved["evidence_contexts"]["verify"], old_context);
+        assert!(record_verification(
+            &db,
+            "run",
+            &saved,
+            &project,
+            &evidence,
+            "task",
+            &tokio_util::sync::CancellationToken::new()
+        )
+        .is_err());
+        drop(db);
+        drop(engine);
+        let reopened = crate::Engine::open(&root.join("state.redb")).unwrap();
+        let db = reopened.db.get().unwrap();
+        let saved = get(&db, "run").unwrap();
+        assert!(crate::evidence::resolve(&saved, "verify", 1)
+            .unwrap()
+            .is_some());
+        assert!(crate::evidence::resolve(&saved, "verify", 2)
+            .unwrap()
+            .is_some());
+        drop(db);
+        drop(reopened);
+        let _ = std::fs::remove_file(root.join("state.redb"));
+        let _ = std::fs::remove_dir(root);
+    }
 
     #[cfg(windows)]
     #[test]

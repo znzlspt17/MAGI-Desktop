@@ -698,13 +698,14 @@ async fn final_review(
         let engine = std::sync::Arc::clone(engine);
         let id = run_id.to_owned();
         let hash = digest.clone();
+        let call_id = crate::agent_completion::review_call_id(attempt);
         tokio::task::spawn_blocking(move || {
             let _gate = engine
                 .mutation_gate
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let db = engine.db.get().ok_or("storage unavailable")?;
-            crate::runs::claim_call(&db, &id, "final-review", &hash)
+            crate::runs::claim_call(&db, &id, &call_id, &hash)
         })
         .await
         .map_err(|_| "review claim worker failed")??
@@ -768,6 +769,7 @@ async fn final_review(
     runtime.fresh(spec).await?;
     let engine = std::sync::Arc::clone(engine);
     let id = run_id.to_owned();
+    let call_id = crate::agent_completion::review_call_id(attempt);
     tokio::task::spawn_blocking(move || {
         let _gate = engine
             .mutation_gate
@@ -777,7 +779,7 @@ async fn final_review(
         crate::runs::complete_call(
             &db,
             &id,
-            "final-review",
+            &call_id,
             serde_json::json!({"approved":true,"binding":binding}),
         )
     })
@@ -1070,7 +1072,7 @@ mod tests {
         assert!(
             crate::runs::begin_resume(&db, "run", &old_evidence, "model", "config")
                 .unwrap_err()
-                .contains("evidence")
+                .contains("verification id")
         );
         let tx = db.begin_write().unwrap();
         {
@@ -1428,6 +1430,11 @@ mod tests {
         resumed_run["id"] = "resumable".into();
         resumed_run["status"] = "interrupted".into();
         resumed_run["agent_attempt"] = 1.into();
+        let logical_id = serde_json::to_string(&("task", "final_validation", 0)).unwrap();
+        let old_row = serde_json::json!({"revision":revision,"spec_hash":"fixture","command":"read_contains:src/a.txt:after","passed":true,"output":"old fixture","verification_id":logical_id,"worktree_hash":"old-snapshot","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]});
+        let old_context = serde_json::json!({"schema_version":1,"spec_version":1,"context_version":2,"agent_attempt":1,"task_id":"task"});
+        resumed_run["evidence"] = serde_json::json!([old_row]);
+        resumed_run["evidence_contexts"] = serde_json::json!({logical_id.clone():old_context});
         let tx = db.begin_write().unwrap();
         {
             tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
@@ -1464,6 +1471,104 @@ mod tests {
         assert_eq!(resumed_run["status"], "completed", "{resumed_run}");
         assert_eq!(resumed_run["agent_attempt"], 2);
         assert_eq!(resumed_run["events"][0]["attempt"], 2);
+        assert_eq!(resumed_run["evidence"][0], old_row);
+        assert_eq!(resumed_run["evidence_contexts"][&logical_id], old_context);
+        let (new_row, context) = crate::evidence::resolve(&resumed_run, &logical_id, 2)
+            .unwrap()
+            .expect("fresh verification missing");
+        assert_eq!(new_row["agent_attempt"], 2);
+        assert_eq!(context["agent_attempt"], 2);
+        let mut waiting_run = before_resume.clone();
+        waiting_run["id"] = "waiting-resume".into();
+        waiting_run["agent_active"] = true.into();
+        waiting_run["agent_attempt"] = 1.into();
+        waiting_run["autonomy_mode"] = "step".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("waiting-resume", waiting_run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let call_id = serde_json::to_string(&("task", "implementer", 0, "patch")).unwrap();
+        let args = serde_json::json!({"path":"src/pending.txt","content":"approved"});
+        let waiting = crate::runs::submit_bound_patch(
+            &db,
+            "waiting-resume",
+            "implementer",
+            "task",
+            &call_id,
+            args.clone(),
+        )
+        .unwrap();
+        let approval = waiting["approval_id"].as_str().unwrap().to_owned();
+        let mut waiting_run = crate::runs::get(&db, "waiting-resume").unwrap();
+        waiting_run["agent_active"] = false.into();
+        let mut waiting_checkpoint = checkpoint.clone();
+        waiting_checkpoint["role_index"] = 1.into();
+        waiting_checkpoint["pending_calls"] =
+            serde_json::json!([{"call_id":"patch","name":"patch","arguments":args}]);
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("waiting-resume", waiting_run.to_string().as_str())
+                .unwrap();
+        }
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert("waiting-resume", waiting_checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let response = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "resume-waiting".into(),
+                command: domain::Command::ResumeAgent {
+                    run_id: "waiting-resume".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        assert!(!work.join("src/pending.txt").exists());
+        let denied = engine.handle(domain::Request {
+            id: "wrong-approval".into(),
+            command: domain::Command::ApproveTool {
+                run_id: "waiting-resume".into(),
+                approval_id: "wrong".into(),
+                approved: true,
+            },
+        });
+        assert!(denied.result.is_err());
+        assert!(!work.join("src/pending.txt").exists());
+        let accepted = engine.handle(domain::Request {
+            id: "approve".into(),
+            command: domain::Command::ApproveTool {
+                run_id: "waiting-resume".into(),
+                approval_id: approval,
+                approved: true,
+            },
+        });
+        assert!(accepted.result.is_ok(), "{:?}", accepted.result);
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/pending.txt")).unwrap(),
+            "approved"
+        );
+        let _ = engine.handle(domain::Request {
+            id: "cancel".into(),
+            command: domain::Command::CancelRun {
+                run_id: "waiting-resume".into(),
+            },
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while engine.slots.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::remove_file(work.join("src/pending.txt")).unwrap();
         std::fs::write(work.join("src/a.txt"), "before").unwrap();
         let mut unsupported = project.clone();
         unsupported["approved"]["tasks"][0]["validation"] = serde_json::json!(["exec_json:{}"]);

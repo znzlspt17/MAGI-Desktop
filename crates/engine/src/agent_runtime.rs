@@ -526,21 +526,12 @@ impl Runtime {
             if run["status"] != "awaiting_implementation" {
                 return Err("run not ready".into());
             }
-            let all = run["evidence"].as_array().ok_or("invalid evidence")?;
-            let matches: Vec<_> = all
-                .iter()
-                .filter(|v| v["verification_id"].as_str() == Some(id.as_str()))
-                .collect();
-            let context = run["evidence_contexts"].get(&id);
-            if matches.is_empty() && context.is_none() {
+            let Some((row, context)) = crate::evidence::resolve(&run, &id, identity.attempt)?
+            else {
                 return Ok(None);
-            }
-            if matches.len() != 1 {
-                return Err("invalid saved evidence".into());
-            }
-            let context = context.ok_or("invalid saved evidence context")?;
+            };
             let evidence: domain::VerificationEvidence =
-                serde_json::from_value(matches[0].clone()).map_err(|_| "invalid saved evidence")?;
+                serde_json::from_value(row.clone()).map_err(|_| "invalid saved evidence")?;
             let approved = spec
                 .tasks
                 .iter()
@@ -924,6 +915,180 @@ mod bridge_integration_tests {
         }
     }
     struct Model(AtomicUsize);
+
+    #[tokio::test]
+    async fn resume_waiting_patch_keeps_original_approval_and_runs_only_after_user_accepts() {
+        let fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let logical_id = serde_json::to_string(&("task", "implementer", 0, "patch-1")).unwrap();
+        let arguments = json!({"path":"src/new.txt","content":"fixture"});
+        let pending = runs::submit_bound_patch(
+            &db,
+            &fixture.run_id,
+            "implementer",
+            "task",
+            &logical_id,
+            arguments.clone(),
+        )
+        .unwrap();
+        let approval = pending["approval_id"].as_str().unwrap().to_owned();
+        let mut saved = runs::get(&db, &fixture.run_id).unwrap();
+        saved["agent_active"] = false.into();
+        let checkpoint = json!({"schema_version":1,"revision":1,"spec_hash":"fixture","spec_version":1,"model_identity":"model","config_hash":"config","task_index":0,"role_index":1,"round":0,"input":[],"pending_calls":[{"call_id":"patch-1","name":"patch","arguments":arguments}],"pending_index":0,"evidence":[],"completed_tasks":[],"used_calls":[],"tokens_used":0,"model_inflight":false,"role_complete":false,"validation_index":0,"reserved_tokens":0});
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), saved.to_string().as_str())
+                .unwrap();
+        }
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let saved = runs::get(&db, &fixture.run_id).unwrap();
+        let set_run = |value: &Value| {
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                    .unwrap()
+                    .insert(fixture.run_id.as_str(), value.to_string().as_str())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        };
+        for field in ["id", "call_id", "arguments"] {
+            let mut changed = saved.clone();
+            changed["pending"][field] = json!("mismatch");
+            set_run(&changed);
+            assert!(runs::begin_resume(&db, &fixture.run_id, &changed, "model", "config").is_err());
+        }
+        let mut unknown = saved.clone();
+        unknown["resources_unknown"] = true.into();
+        set_run(&unknown);
+        assert!(runs::begin_resume(&db, &fixture.run_id, &unknown, "model", "config").is_err());
+        set_run(&saved);
+        let key = format!("{}:{logical_id}", fixture.run_id);
+        let original_record: Value = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap();
+            serde_json::from_str(table.get(key.as_str()).unwrap().unwrap().value()).unwrap()
+        };
+        for invalid in ["planned", "uncertain", "completed"] {
+            let mut altered = original_record.clone();
+            altered["status"] = invalid.into();
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                    .unwrap()
+                    .insert(key.as_str(), altered.to_string().as_str())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            assert!(runs::begin_resume(&db, &fixture.run_id, &saved, "model", "config").is_err());
+        }
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap()
+                .insert(key.as_str(), original_record.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let mut wrong_checkpoint = checkpoint.clone();
+        wrong_checkpoint["pending_calls"][0]["arguments"]["content"] = "other".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(
+                    fixture.run_id.as_str(),
+                    wrong_checkpoint.to_string().as_str(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(runs::begin_resume(&db, &fixture.run_id, &saved, "model", "config").is_err());
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let db = db.clone();
+                let id = fixture.run_id.clone();
+                let expected = saved.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runs::begin_resume(&db, &id, &expected, "model", "config")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let mut results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter_map(Result::ok);
+        let resumed = results.next().expect("resume claim missing");
+        assert!(results.next().is_none());
+        assert_eq!(resumed["pending"]["id"], approval);
+        assert_eq!(resumed["agent_attempt"], 2);
+        assert!(!fixture.work.join("src/new.txt").exists());
+        let runtime = Runtime::new(
+            Arc::clone(&fixture.engine),
+            fixture.run_id.clone(),
+            fixture.spec.clone(),
+            2,
+            2,
+        );
+        let work = runtime.execute_durable(
+            "implementer",
+            &fixture.spec.tasks[0],
+            "patch",
+            &logical_id,
+            arguments,
+            CancellationToken::new(),
+        );
+        let approve = async {
+            tokio::task::yield_now().await;
+            assert!(!fixture.work.join("src/new.txt").exists());
+            fixture
+                .engine
+                .handle(domain::Request {
+                    id: "approve".into(),
+                    command: domain::Command::ApproveTool {
+                        run_id: fixture.run_id.clone(),
+                        approval_id: approval,
+                        approved: true,
+                    },
+                })
+                .result
+                .unwrap();
+        };
+        let (result, _) = tokio::join!(work, approve);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("src/new.txt")).unwrap(),
+            "fixture"
+        );
+        let after = runs::get(&db, &fixture.run_id).unwrap();
+        assert!(after["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "tool_started" && event["attempt"] == 2));
+    }
     impl ModelDriver for Model {
         async fn generate(
             &self,
@@ -1247,7 +1412,7 @@ mod bridge_integration_tests {
                 let v = table.get(fixture.run_id.as_str()).unwrap().unwrap();
                 serde_json::from_str(v.value()).unwrap()
             };
-            run["evidence_contexts"]["verification-1"]["agent_attempt"] = json!(2);
+            run["evidence_contexts_by_attempt"]["1"]["verification-1"]["agent_attempt"] = json!(2);
             table
                 .insert(fixture.run_id.as_str(), run.to_string().as_str())
                 .unwrap();
