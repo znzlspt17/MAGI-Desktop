@@ -12,6 +12,7 @@ mod knowledge_text_ui;
 mod mcp_connection_ui;
 mod model_settings;
 mod run_controls;
+mod run_diff_ui;
 mod run_history;
 mod spec_review;
 mod storage;
@@ -56,6 +57,7 @@ struct State {
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
     tool_pending: std::collections::HashSet<String>,
+    run_diff: run_diff_ui::State,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
 }
@@ -109,6 +111,33 @@ struct App {
 }
 
 impl App {
+    fn request_run_diff(&mut self, project: &str, run: &str) {
+        if self.state.selected.as_deref() != Some(project)
+            || self.state.history.project.as_deref() != Some(project)
+            || self.state.history.selected.as_deref() != Some(run)
+            || self.state.run_diff.project.as_deref() != Some(project)
+            || self.state.run_diff.run.as_deref() != Some(run)
+            || self.state.run_diff.pending
+        {
+            return;
+        }
+        let sequence = self.state.run_diff.sequence.wrapping_add(1);
+        if self.send(worker::Work::new(
+            worker::Kind::RunDiff {
+                project_id: project.into(),
+                run_id: run.into(),
+                selection: self.state.history.selection_request,
+                sequence,
+            },
+            Command::GetDiff { run_id: run.into() },
+        )) {
+            self.state.run_diff.sequence = sequence;
+            self.state.run_diff.pending = true;
+            self.state.run_diff.error = None;
+            self.state.run_diff.diff = None;
+        }
+    }
+
     fn answer_tool(&mut self, project: &Project, item: tool_approval_ui::Pending, approved: bool) {
         let Some(run_id) = self.state.history.selected.clone() else {
             return;
@@ -1193,6 +1222,38 @@ impl App {
                     ));
                 }
             }
+            Kind::RunDiff {
+                project_id,
+                run_id,
+                selection,
+                sequence,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.history.selection_request == selection
+                    && self.state.run_diff.project.as_deref() == Some(&project_id)
+                    && self.state.run_diff.run.as_deref() == Some(&run_id)
+                    && self.state.run_diff.sequence == sequence
+                {
+                    self.state.run_diff.pending = false;
+                    match reply.result {
+                        Ok(ResponseData::Data(data)) => match run_diff_ui::parse(&data) {
+                            Ok(diff) => {
+                                self.state.run_diff.diff = Some(diff);
+                                self.state.run_diff.error = None;
+                            }
+                            Err(error) => self.state.run_diff.error = Some(error),
+                        },
+                        Err(error) => {
+                            self.state.run_diff.error = Some(format!("변경 조회 실패: {error}"))
+                        }
+                        _ => {
+                            self.state.run_diff.error =
+                                Some("변경 조회 응답이 올바르지 않습니다.".into())
+                        }
+                    }
+                }
+            }
             Kind::ToolAnswer {
                 project_id,
                 run_id,
@@ -1667,6 +1728,22 @@ impl App {
                                 tool_approval_ui::render(ui, &project, &run, &run_id, busy)
                             {
                                 self.answer_tool(&project, item, approved);
+                            }
+                        }
+                        if let Some(run_id) = self.state.history.selected.clone() {
+                            self.state.run_diff.bind_selection(
+                                &project.id,
+                                &run_id,
+                                self.state.history.selection_request,
+                            );
+                            let detail = self
+                                .state
+                                .history
+                                .detail
+                                .as_ref()
+                                .filter(|d| d["id"] == run_id && d["project_id"] == project.id);
+                            if run_diff_ui::render(ui, &self.state.run_diff, detail) {
+                                self.request_run_diff(&project.id, &run_id);
                             }
                         }
                         if let Some(action) = run_history::render(ui, &self.state.history) {
@@ -6326,6 +6403,169 @@ mod tests {
         assert!(work.try_recv().is_err());
         assert!(!app.state.tool_pending.contains("r"));
         assert_eq!(app.state.history.detail.as_ref(), Some(&detail));
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn diff_only_requests_the_selected_run_on_explicit_action() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.run_diff.bind("a", "r");
+        app.request_run_diff("a", "other");
+        assert!(work.try_recv().is_err());
+        app.request_run_diff("a", "r");
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetDiff{run_id} if run_id=="r"));
+        app.request_run_diff("a", "r");
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn diff_response_does_not_cross_project_or_run_reselection() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.run_diff.bind("a", "r");
+        app.request_run_diff("a", "r");
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.run_diff.bind("b", "s");
+        app.state.select("a");
+        app.state.history.selected = Some("r".into());
+        app.state.run_diff.bind("a", "r");
+        app.request_run_diff("a", "r");
+        let current = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: current.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"revision":"current","changes":[]}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Err("stale".into()),
+        });
+        assert_eq!(
+            app.state
+                .run_diff
+                .diff
+                .as_ref()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some("current")
+        );
+        assert!(app.state.run_diff.error.is_none());
+    }
+    #[test]
+    fn selected_run_shows_manual_diff_and_evidence_panel() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail =
+            Some(serde_json::json!({"id":"r","project_id":"a","evidence":[]}));
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="변경 조회")
+        ));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn requesting_new_diff_removes_previously_displayed_snapshot() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.run_diff.bind("a", "r");
+        app.state.run_diff.diff =
+            Some(run_diff_ui::parse(&serde_json::json!({"changes":[]})).unwrap());
+        app.request_run_diff("a", "r");
+        assert!(work.try_recv().is_ok());
+        assert!(app.state.run_diff.diff.is_none());
+    }
+    #[test]
+    fn diff_queue_full_preserves_previous_snapshot_and_reports_error() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.run_diff.bind("a", "r");
+        app.state.run_diff.diff =
+            Some(run_diff_ui::parse(&serde_json::json!({"revision":"old","changes":[]})).unwrap());
+        app.request_run_diff("a", "r");
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.run_diff.pending);
+        assert_eq!(
+            app.state
+                .run_diff
+                .diff
+                .as_ref()
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some("old")
+        );
         assert!(app.state.status.contains("대기열"));
     }
     #[test]

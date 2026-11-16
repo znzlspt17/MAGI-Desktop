@@ -16,9 +16,11 @@ fn waiting_checkpoint_call(
     spec: &domain::ApprovedSpec,
 ) -> Result<(String, String, String, String, String), String> {
     use sha2::{Digest, Sha256};
-    if run["status"] != "awaiting_approval"
-        || run["pending"]["tool"] != "patch"
-        || run["pending"]["authorized"] != false
+    if !((run["status"] == "awaiting_approval" && run["pending"]["authorized"] == false)
+        || (run["status"] == "approved_mcp"
+            && run["pending"]["tool"] == "mcp"
+            && run["pending"]["authorized"] == true))
+        || !["patch", "mcp"].contains(&run["pending"]["tool"].as_str().unwrap_or(""))
     {
         return Err("pending approval cannot resume safely".into());
     }
@@ -61,11 +63,13 @@ fn waiting_checkpoint_call(
         if logical != expected {
             continue;
         }
-        if found.is_some() || call.name != "patch" || call.arguments != run["pending"]["arguments"]
+        if found.is_some()
+            || call.name != run["pending"]["tool"]
+            || call.arguments != run["pending"]["arguments"]
         {
             return Err("pending call mismatch".into());
         }
-        let identity = serde_json::to_vec(&(role, &task, "patch", &call.arguments))
+        let identity = serde_json::to_vec(&(role, &task, call.name.as_str(), &call.arguments))
             .map_err(|_| "invalid call identity")?;
         found = Some((
             logical,
@@ -76,6 +80,21 @@ fn waiting_checkpoint_call(
         ));
     }
     found.ok_or("pending checkpoint mismatch".into())
+}
+
+#[cfg(test)]
+#[test]
+fn waiting_checkpoint_accepts_exact_mcp_call() {
+    let spec: domain::ApprovedSpec = serde_json::from_value(serde_json::json!({"version":1,"hash":"fixture","base_revision":"rev","scope":["src"],"requirements":["r"],"acceptance":["a"],"tasks":[{"id":"task","dependencies":[],"owned_paths":["src"],"validation":["read_contains:src/a:x"]}],"task_bindings":[{"task_id":"task","goal":"goal","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]}]})).unwrap();
+    let args = serde_json::json!({"endpoint":"http://127.0.0.1:1/mcp","name":"write","arguments":{},"cwd":".","side_effect":true});
+    let logical = serde_json::to_string(&("task", "implementer", 0, "mcp-1")).unwrap();
+    let run = serde_json::json!({"status":"awaiting_approval","pending":{"tool":"mcp","authorized":false,"id":"approval","call_id":logical,"arguments":args}});
+    let checkpoint:crate::agent_loop::LoopCheckpoint=serde_json::from_value(serde_json::json!({"schema_version":1,"revision":1,"spec_hash":"fixture","spec_version":1,"model_identity":"model","config_hash":"config","task_index":0,"role_index":1,"round":0,"input":[],"pending_calls":[{"call_id":"mcp-1","name":"mcp","arguments":args}],"pending_index":0,"evidence":[],"completed_tasks":[],"used_calls":[],"tokens_used":0,"model_inflight":false,"role_complete":false,"validation_index":0,"reserved_tokens":0})).unwrap();
+    assert!(waiting_checkpoint_call(&run, &checkpoint, &spec).is_ok());
+    let mut approved = run.clone();
+    approved["status"] = "approved_mcp".into();
+    approved["pending"]["authorized"] = true.into();
+    assert!(waiting_checkpoint_call(&approved, &checkpoint, &spec).is_ok());
 }
 
 // 2026-11-16: 커서 기록 전 완료된 patch는 실제 ledger와 동일할 때만 결과를 재사용한다.
@@ -221,11 +240,14 @@ fn begin_agent_inner(
     if &run != expected
         || (run["status"] != "awaiting_implementation"
             && !(resume.is_some()
-                && (run["status"] == "interrupted" || run["status"] == "awaiting_approval")))
+                && (run["status"] == "interrupted"
+                    || run["status"] == "awaiting_approval"
+                    || run["status"] == "approved_mcp")))
         || run["agent_active"] != false
         || (resume.is_some() && run["resources_unknown"] == true)
         || (!run["pending"].is_null()
-            && !(resume.is_some() && run["status"] == "awaiting_approval"))
+            && !(resume.is_some()
+                && (run["status"] == "awaiting_approval" || run["status"] == "approved_mcp")))
     {
         return Err("run not ready for agent".into());
     }
@@ -289,16 +311,20 @@ fn begin_agent_inner(
             let (attempt, _) = crate::evidence::context(&run, item)?;
             crate::evidence::resolve(&run, id, attempt)?.ok_or("invalid evidence")?;
         }
-        let waiting = if run["status"] == "awaiting_approval" {
+        let waiting = if run["status"] == "awaiting_approval" || run["status"] == "approved_mcp" {
             let waiting = waiting_checkpoint_call(&run, &saved, spec)?;
-            validate_bound_patch(
-                &tx,
-                &run,
-                &waiting.3,
-                &waiting.4,
-                &run["pending"]["arguments"],
-                false,
-            )?;
+            if run["pending"]["tool"] == "mcp" {
+                validate_bound_mcp(&tx, &run, &waiting.3, &waiting.4, false)?;
+            } else {
+                validate_bound_patch(
+                    &tx,
+                    &run,
+                    &waiting.3,
+                    &waiting.4,
+                    &run["pending"]["arguments"],
+                    false,
+                )?;
+            }
             if run["used_calls"]
                 .as_array()
                 .ok_or("invalid calls")?
@@ -332,6 +358,9 @@ fn begin_agent_inner(
                             || record["task_id"] != *task
                         {
                             return Err("pending call mismatch".into());
+                        }
+                        if run["pending"]["tool"] == "mcp" {
+                            validate_mcp_stamp(&tx, &run, &record)?;
                         }
                         continue;
                     }
@@ -1631,7 +1660,8 @@ pub(crate) fn approve_patch(
                 };
                 let role = record["role"].as_str().ok_or("invalid call identity")?;
                 let task = record["task_id"].as_str().ok_or("invalid call identity")?;
-                let identity = serde_json::to_vec(&(role, task, "patch", &pending["arguments"]))
+                let tool = pending["tool"].as_str().ok_or("invalid tool")?;
+                let identity = serde_json::to_vec(&(role, task, tool, &pending["arguments"]))
                     .map_err(|e| e.to_string())?;
                 if record["status"] != "waiting"
                     || record["approval_id"].as_str() != Some(approval)
@@ -1641,13 +1671,18 @@ pub(crate) fn approve_patch(
                 }
                 drop(value);
                 drop(projects);
-                validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
-                let mut claimed = record;
-                claimed["effect_agent_attempt"] = current["agent_attempt"].clone();
-                let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
-                calls
-                    .insert(key.as_str(), claimed.to_string().as_str())
-                    .map_err(|e| e.to_string())?;
+                if tool == "mcp" {
+                    validate_bound_mcp(&tx, &current, role, task, true)?;
+                    validate_mcp_stamp(&tx, &current, &record)?;
+                } else {
+                    validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
+                    let mut claimed = record;
+                    claimed["effect_agent_attempt"] = current["agent_attempt"].clone();
+                    let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+                    calls
+                        .insert(key.as_str(), claimed.to_string().as_str())
+                        .map_err(|e| e.to_string())?;
+                }
             }
             if pending["tool"] == "mcp" {
                 current["pending"]["authorized"] = true.into();
@@ -2970,6 +3005,165 @@ mod diff_snapshot_tests {
 }
 
 // 2026-11-16: 승인 대상 전체를 같은 트랜잭션에 고정해 경합 중 요청이 바뀌지 않게 한다.
+#[cfg(windows)]
+pub(crate) fn submit_bound_mcp(
+    db: &Database,
+    id: &str,
+    role: &str,
+    task: &str,
+    call: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    if call.is_empty() || call.len() > 1024 || id.len() > 128 {
+        return Err("invalid call identity".into());
+    }
+    let endpoint = args["endpoint"].as_str().ok_or("invalid endpoint")?;
+    integrations::mcp::validate_endpoint(endpoint)?;
+    if args["name"].as_str().is_none_or(|v| v.trim().is_empty())
+        || !args["arguments"].is_object()
+        || args["cwd"] != "."
+        || args["side_effect"] != true
+    {
+        return Err("invalid MCP approval request".into());
+    }
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(role, task, "mcp", &args)).map_err(|e| e.to_string())?)
+    );
+    let tx = db.begin_write().map_err(|e| e.to_string())?;
+    let result = {
+        let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
+        let mut run: serde_json::Value = serde_json::from_str(
+            table
+                .get(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("run not found")?
+                .value(),
+        )
+        .map_err(|e| e.to_string())?;
+        normalize_run(&mut run)?;
+        validate_bound_mcp(&tx, &run, role, task, true)?;
+        let stamp = crate::mcp_connections::endpoint_in_write(
+            &tx,
+            run["project_id"].as_str().ok_or("invalid project")?,
+        )?;
+        if stamp.0 != endpoint {
+            return Err("MCP endpoint changed".into());
+        }
+        let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        let key = format!("{id}:{call}");
+        let existing = calls
+            .get(key.as_str())
+            .map_err(|e| e.to_string())?
+            .map(|v| v.value().to_owned());
+        if let Some(existing) = existing {
+            let record: serde_json::Value =
+                serde_json::from_str(&existing).map_err(|e| e.to_string())?;
+            validate_mcp_stamp(&tx, &run, &record)?;
+            if record["hash"] != hash {
+                return Err("call identity conflict".into());
+            }
+            match record["status"].as_str() {
+                Some("completed") => {
+                    serde_json::json!({"status":"completed","result":record["result"]})
+                }
+                Some("waiting")
+                    if ["awaiting_approval", "approved_mcp"]
+                        .contains(&run["status"].as_str().unwrap_or(""))
+                        && run["pending"]["id"] == record["approval_id"]
+                        && run["pending"]["call_id"] == call =>
+                {
+                    serde_json::json!({"status":run["status"],"approval_id":record["approval_id"]})
+                }
+                _ => return Err("previous tool outcome uncertain".into()),
+            }
+        } else {
+            if run["status"] != "awaiting_implementation"
+                || !run["pending"].is_null()
+                || run["used_calls"]
+                    .as_array()
+                    .is_none_or(|v| v.iter().any(|v| v == call))
+            {
+                return Err("run not ready for call".into());
+            }
+            let approval = uuid::Uuid::new_v4().to_string();
+            let record = serde_json::json!({"status":"waiting","hash":hash,"approval_id":approval,"role":role,"task_id":task,"endpoint_stamp":stamp});
+            calls
+                .insert(key.as_str(), record.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+            run["used_calls"].as_array_mut().unwrap().push(call.into());
+            run["pending"] = serde_json::json!({"id":approval,"tool":"mcp","arguments":args,"call_id":call,"authorized":false});
+            run["status"] = "awaiting_approval".into();
+            append_event(
+                &mut run,
+                id,
+                "approval_required",
+                "MCP 요청에 사용자 승인이 필요합니다.",
+            )?;
+            table
+                .insert(id, run.to_string().as_str())
+                .map_err(|e| e.to_string())?;
+            serde_json::json!({"status":"awaiting_approval","approval_id":approval})
+        }
+    };
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+fn validate_bound_mcp(
+    tx: &redb::WriteTransaction,
+    run: &serde_json::Value,
+    role: &str,
+    task: &str,
+    require_active: bool,
+) -> Result<(), String> {
+    if (require_active && run["agent_active"] != true)
+        || run["agent_configs"]
+            .as_array()
+            .and_then(|v| v.iter().find(|v| v["role"] == role))
+            .and_then(|v| v["tools"].as_array())
+            .is_none_or(|v| !v.iter().any(|v| v == "mcp"))
+    {
+        return Err("tool not allowed for active role".into());
+    }
+    let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
+    let row = projects
+        .get(run["project_id"].as_str().ok_or("invalid project")?)
+        .map_err(|e| e.to_string())?
+        .ok_or("project not found")?;
+    let project: domain::Project = serde_json::from_str(row.value()).map_err(|e| e.to_string())?;
+    let spec = project
+        .approved
+        .as_ref()
+        .ok_or("approved specification changed")?;
+    if run["spec_hash"].as_str() != Some(spec.hash.as_str())
+        || run["spec_version"].as_u64() != Some(spec.version)
+        || run["context_version"].as_u64() != Some(project.context_version)
+        || project.draft_hash != spec.hash
+        || run["scope"] != serde_json::json!(spec.scope)
+        || !spec.tasks.iter().any(|v| v.id == task)
+    {
+        return Err("approved specification changed".into());
+    }
+    Ok(())
+}
+
+fn validate_mcp_stamp(
+    tx: &redb::WriteTransaction,
+    run: &serde_json::Value,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    let current = crate::mcp_connections::endpoint_in_write(
+        tx,
+        run["project_id"].as_str().ok_or("invalid project")?,
+    )?;
+    if record["endpoint_stamp"] != serde_json::json!(current) {
+        return Err("MCP endpoint changed".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn request_mcp(
     db: &Database,
     id: &str,
@@ -3021,6 +3215,25 @@ pub(crate) fn consume_mcp(
     id: &str,
     approval: &str,
 ) -> Result<serde_json::Value, String> {
+    consume_mcp_inner(db, id, approval, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn consume_bound_mcp(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    call: &str,
+) -> Result<serde_json::Value, String> {
+    consume_mcp_inner(db, id, approval, Some(call))
+}
+
+fn consume_mcp_inner(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    bound: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
     let request = {
         let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
@@ -3037,6 +3250,45 @@ pub(crate) fn consume_mcp(
             || run["pending"]["authorized"] != true
         {
             return Err("approval unavailable or already consumed".into());
+        }
+        if run["pending"]["call_id"].as_str() != bound {
+            return Err("approval unavailable or already consumed".into());
+        }
+        let mut endpoint_stamp = None;
+        if let Some(call) = bound {
+            use sha2::{Digest, Sha256};
+            let key = format!("{id}:{call}");
+            let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+            let mut record: serde_json::Value = serde_json::from_str(
+                calls
+                    .get(key.as_str())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("call not found")?
+                    .value(),
+            )
+            .map_err(|e| e.to_string())?;
+            let role = record["role"].as_str().ok_or("invalid call")?;
+            let task = record["task_id"].as_str().ok_or("invalid call")?;
+            let hash = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(role, task, "mcp", &run["pending"]["arguments"]))
+                        .map_err(|e| e.to_string())?
+                )
+            );
+            if record["status"] != "waiting"
+                || record["approval_id"] != approval
+                || record["hash"] != hash
+            {
+                return Err("call identity conflict".into());
+            }
+            validate_bound_mcp(&tx, &run, role, task, true)?;
+            validate_mcp_stamp(&tx, &run, &record)?;
+            endpoint_stamp = Some(record["endpoint_stamp"].clone());
+            record["status"] = "executing".into();
+            calls
+                .insert(key.as_str(), record.to_string().as_str())
+                .map_err(|e| e.to_string())?;
         }
         let projects = tx.open_table(crate::PROJECTS).map_err(|e| e.to_string())?;
         let row = projects
@@ -3056,7 +3308,10 @@ pub(crate) fn consume_mcp(
         {
             return Err("approved specification changed".into());
         }
-        let request = run["pending"]["arguments"].clone();
+        let mut request = run["pending"]["arguments"].clone();
+        if let Some(stamp) = endpoint_stamp {
+            request["_endpoint_stamp"] = stamp;
+        }
         run["status"] = "executing".into();
         append_event(
             &mut run,
@@ -3080,6 +3335,27 @@ pub(crate) fn finish_mcp(
     approval: &str,
     success: bool,
 ) -> Result<bool, String> {
+    finish_mcp_inner(db, id, approval, success, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn finish_bound_mcp(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    call: &str,
+    result: Option<serde_json::Value>,
+) -> Result<bool, String> {
+    finish_mcp_inner(db, id, approval, result.is_some(), Some((call, result)))
+}
+
+fn finish_mcp_inner(
+    db: &Database,
+    id: &str,
+    approval: &str,
+    success: bool,
+    bound: Option<(&str, Option<serde_json::Value>)>,
+) -> Result<bool, String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
     let complete = {
         let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
@@ -3096,7 +3372,36 @@ pub(crate) fn finish_mcp(
         {
             return Err("MCP execution not active".into());
         }
+        if run["pending"]["call_id"].as_str() != bound.as_ref().map(|(call, _)| *call) {
+            return Err("MCP execution identity changed".into());
+        }
         let complete = success && run["status"] == "executing";
+        if let Some((call, result)) = bound {
+            let key = format!("{id}:{call}");
+            let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+            let mut record: serde_json::Value = serde_json::from_str(
+                calls
+                    .get(key.as_str())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("call not found")?
+                    .value(),
+            )
+            .map_err(|e| e.to_string())?;
+            if record["status"] != "executing" || record["approval_id"] != approval {
+                return Err("call identity conflict".into());
+            }
+            record["status"] = if complete { "completed" } else { "uncertain" }.into();
+            if complete {
+                record["result"] = result.ok_or("result missing")?;
+            }
+            let encoded = record.to_string();
+            if encoded.len() > MAX_DURABLE_RECORD_BYTES {
+                return Err("call result too large".into());
+            }
+            calls
+                .insert(key.as_str(), encoded.as_str())
+                .map_err(|e| e.to_string())?;
+        }
         run["pending"] = serde_json::Value::Null;
         run["status"] = if complete {
             "awaiting_implementation"

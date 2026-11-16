@@ -7,6 +7,12 @@ use std::sync::{
 };
 
 pub enum Kind {
+    RunDiff {
+        project_id: String,
+        run_id: String,
+        selection: u64,
+        sequence: u64,
+    },
     ToolAnswer {
         project_id: String,
         run_id: String,
