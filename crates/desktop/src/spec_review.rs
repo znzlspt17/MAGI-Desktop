@@ -41,6 +41,12 @@ impl Form {
             accepted: Default::default(),
         }
     }
+    pub(crate) fn is_clean(&self, project: &domain::Project) -> bool {
+        self.draft()
+            .ok()
+            .and_then(|d| serde_json::to_value(d).ok())
+            .is_some_and(|d| serde_json::to_value(&project.draft).ok() == Some(d))
+    }
     fn draft(&self) -> Result<domain::SpecDraft, String> {
         let mut d = self.draft.clone();
         d.title = self.title.clone();
@@ -193,6 +199,17 @@ mod tests {
     use super::*;
     fn project() -> domain::Project {
         serde_json::from_value(serde_json::json!({"id":"a","name":"a","path":"x","draft":{"title":"old","scope":[],"requirements":[],"acceptance":[],"mandatory_questions":[],"required_failures":[],"optional_issues":[],"base_revision":""},"draft_hash":"h","approved":null})).unwrap()
+    }
+    #[test]
+    fn start_clean_check_detects_unsaved_and_invalid_edit() {
+        let p = project();
+        let mut form = Form::new(&p);
+        assert!(form.is_clean(&p));
+        form.title = "changed".into();
+        assert!(!form.is_clean(&p));
+        form.title = p.draft.title.clone();
+        form.tasks = "bad json".into();
+        assert!(!form.is_clean(&p));
     }
     #[test]
     fn list_items_round_trip_without_losing_newlines_or_whitespace() {
