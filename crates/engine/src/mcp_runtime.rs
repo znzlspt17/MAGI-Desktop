@@ -59,11 +59,21 @@ pub(crate) async fn call(
     run_id: String,
     approval_id: String,
 ) -> Result<ResponseData, String> {
+    call_inner(engine, run_id, approval_id, None).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn call_bound(engine: Arc<Engine>, run_id: String, approval_id: String, call_id: String, token: tokio_util::sync::CancellationToken, identity: crate::agent_runtime::RunIdentity) -> Result<ResponseData, String> {
+    call_inner(engine, run_id, approval_id, Some((call_id, token, identity))).await
+}
+
+async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bound: Option<(String, tokio_util::sync::CancellationToken, crate::agent_runtime::RunIdentity)>) -> Result<ResponseData, String> {
     let task = tokio::spawn(async move {
         let worker = Arc::clone(&engine);
         let consume_run = run_id.clone();
         let consume_approval = approval_id.clone();
-        let (request, token) = tokio::task::spawn_blocking(move || {
+        let consume_bound = bound.clone();
+        let (request, token, owned) = tokio::task::spawn_blocking(move || {
             let _gate = worker
                 .mutation_gate
                 .lock()
@@ -77,6 +87,13 @@ pub(crate) async fn call(
                 return Err("완료 결과 저장을 먼저 복구해야 합니다.".into());
             }
             let db = worker.db.get().ok_or("storage unavailable")?;
+            if let Some((call, token, identity)) = consume_bound {
+                if token.is_cancelled() { return Err("cancelled".into()); }
+                #[cfg(windows)]
+                { crate::agent_runtime::check_identity(&db, &identity)?; return Ok((runs::consume_bound_mcp(&db, &consume_run, &consume_approval, &call)?, Arc::new(token), false)); }
+                #[cfg(not(windows))]
+                return Err("agent MCP unavailable".into());
+            }
             let token = Arc::new(tokio_util::sync::CancellationToken::new());
             {
                 let mut tokens = worker
@@ -89,7 +106,7 @@ pub(crate) async fn call(
                 tokens.insert(consume_run.clone(), Arc::clone(&token));
             }
             match runs::consume_mcp(&db, &consume_run, &consume_approval) {
-                Ok(request) => Ok((request, token)),
+                Ok(request) => Ok((request, token, true)),
                 Err(error) => {
                     worker
                         .cancellations
@@ -102,11 +119,11 @@ pub(crate) async fn call(
         })
         .await
         .map_err(err)??;
-        let _lease = CancellationLease {
+        let _lease = owned.then(|| CancellationLease {
             engine: Arc::clone(&engine),
             run_id: run_id.clone(),
             token: Arc::clone(&token),
-        };
+        });
         let result=async {
             let endpoint=request["endpoint"].as_str().ok_or("invalid endpoint")?;
             let name=request["name"].as_str().ok_or("invalid tool name")?;
@@ -130,10 +147,16 @@ pub(crate) async fn call(
             Ok(ResponseData::Data(serde_json::json!({"content":output.content,"structured_content":output.structured_content,"is_error":output.is_error})))
         }.await;
         let finish_engine = Arc::clone(&engine);
-        let success = result.is_ok();
+        let saved = result.as_ref().ok().and_then(|v| match v { ResponseData::Data(v) => Some(v.clone()), _ => None });
         let complete = tokio::task::spawn_blocking(move || {
             let db = finish_engine.db.get().ok_or("storage unavailable")?;
-            runs::finish_mcp(&db, &run_id, &approval_id, success)
+            if let Some((call, _, _)) = bound {
+                #[cfg(windows)]
+                return runs::finish_bound_mcp(&db, &run_id, &approval_id, &call, saved);
+                #[cfg(not(windows))]
+                return Err("agent MCP unavailable".into());
+            }
+            runs::finish_mcp(&db, &run_id, &approval_id, saved.is_some())
         })
         .await
         .map_err(err)??;

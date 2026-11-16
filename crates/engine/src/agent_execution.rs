@@ -903,6 +903,14 @@ mod tests {
         assert_eq!(bounded_output(&input, &[], 1000, 100, None).unwrap(), 100);
     }
     #[test]
+    fn allows_mcp_for_implementer_but_not_reviewer() {
+        let (spec, mut configs) = fixture();
+        configs[1].tools.push("mcp".into());
+        assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_ok());
+        configs[2].tools.push("mcp".into());
+        assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_err());
+    }
+    #[test]
     fn supports_only_explicit_initial_tool_and_validation_contract() {
         let (spec, configs) = fixture();
         assert!(preflight(&spec, &configs, "step", "mock", &[serde_json::json!({})]).is_ok());

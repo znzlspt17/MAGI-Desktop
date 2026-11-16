@@ -8,7 +8,7 @@ use redb::Database;
 use std::sync::Arc;
 
 #[derive(Clone)]
-struct RunIdentity {
+pub(crate) struct RunIdentity {
     run_id: String,
     spec_hash: String,
     spec_version: u64,
@@ -17,7 +17,7 @@ struct RunIdentity {
 }
 
 // 2026-11-16: 같은 gate 아래 현재 승인과 시도를 확인한 뒤에만 쓰기를 수행한다.
-fn check_identity(db: &Database, identity: &RunIdentity) -> Result<(), String> {
+pub(crate) fn check_identity(db: &Database, identity: &RunIdentity) -> Result<(), String> {
     let run = runs::get(db, &identity.run_id)?;
     let project_id = run["project_id"].as_str().ok_or("invalid run project")?;
     if run["agent_active"].as_bool() != Some(true)
@@ -686,6 +686,32 @@ impl crate::agent_loop::DurableToolDriver for Runtime {
         args: serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value, String> {
+        if name == "mcp" {
+            loop {
+                let engine = Arc::clone(&self.engine);
+                let identity = self.identity.clone();
+                let role = role.to_owned();
+                let task = task.id.clone();
+                let call = call_id.to_owned();
+                let args = args.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let _guard = engine.mutation_gate.lock().unwrap_or_else(|e| e.into_inner());
+                    let db = engine.db.get().ok_or("storage unavailable")?;
+                    check_identity(&db, &identity)?;
+                    runs::submit_bound_mcp(&db, &identity.run_id, &role, &task, &call, args)
+                }).await.map_err(|_| "runtime worker failed")??;
+                match result["status"].as_str() {
+                    Some("completed") => return Ok(result["result"].clone()),
+                    Some("awaiting_approval") => tokio::select! { _ = cancel.cancelled() => return Err("cancelled".into()), _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {} },
+                    Some("approved_mcp") => {
+                        let approval = result["approval_id"].as_str().ok_or("approval missing")?.to_owned();
+                        let response = crate::mcp_runtime::call_bound(Arc::clone(&self.engine), self.identity.run_id.clone(), approval, call_id.to_owned(), cancel.clone(), self.identity.clone()).await?;
+                        return match response { domain::ResponseData::Data(value) => Ok(value), _ => Err("invalid MCP response".into()) };
+                    }
+                    _ => return Err("unsupported durable MCP execution".into()),
+                }
+            }
+        }
         if !["read", "search", "patch"].contains(&name) {
             return Err("unsupported durable tool".into());
         }
@@ -945,6 +971,124 @@ mod bridge_integration_tests {
             max_parallel_tasks: 1,
             timeout: Duration::from_secs(20),
         }
+    }
+    #[tokio::test]
+    async fn mcp_agent_creates_bound_approval_before_network_activity() {
+        let fixture = Fixture::new("step_by_step");
+        let runtime = fixture.runtime();
+        let db = fixture.engine.db.get().unwrap();
+        crate::mcp_connections::configure(&db, "project", "http://127.0.0.1:1/sse").unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(redb::TableDefinition::<&str, &str>::new("runs")).unwrap();
+            let mut run: Value = serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value()).unwrap();
+            run["agent_configs"][1]["tools"] = json!(["read", "patch", "mcp"]);
+            table.insert(fixture.run_id.as_str(), run.to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let task = fixture.spec.tasks[0].clone();
+        let token = CancellationToken::new();
+        let child = token.clone();
+        let work = tokio::spawn(async move { runtime.execute_durable("implementer", &task, "mcp", "mcp-1", json!({"endpoint":"http://127.0.0.1:1/sse","name":"read","arguments":{},"cwd":".","side_effect":true}), child).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let run = runs::get(&db, &fixture.run_id).unwrap();
+        token.cancel();
+        let _ = work.await;
+        assert_eq!(run["status"], "awaiting_approval");
+        assert_eq!(run["pending"]["call_id"], "mcp-1");
+        let approval = run["pending"]["id"].as_str().unwrap();
+        let result = runs::approve_patch(&db, &fixture.run_id, approval, true);
+        assert_eq!(result.unwrap()["status"], "approved_mcp");
+    }
+    #[tokio::test]
+    async fn approved_agent_mcp_executes_exactly_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(redb::TableDefinition::<&str, &str>::new("runs")).unwrap();
+            let mut run: Value = serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value()).unwrap();
+            run["agent_configs"][1]["tools"] = json!(["read", "patch", "mcp"]);
+            table.insert(fixture.run_id.as_str(), run.to_string().as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for step in 0..7 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                observed.fetch_add(1, Ordering::SeqCst);
+                let mut data = Vec::new();
+                loop { let mut buf=[0;4096]; let n=socket.read(&mut buf).await.unwrap(); assert!(n>0); data.extend_from_slice(&buf[..n]); if let Some(end)=data.windows(4).position(|w| w==b"\r\n\r\n") { let headers=String::from_utf8_lossy(&data[..end]).to_ascii_lowercase(); let len=headers.lines().find_map(|v| v.strip_prefix("content-length: ").and_then(|v| v.parse::<usize>().ok())).unwrap_or(0); if data.len()>=end+4+len { break; } } }
+                if step >= 3 { assert!(String::from_utf8_lossy(&data).to_ascii_lowercase().contains("authorization: bearer fixture-token\r\n")); }
+                if step == 6 { let end=data.windows(4).position(|w| w==b"\r\n\r\n").unwrap(); let req: Value=serde_json::from_slice(&data[end+4..]).unwrap(); assert_eq!(req["method"],"tools/call"); assert_eq!(req["params"]["arguments"],json!({"value":"fixture"})); }
+                let body=match step { 0=>format!(r#"{{"resource":"http://{addr}/mcp","authorization_servers":["http://{addr}"]}}"#), 1=>format!(r#"{{"issuer":"http://{addr}","authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token","code_challenge_methods_supported":["S256"]}}"#), 2=>r#"{"access_token":"fixture-token","token_type":"Bearer"}"#.into(), 3=>r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}"#.into(), 4=>String::new(), 5=>r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"write","inputSchema":{"type":"object"}}]}}"#.into(), _=>r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"done"}]}}"#.into() };
+                let status=if step==4 {"202 Accepted"} else {"200 OK"};
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let send = |command| Arc::clone(&fixture.engine).handle_async(domain::Request { id:"fixture".into(), command });
+        send(domain::Command::ConfigureMcp { project_id:"project".into(), endpoint:endpoint.clone() }).await.result.unwrap();
+        let response = send(domain::Command::BeginMcpOAuth { project_id:"project".into(), metadata_url:format!("http://{addr}/metadata"), client_id:"fixture".into(), redirect_uri:"http://127.0.0.1:43210/callback".into() }).await.result.unwrap();
+        let domain::ResponseData::Data(value)=response else { panic!("OAuth") };
+        let state=value["authorization_url"].as_str().unwrap().split(['?', '&']).find_map(|v| v.strip_prefix("state=")).unwrap();
+        send(domain::Command::CompleteMcpOAuth { project_id:"project".into(), callback:domain::SecretString(format!("http://127.0.0.1:43210/callback?state={state}&code=fixture")) }).await.result.unwrap();
+        let runtime=fixture.runtime(); let task=fixture.spec.tasks[0].clone(); let token=CancellationToken::new();
+        fixture.engine.slots.store(4, Ordering::Release);
+        fixture.engine.cancellations.lock().unwrap().insert(fixture.run_id.clone(), Arc::new(token.clone()));
+        let args=json!({"endpoint":endpoint,"name":"write","arguments":{"value":"fixture"},"cwd":".","side_effect":true});
+        let input=args.clone();
+        let work=tokio::spawn(async move { runtime.execute_durable("implementer", &task, "mcp", "mcp-2", input,token).await });
+        let run=loop { let run=runs::get(&db,&fixture.run_id).unwrap(); if run["status"]=="awaiting_approval" { break run; } assert!(!work.is_finished()); tokio::task::yield_now().await; };
+        assert_eq!(requests.load(Ordering::SeqCst),3);
+        let approval=run["pending"]["id"].as_str().unwrap();
+        runs::approve_patch(&db,&fixture.run_id,approval,true).unwrap();
+        assert!(runs::consume_mcp(&db,&fixture.run_id,approval).is_err());
+        let result=tokio::time::timeout(Duration::from_secs(5),work).await.unwrap().unwrap().unwrap();
+        assert_eq!(result["content"][0]["text"], "done");
+        server.await.unwrap();
+        assert_eq!(fixture.engine.slots.load(Ordering::Acquire),4);
+        let replay=fixture.runtime().execute_durable("implementer",&fixture.spec.tasks[0],"mcp","mcp-2",args,CancellationToken::new()).await.unwrap();
+        assert_eq!(replay,result);
+        assert_eq!(requests.load(Ordering::SeqCst),7);
+        fixture.engine.cancellations.lock().unwrap().remove(&fixture.run_id);
+    }
+    #[tokio::test]
+    async fn mcp_approval_rejects_endpoint_generation_change() {
+        let fixture=Fixture::new("step_by_step");
+        let db=fixture.engine.db.get().unwrap();
+        let endpoint="http://127.0.0.1:1/mcp";
+        crate::mcp_connections::configure(&db,"project",endpoint).unwrap();
+        let tx=db.begin_write().unwrap();
+        { let mut table=tx.open_table(redb::TableDefinition::<&str,&str>::new("runs")).unwrap(); let mut run:Value=serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value()).unwrap(); run["agent_configs"][1]["tools"]=json!(["read","patch","mcp"]); table.insert(fixture.run_id.as_str(),run.to_string().as_str()).unwrap(); }
+        tx.commit().unwrap();
+        let runtime=fixture.runtime(); let task=fixture.spec.tasks[0].clone(); let token=CancellationToken::new(); let child=token.clone();
+        let work=tokio::spawn(async move { runtime.execute_durable("implementer",&task,"mcp","mcp-aba",json!({"endpoint":endpoint,"name":"write","arguments":{},"cwd":".","side_effect":true}),child).await });
+        let run=loop { let run=runs::get(&db,&fixture.run_id).unwrap(); if run["status"]=="awaiting_approval" {break run;} assert!(!work.is_finished()); tokio::task::yield_now().await; };
+        crate::mcp_connections::configure(&db,"project",endpoint).unwrap();
+        let result=runs::approve_patch(&db,&fixture.run_id,run["pending"]["id"].as_str().unwrap(),true);
+        token.cancel(); let _=work.await;
+        assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn interrupted_claimed_mcp_never_replays() {
+        let fixture=Fixture::new("step_by_step"); let db=fixture.engine.db.get().unwrap();
+        let endpoint="http://127.0.0.1:1/mcp";
+        crate::mcp_connections::configure(&db,"project",endpoint).unwrap();
+        let tx=db.begin_write().unwrap(); { let mut table=tx.open_table(redb::TableDefinition::<&str,&str>::new("runs")).unwrap(); let mut run:Value=serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value()).unwrap(); run["agent_configs"][1]["tools"]=json!(["read","patch","mcp"]); table.insert(fixture.run_id.as_str(),run.to_string().as_str()).unwrap(); } tx.commit().unwrap();
+        let args=json!({"endpoint":endpoint,"name":"write","arguments":{},"cwd":".","side_effect":true});
+        let response=runs::submit_bound_mcp(&db,&fixture.run_id,"implementer","task","mcp-interrupted",args.clone()).unwrap();
+        let approval=response["approval_id"].as_str().unwrap();
+        runs::approve_patch(&db,&fixture.run_id,approval,true).unwrap();
+        runs::consume_bound_mcp(&db,&fixture.run_id,approval,"mcp-interrupted").unwrap();
+        assert!(!runs::finish_bound_mcp(&db,&fixture.run_id,approval,"mcp-interrupted",None).unwrap());
+        let result=fixture.runtime().execute_durable("implementer",&fixture.spec.tasks[0],"mcp","mcp-interrupted",args,CancellationToken::new()).await;
+        assert!(result.is_err());
+        assert_eq!(runs::get(&db,&fixture.run_id).unwrap()["status"],"uncertain");
     }
     #[tokio::test]
     async fn checkpoint_loop_applies_patch_once_and_reuses_real_evidence() {
