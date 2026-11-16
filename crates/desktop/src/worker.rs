@@ -57,6 +57,12 @@ pub enum Kind {
         request: u64,
         generation: u64,
     },
+    AgentResume {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        generation: u64,
+    },
     AgentSettingsSave {
         project_id: String,
         generation: u64,
