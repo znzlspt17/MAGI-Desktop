@@ -5,6 +5,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 const SOURCES: TableDefinition<&str, &str> = TableDefinition::new("integration_knowledge_sources");
 const KNOWLEDGE: TableDefinition<&str, &str> = TableDefinition::new("integration_knowledge");
+#[cfg(test)]
+pub(crate) static TEST_INDEX_BEFORE_WRITE: std::sync::Mutex<
+    Option<(String, std::sync::mpsc::Sender<()>)>,
+> = std::sync::Mutex::new(None);
 
 // 2026-11-16: 원문과 검색 checkpoint를 같은 트랜잭션에 기록해 한쪽만 갱신되는 일을 막는다.
 pub(crate) fn put(
@@ -121,7 +125,30 @@ pub(crate) fn set_embedding(
     model: serde_json::Value,
     vector: Vec<f32>,
 ) -> Result<ResponseData, String> {
+    set_embedding_checked(db, project_id, document_id, version, model, vector, || {
+        Ok(())
+    })
+}
+
+// 2026-11-16: 같은 쓰기 트랜잭션에서 원문 버전을 확인한 뒤 게시 허가를 받아 취소와 경합을 직렬화한다.
+pub(crate) fn set_embedding_checked(
+    db: &Database,
+    project_id: &str,
+    document_id: &str,
+    version: u64,
+    model: serde_json::Value,
+    vector: Vec<f32>,
+    authorize: impl FnOnce() -> Result<(), String>,
+) -> Result<ResponseData, String> {
     let model: integrations::EmbeddingModel = serde_json::from_value(model).map_err(err)?;
+    #[cfg(test)]
+    if let Some((_, ready)) = TEST_INDEX_BEFORE_WRITE
+        .lock()
+        .unwrap()
+        .take_if(|(id, _)| id == project_id)
+    {
+        let _ = ready.send(());
+    }
     let tx = db.begin_write().map_err(err)?;
     {
         let projects = tx.open_table(PROJECTS).map_err(err)?;
@@ -150,6 +177,7 @@ pub(crate) fn set_embedding(
     };
     index.set_embedding(document_id, version, model, vector)?;
     let checkpoint = index.checkpoint()?;
+    authorize()?;
     {
         let mut table = tx.open_table(KNOWLEDGE).map_err(err)?;
         table

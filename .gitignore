@@ -1,4 +1,8 @@
 /target/
+/target-indexing-validation/
+/target-engine-pr47-7524/
+/target-engine-pr47/
+/target-engine-pr49/
 /dist/
 /.worktrees/
 /.superpowers/

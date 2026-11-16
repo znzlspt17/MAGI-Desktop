@@ -30,6 +30,27 @@ foreach ($name in $names) {
     }
     Assert-SafeExistingPath $source
 }
+$infoPath = Join-Path $build 'build-info.json'
+$buildInfo = $null
+$provenance = '출처 미확인: 빌드 기록이 없습니다.'
+if (Test-Path -LiteralPath $infoPath) {
+    Assert-SafeExistingPath $infoPath
+    $infoFile = Get-Item -LiteralPath $infoPath -Force
+    if ($infoFile.PSIsContainer -or $infoFile.Length -gt 8192) { throw '빌드 기록 파일이 잘못되었습니다.' }
+    try { $rawInfo = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json -ErrorAction Stop } catch { throw '빌드 기록 JSON이 잘못되었습니다.' }
+    $keys = @('schemaVersion','sourceRevision','sourceDirty','rustVersion','target','binaries')
+    $actualKeys = @($rawInfo.PSObject.Properties.Name)
+    if ($actualKeys.Count -ne $keys.Count -or @($actualKeys | Where-Object { $_ -cnotin $keys }).Count -ne 0) { throw '빌드 기록 필드가 잘못되었습니다.' }
+    if ($rawInfo.schemaVersion -isnot [long] -or $rawInfo.schemaVersion -ne 1 -or
+        $rawInfo.sourceRevision -isnot [string] -or $rawInfo.sourceRevision -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' -or
+        $rawInfo.sourceDirty -isnot [bool] -or $rawInfo.rustVersion -isnot [string] -or
+        $rawInfo.rustVersion -cnotmatch '^[0-9][0-9A-Za-z.+-]{0,63}$' -or $rawInfo.target -isnot [string] -or
+        $rawInfo.target -cnotmatch '^[A-Za-z0-9_.-]{1,100}$' -or $rawInfo.binaries -isnot [array] -or
+        @($rawInfo.binaries | Where-Object { $_ -isnot [string] }).Count -ne 0 -or
+        ($rawInfo.binaries -join '|') -cne ($names -join '|')) { throw '빌드 기록 내용이 잘못되었습니다.' }
+    $buildInfo = [ordered]@{ schemaVersion = 1; sourceRevision = $rawInfo.sourceRevision; sourceDirty = $rawInfo.sourceDirty; rustVersion = $rawInfo.rustVersion; target = $rawInfo.target; binaries = $names }
+    $provenance = '빌드 기록은 제공자가 작성한 정보이며 바이너리 무결성이나 출처를 증명하지 않습니다.'
+}
 
 # 현재 workspace의 잠금 의존성을 기준으로 공개 라이선스 원문만 수집한다.
 Push-Location $root
@@ -39,6 +60,17 @@ try {
     $hostLine = $rustInfo | Where-Object { $_ -like 'host: *' } | Select-Object -First 1
     if (-not $hostLine) { throw 'Rust host 대상을 확인할 수 없습니다.' }
     $hostTarget = $hostLine.Substring(6)
+    if ($buildInfo) {
+        $currentRevision = @(& git rev-parse --verify HEAD)
+        if ($LASTEXITCODE -ne 0 -or $currentRevision.Count -ne 1) { throw '현재 workspace revision을 확인할 수 없습니다.' }
+        $currentChanges = @(& git status --porcelain --untracked-files=normal)
+        if ($LASTEXITCODE -ne 0) { throw '현재 workspace 변경 상태를 확인할 수 없습니다.' }
+        if ($buildInfo.sourceRevision -cne $currentRevision[0] -or $buildInfo.sourceDirty -ne [bool]$currentChanges.Count -or $buildInfo.target -cne $hostTarget) {
+            $provenance += ' 빌드 기록과 현재 workspace의 revision, 변경 상태 또는 대상이 다릅니다.'
+        } else {
+            $provenance += ' 기록된 revision, 변경 상태 및 대상은 현재 workspace와 같지만 실제 빌드 일치는 확인되지 않았습니다.'
+        }
+    }
     $packages = @(& cargo tree --locked --offline --edges normal,build --target $hostTarget -p desktop -p engine -p inference --prefix none --format '{p}|{l}')
     if ($LASTEXITCODE -ne 0 -or $packages.Count -eq 0) { throw '잠금 의존성 목록을 확인할 수 없습니다.' }
 } finally { Pop-Location }
@@ -52,6 +84,7 @@ $missing = [Collections.Generic.List[string]]::new()
 $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $notices.Add('현재 workspace의 Cargo.lock과 host 대상 의존성을 기준으로 수집한 공개 고지입니다.')
 $notices.Add('입력 실행 파일이 현재 workspace에서 빌드되었는지는 확인하지 않았습니다. 배포 전 별도 검토가 필요합니다.')
+$notices.Add($provenance)
 foreach ($line in @($packages | Sort-Object -Unique)) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     if ($line -notmatch '^(?<crate>[^ ]+) v(?<version>[^ |]+)(?: \((?<location>[^)]*)\))?\|(?<license>.*?)(?: \(\*\))?$') { throw 'Cargo 의존성 목록 형식이 예상과 다릅니다.' }
@@ -112,17 +145,21 @@ MAGI Windows 개발용 패키지
 
 desktop, engine, inference는 각각 별도 프로세스입니다.
 실제 모델 추론은 아직 지원하지 않습니다. 모의 응답을 실제 추론으로 간주하지 마세요.
+$provenance
 모델, 데이터베이스, 로그 및 인증 정보는 포함하지 않습니다.
 제3자 고지는 THIRD-PARTY-NOTICES.txt를 확인하세요. 누락된 고지와 입력 빌드의 출처를 검토하기 전에는 배포할 수 없습니다.
 "@
 [IO.File]::WriteAllText((Join-Path $folder 'README.txt'), $readme, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllLines((Join-Path $folder 'THIRD-PARTY-NOTICES.txt'), $notices, [Text.UTF8Encoding]::new($false))
+if ($buildInfo) { [IO.File]::WriteAllText((Join-Path $folder 'build-info.json'), ($buildInfo | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false)) }
 Add-Type -AssemblyName System.IO.Compression
 $stream = [IO.File]::Open($archive, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
 try {
     $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create, $true)
     try {
-        foreach ($entry in @($names + @('README.txt', 'THIRD-PARTY-NOTICES.txt'))) {
+        $entries = @($names + @('README.txt', 'THIRD-PARTY-NOTICES.txt'))
+        if ($buildInfo) { $entries += 'build-info.json' }
+        foreach ($entry in $entries) {
             [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $folder $entry), $entry) | Out-Null
         }
     } finally { $zip.Dispose() }
