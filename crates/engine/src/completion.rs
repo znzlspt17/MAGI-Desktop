@@ -936,6 +936,7 @@ mod tests {
         manager.register(&db, &run_id, &project_id, Ok(()));
         let gate = std::sync::Arc::clone(&manager.mutation_gate);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(dbpath.clone(), db),
             run_root: root.clone(),
             git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -1167,6 +1168,7 @@ mod tests {
         manager.register_generation(&db, &run_id, &project_id, Err("fake failure".into()));
         let gate = std::sync::Arc::clone(&manager.mutation_gate);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(dbpath.clone(), db),
             run_root: root.clone(),
             git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -1926,6 +1928,7 @@ mod agent_journal_tests {
             Arc::clone(&gate),
         ));
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(path.clone(), db),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),

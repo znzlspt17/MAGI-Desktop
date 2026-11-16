@@ -5,6 +5,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 const SOURCES: TableDefinition<&str, &str> = TableDefinition::new("integration_knowledge_sources");
 const KNOWLEDGE: TableDefinition<&str, &str> = TableDefinition::new("integration_knowledge");
+#[cfg(test)]
+pub(crate) static TEST_INDEX_BEFORE_WRITE: std::sync::Mutex<
+    Option<(String, std::sync::mpsc::Sender<()>)>,
+> = std::sync::Mutex::new(None);
 
 // 2026-11-16: 원문과 검색 checkpoint를 같은 트랜잭션에 기록해 한쪽만 갱신되는 일을 막는다.
 pub(crate) fn put(
@@ -121,7 +125,30 @@ pub(crate) fn set_embedding(
     model: serde_json::Value,
     vector: Vec<f32>,
 ) -> Result<ResponseData, String> {
+    set_embedding_checked(db, project_id, document_id, version, model, vector, || {
+        Ok(())
+    })
+}
+
+// 2026-11-16: 같은 쓰기 트랜잭션에서 원문 버전을 확인한 뒤 게시 허가를 받아 취소와 경합을 직렬화한다.
+pub(crate) fn set_embedding_checked(
+    db: &Database,
+    project_id: &str,
+    document_id: &str,
+    version: u64,
+    model: serde_json::Value,
+    vector: Vec<f32>,
+    authorize: impl FnOnce() -> Result<(), String>,
+) -> Result<ResponseData, String> {
     let model: integrations::EmbeddingModel = serde_json::from_value(model).map_err(err)?;
+    #[cfg(test)]
+    if let Some((_, ready)) = TEST_INDEX_BEFORE_WRITE
+        .lock()
+        .unwrap()
+        .take_if(|(id, _)| id == project_id)
+    {
+        let _ = ready.send(());
+    }
     let tx = db.begin_write().map_err(err)?;
     {
         let projects = tx.open_table(PROJECTS).map_err(err)?;
@@ -150,6 +177,7 @@ pub(crate) fn set_embedding(
     };
     index.set_embedding(document_id, version, model, vector)?;
     let checkpoint = index.checkpoint()?;
+    authorize()?;
     {
         let mut table = tx.open_table(KNOWLEDGE).map_err(err)?;
         table
@@ -174,5 +202,36 @@ pub(crate) fn search_vector(
     let results = index.semantic_search(&vector, &model, offset, limit)?;
     Ok(ResponseData::Data(
         serde_json::json!({"mode":"semantic","results":results}),
+    ))
+}
+
+// 2026-11-16: 원문 출처에서만 관계를 만들고 단일 응답 상한 초과는 페이지 조회로 명시한다.
+pub(crate) fn graph(
+    db: &Database,
+    project_id: &str,
+    page: Option<(usize, usize)>,
+) -> Result<ResponseData, String> {
+    let index = read(db, project_id)?;
+    let (offset, limit) = page.unwrap_or((0, 100));
+    if page.is_none() && !index.graph(100, 1).is_empty() {
+        return Err("graph exceeds one page; use GetGraphPage".into());
+    }
+    let edges = index.graph(offset, limit);
+    let mut nodes = Vec::new();
+    for edge in &edges {
+        nodes.push(serde_json::json!({"id":edge.source,"kind":"source"}));
+        nodes.push(serde_json::json!({"id":edge.document_id,"kind":"document","version":edge.document_version}));
+    }
+    // 2026-11-16: 출처와 문서의 ID가 같아도 동일 노드가 인접해야 중복 제거가 정확하다.
+    nodes.sort_by(|a, b| {
+        (a["id"].as_str(), a["kind"].as_str(), a["version"].as_u64()).cmp(&(
+            b["id"].as_str(),
+            b["kind"].as_str(),
+            b["version"].as_u64(),
+        ))
+    });
+    nodes.dedup();
+    Ok(ResponseData::Data(
+        serde_json::json!({"nodes":nodes,"edges":edges}),
     ))
 }
