@@ -39,7 +39,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: 테스트
         if: steps.workspace.outputs.present == 'true'
-        run: cargo test --locked --workspace
+        env:
+          RUST_BACKTRACE: '1'
+        run: cargo test --locked --workspace -- --nocapture
       - name: Clippy
         if: steps.workspace.outputs.present == 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
