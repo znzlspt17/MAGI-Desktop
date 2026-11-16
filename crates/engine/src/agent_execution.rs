@@ -1470,6 +1470,97 @@ mod tests {
             .expect("fresh verification missing");
         assert_eq!(new_row["agent_attempt"], 2);
         assert_eq!(context["agent_attempt"], 2);
+        let mut waiting_run = before_resume.clone();
+        waiting_run["id"] = "waiting-resume".into();
+        waiting_run["agent_active"] = true.into();
+        waiting_run["agent_attempt"] = 1.into();
+        waiting_run["autonomy_mode"] = "step".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("waiting-resume", waiting_run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let call_id = serde_json::to_string(&("task", "implementer", 0, "patch")).unwrap();
+        let args = serde_json::json!({"path":"src/pending.txt","content":"approved"});
+        let waiting = crate::runs::submit_bound_patch(
+            &db,
+            "waiting-resume",
+            "implementer",
+            "task",
+            &call_id,
+            args.clone(),
+        )
+        .unwrap();
+        let approval = waiting["approval_id"].as_str().unwrap().to_owned();
+        let mut waiting_run = crate::runs::get(&db, "waiting-resume").unwrap();
+        waiting_run["agent_active"] = false.into();
+        let mut waiting_checkpoint = checkpoint.clone();
+        waiting_checkpoint["role_index"] = 1.into();
+        waiting_checkpoint["pending_calls"] =
+            serde_json::json!([{"call_id":"patch","name":"patch","arguments":args}]);
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("waiting-resume", waiting_run.to_string().as_str())
+                .unwrap();
+        }
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert("waiting-resume", waiting_checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let response = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "resume-waiting".into(),
+                command: domain::Command::ResumeAgent {
+                    run_id: "waiting-resume".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        assert!(!work.join("src/pending.txt").exists());
+        let denied = engine.handle(domain::Request {
+            id: "wrong-approval".into(),
+            command: domain::Command::ApproveTool {
+                run_id: "waiting-resume".into(),
+                approval_id: "wrong".into(),
+                approved: true,
+            },
+        });
+        assert!(denied.result.is_err());
+        assert!(!work.join("src/pending.txt").exists());
+        let accepted = engine.handle(domain::Request {
+            id: "approve".into(),
+            command: domain::Command::ApproveTool {
+                run_id: "waiting-resume".into(),
+                approval_id: approval,
+                approved: true,
+            },
+        });
+        assert!(accepted.result.is_ok(), "{:?}", accepted.result);
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/pending.txt")).unwrap(),
+            "approved"
+        );
+        let _ = engine.handle(domain::Request {
+            id: "cancel".into(),
+            command: domain::Command::CancelRun {
+                run_id: "waiting-resume".into(),
+            },
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while engine.slots.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::remove_file(work.join("src/pending.txt")).unwrap();
         std::fs::write(work.join("src/a.txt"), "before").unwrap();
         let mut unsupported = project.clone();
         unsupported["approved"]["tasks"][0]["validation"] = serde_json::json!(["exec_json:{}"]);
