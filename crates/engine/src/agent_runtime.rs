@@ -252,7 +252,7 @@ pub(crate) struct Runtime {
     engine: Arc<Engine>,
     identity: RunIdentity,
     spec: domain::ApprovedSpec,
-    mcp_workers: Arc<crate::mcp_runtime::AgentWorkers>,
+    effect_workers: Arc<crate::mcp_runtime::AgentWorkers>,
 }
 
 // 2026-11-16: 현재 승인과 실행 세대에서만 도구와 검증을 실행한다.
@@ -274,12 +274,12 @@ impl Runtime {
                 attempt: expected_attempt,
             },
             spec,
-            mcp_workers: Arc::new(crate::mcp_runtime::AgentWorkers::default()),
+            effect_workers: Arc::new(crate::mcp_runtime::AgentWorkers::default()),
         }
     }
 
-    pub(crate) async fn wait_mcp_workers(&self) {
-        self.mcp_workers.wait().await;
+    pub(crate) async fn wait_effect_workers(&self) {
+        self.effect_workers.wait().await;
     }
 
     async fn snapshot(&self) -> Result<serde_json::Value, String> {
@@ -683,6 +683,100 @@ impl crate::agent_loop::DurableToolDriver for Runtime {
         args: serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<serde_json::Value, String> {
+        if name == "exec" {
+            loop {
+                let engine = Arc::clone(&self.engine);
+                let identity = self.identity.clone();
+                let role_name = role.to_owned();
+                let task_id = task.id.clone();
+                let call = call_id.to_owned();
+                let args = args.clone();
+                let check = cancel.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let _guard = engine
+                        .mutation_gate
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if check.is_cancelled() {
+                        return Err("cancelled".into());
+                    }
+                    let db = engine.db.get().ok_or("storage unavailable")?;
+                    check_identity(&db, &identity)?;
+                    runs::submit_bound_exec(
+                        &db,
+                        &identity.run_id,
+                        &role_name,
+                        &task_id,
+                        &call,
+                        args,
+                    )
+                })
+                .await
+                .map_err(|_| "runtime worker failed")??;
+                match result["status"].as_str() {
+                    Some("completed") => return Ok(result["result"].clone()),
+                    Some("awaiting_approval") => {
+                        tokio::select! {_=cancel.cancelled()=>return Err("cancelled".into()),_=tokio::time::sleep(std::time::Duration::from_millis(50))=>{}}
+                    }
+                    Some("approved_exec") => {
+                        let approval = result["approval_id"]
+                            .as_str()
+                            .ok_or("approval missing")?
+                            .to_owned();
+                        let run = self.snapshot().await?;
+                        let mut ctx = self.context(&run, task, role)?;
+                        ctx.side_effect_authorized = true;
+                        let engine = Arc::clone(&self.engine);
+                        let identity = self.identity.clone();
+                        let call = call_id.to_owned();
+                        let token = cancel.clone();
+                        let guard = self.effect_workers.register();
+                        let worker = tokio::spawn(async move {
+                            let _guard = guard;
+                            let e = Arc::clone(&engine);
+                            let i = identity.clone();
+                            let a = approval.clone();
+                            let c = call.clone();
+                            let check = token.clone();
+                            let input = tokio::task::spawn_blocking(move || {
+                                let _gate =
+                                    e.mutation_gate.lock().unwrap_or_else(|e| e.into_inner());
+                                if check.is_cancelled() {
+                                    return Err("cancelled".into());
+                                }
+                                let db = e.db.get().ok_or("storage unavailable")?;
+                                check_identity(&db, &i)?;
+                                runs::consume_bound_exec(&db, &i.run_id, &a, &c)
+                            })
+                            .await
+                            .map_err(|_| "runtime worker failed")??;
+                            let result =
+                                crate::tools::execute_tool(ctx, "exec", input, token).await;
+                            let saved=result.as_ref().ok().map(|v|serde_json::json!({"content":v.content,"exit_code":v.exit_code}));
+                            let e = Arc::clone(&engine);
+                            let i = identity.clone();
+                            let a = approval.clone();
+                            let c = call.clone();
+                            let complete = tokio::task::spawn_blocking(move || {
+                                let db = e.db.get().ok_or("storage unavailable")?;
+                                runs::finish_bound_exec(&db, &i.run_id, &a, &c, saved)
+                            })
+                            .await
+                            .map_err(|_| "runtime worker failed")??;
+                            if !complete {
+                                return Err("command outcome uncertain".into());
+                            }
+                            let result = result?;
+                            Ok(
+                                serde_json::json!({"content":result.content,"exit_code":result.exit_code}),
+                            )
+                        });
+                        return worker.await.map_err(|_| "runtime worker failed")?;
+                    }
+                    _ => return Err("unsupported durable exec execution".into()),
+                }
+            }
+        }
         if name == "mcp" {
             loop {
                 let engine = Arc::clone(&self.engine);
@@ -723,7 +817,7 @@ impl crate::agent_loop::DurableToolDriver for Runtime {
                             call_id.to_owned(),
                             cancel.clone(),
                             self.identity.clone(),
-                            Arc::clone(&self.mcp_workers),
+                            Arc::clone(&self.effect_workers),
                         )
                         .await?;
                         return match response {
@@ -1826,7 +1920,7 @@ mod bridge_integration_tests {
         )
         .unwrap();
         let runtime = fixture.runtime();
-        let workers = Arc::clone(&runtime.mcp_workers);
+        let workers = Arc::clone(&runtime.effect_workers);
         let task = fixture.spec.tasks[0].clone();
         let token = CancellationToken::new();
         let child = token.clone();
@@ -1975,6 +2069,274 @@ mod bridge_integration_tests {
         let _ = work.await;
         assert_eq!(run["status"], "awaiting_approval");
         assert_eq!(run["pending"]["call_id"], "exec-1");
+        let approval = run["pending"]["id"].as_str().unwrap();
+        let mut tampered = run.clone();
+        tampered["pending"]["arguments"]["args"] = json!(["tampered"]);
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), tampered.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(runs::approve_patch(&db, &fixture.run_id, approval, true).is_err());
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+            let mut projects = tx.open_table(PROJECTS).unwrap();
+            let mut project: Value =
+                serde_json::from_str(projects.get("project").unwrap().unwrap().value()).unwrap();
+            project["context_version"] = 3.into();
+            projects
+                .insert("project", project.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(runs::approve_patch(&db, &fixture.run_id, approval, true).is_err());
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(PROJECTS).unwrap();
+            let mut project: Value =
+                serde_json::from_str(projects.get("project").unwrap().unwrap().value()).unwrap();
+            project["context_version"] = 2.into();
+            projects
+                .insert("project", project.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let approved = runs::approve_patch(
+            &db,
+            &fixture.run_id,
+            run["pending"]["id"].as_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(approved["status"], "approved_exec");
+        runs::cancel(&db, &fixture.run_id).unwrap();
+        let cancelled = runs::get(&db, &fixture.run_id).unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled["pending"].is_null());
+    }
+    #[tokio::test]
+    async fn approved_exec_runs_once_and_reuses_result() {
+        let fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let mut run: Value =
+                serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value())
+                    .unwrap();
+            run["agent_configs"][1]["tools"] = json!(["read", "patch", "exec"]);
+            table
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        std::fs::write(fixture.work.join("src/enable-exec"), "").unwrap();
+        let args = json!({"program":std::env::current_exe().unwrap().to_string_lossy(),"args":["--exact","agent_runtime::bridge_integration_tests::exec_fixture_child","--nocapture"],"cwd":"src"});
+        let runtime = fixture.runtime();
+        let task = fixture.spec.tasks[0].clone();
+        let input = args.clone();
+        let logical = serde_json::to_string(&("task", "implementer", 0, "exec-once")).unwrap();
+        let requested = logical.clone();
+        let work = tokio::spawn(async move {
+            runtime
+                .execute_durable(
+                    "implementer",
+                    &task,
+                    "exec",
+                    &requested,
+                    input,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let run = loop {
+            let run = runs::get(&db, &fixture.run_id).unwrap();
+            if run["status"] == "awaiting_approval" {
+                break run;
+            }
+            assert!(!work.is_finished());
+            tokio::task::yield_now().await;
+        };
+        assert!(!fixture.work.join("src/exec-ran").exists());
+        runs::approve_patch(
+            &db,
+            &fixture.run_id,
+            run["pending"]["id"].as_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), work)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(fixture.work.join("src/exec-ran").exists());
+        std::fs::write(fixture.work.join("src/exec-ran"), "preserve").unwrap();
+        let replay = fixture
+            .runtime()
+            .execute_durable(
+                "implementer",
+                &fixture.spec.tasks[0],
+                "exec",
+                &logical,
+                args.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, result);
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("src/exec-ran")).unwrap(),
+            "preserve"
+        );
+        let mut saved_run = runs::get(&db, &fixture.run_id).unwrap();
+        saved_run["status"] = "interrupted".into();
+        saved_run["agent_active"] = false.into();
+        let checkpoint = json!({"schema_version":1,"revision":1,"spec_hash":"fixture","spec_version":1,"model_identity":"model","config_hash":"config","task_index":0,"role_index":1,"round":0,"input":[],"pending_calls":[{"call_id":"exec-once","name":"exec","arguments":args}],"pending_index":0,"evidence":[],"completed_tasks":[],"used_calls":[],"tokens_used":0,"model_inflight":false,"role_complete":false,"validation_index":0,"reserved_tokens":0});
+        let tx = db.begin_write().unwrap();
+        {
+            let mut projects = tx.open_table(PROJECTS).unwrap();
+            let mut project: Value =
+                serde_json::from_str(projects.get("project").unwrap().unwrap().value()).unwrap();
+            project["agent_configs"] = saved_run["agent_configs"].clone();
+            projects
+                .insert("project", project.to_string().as_str())
+                .unwrap();
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), saved_run.to_string().as_str())
+                .unwrap();
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let expected = runs::get(&db, &fixture.run_id).unwrap();
+        let resumed =
+            runs::begin_resume(&db, &fixture.run_id, &expected, "model", "config").unwrap();
+        assert_eq!(resumed["agent_attempt"], 2);
+    }
+    #[test]
+    fn exec_fixture_child() {
+        if std::path::Path::new("enable-exec").exists() {
+            std::fs::write("exec-ran", "fixture").unwrap();
+        }
+    }
+    #[test]
+    fn exec_fixture_block_child() {
+        if std::path::Path::new("enable-exec").exists() {
+            std::fs::write("exec-started", std::process::id().to_string()).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            std::fs::write("exec-late", "unexpected").unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_started_exec_is_uncertain_and_not_replayed() {
+        let fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap();
+            let mut run: Value =
+                serde_json::from_str(table.get(fixture.run_id.as_str()).unwrap().unwrap().value())
+                    .unwrap();
+            run["agent_configs"][1]["tools"] = json!(["read", "patch", "exec"]);
+            table
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        std::fs::write(fixture.work.join("src/enable-exec"), "").unwrap();
+        let args = json!({"program":std::env::current_exe().unwrap().to_string_lossy(),"args":["--exact","agent_runtime::bridge_integration_tests::exec_fixture_block_child","--nocapture"],"cwd":"src"});
+        let runtime = fixture.runtime();
+        let workers = Arc::clone(&runtime.effect_workers);
+        let task = fixture.spec.tasks[0].clone();
+        let token = CancellationToken::new();
+        let child = token.clone();
+        let input = args.clone();
+        let work = tokio::spawn(async move {
+            runtime
+                .execute_durable("implementer", &task, "exec", "exec-cancel", input, child)
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let run = loop {
+            let run = runs::get(&db, &fixture.run_id).unwrap();
+            if run["status"] == "awaiting_approval" {
+                break run;
+            }
+            assert!(tokio::time::Instant::now() < deadline && !work.is_finished());
+            tokio::task::yield_now().await;
+        };
+        runs::approve_patch(
+            &db,
+            &fixture.run_id,
+            run["pending"]["id"].as_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        while !fixture.work.join("src/exec-started").exists() {
+            assert!(tokio::time::Instant::now() < deadline && !work.is_finished());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: u32 = std::fs::read_to_string(fixture.work.join("src/exec-started"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        runs::cancel(&db, &fixture.run_id).unwrap();
+        let writer = db.begin_write().unwrap();
+        token.cancel();
+        work.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), workers.wait())
+                .await
+                .is_err()
+        );
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), workers.wait())
+            .await
+            .unwrap();
+        unsafe {
+            use windows_sys::Win32::{
+                Foundation::{CloseHandle, WAIT_OBJECT_0},
+                System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+            };
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if !handle.is_null() {
+                assert_eq!(WaitForSingleObject(handle, 1000), WAIT_OBJECT_0);
+                CloseHandle(handle);
+            }
+        }
+        assert_eq!(
+            runs::get(&db, &fixture.run_id).unwrap()["status"],
+            "uncertain"
+        );
+        assert!(fixture
+            .runtime()
+            .execute_durable(
+                "implementer",
+                &fixture.spec.tasks[0],
+                "exec",
+                "exec-cancel",
+                args,
+                CancellationToken::new()
+            )
+            .await
+            .is_err());
+        assert!(!fixture.work.join("src/exec-late").exists());
     }
     #[tokio::test]
     async fn checkpoint_loop_applies_patch_once_and_reuses_real_evidence() {
@@ -2055,7 +2417,7 @@ mod bridge_integration_tests {
         let fixture = Fixture::new("step_by_step");
         let runtime = fixture.runtime();
         let token = CancellationToken::new();
-        for name in ["exec", "git", "knowledge"] {
+        for name in ["git", "knowledge"] {
             assert_eq!(
                 runtime
                     .execute_durable(
