@@ -4,6 +4,7 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod agent_settings_ui;
 mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_text_ui;
@@ -50,6 +51,7 @@ struct State {
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
+    agent_settings: agent_settings_ui::State,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
 }
@@ -170,6 +172,48 @@ impl App {
         }
     }
 
+    fn refresh_agent_project(&mut self, project_id: &str) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || !self.state.agent_settings.refresh.contains(project_id)
+            || self.state.agent_settings.refreshing.contains(project_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::AgentSettingsRefresh {
+                project_id: project_id.into(),
+                generation: self.state.generation,
+            },
+            Command::GetProject {
+                project_id: project_id.into(),
+            },
+        )) {
+            self.state
+                .agent_settings
+                .refreshing
+                .insert(project_id.into());
+        }
+    }
+    fn save_agent_mode(&mut self, project_id: &str, mode: String) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || self.state.agent_settings.blocked(project_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::AgentSettingsSave {
+                project_id: project_id.into(),
+                generation: self.state.generation,
+            },
+            Command::SetAutonomy {
+                project_id: project_id.into(),
+                mode,
+            },
+        )) {
+            self.state.agent_settings.pending.insert(project_id.into());
+        }
+    }
+
     fn cancel_execution(&mut self, project_id: &str, run_id: &str) {
         if self.state.selected.as_deref() != Some(project_id)
             || self.state.history.project.as_deref() != Some(project_id)
@@ -198,7 +242,8 @@ impl App {
             .get(&project.id)
             .is_none_or(|form| form.is_clean(project));
         let pending = self.state.spec_review_pending.contains(&project.id)
-            || self.state.execution_pending.contains(&project.id);
+            || self.state.execution_pending.contains(&project.id)
+            || self.state.agent_settings.blocked(&project.id);
         if self.state.selected.as_deref() != Some(&project.id) {
             return;
         }
@@ -1119,6 +1164,59 @@ impl App {
                     }
                 }
             }
+            Kind::AgentSettingsSave {
+                project_id,
+                generation,
+            } => {
+                self.state.agent_settings.pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project)) if project.id == project_id => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.generation == generation {
+                            self.refresh_agent_project(&project_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                        {
+                            self.state.status =
+                                format!("설정 저장 실패: {error}. 프로젝트 상태를 확인하세요.");
+                        }
+                    }
+                    Ok(_) => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                        {
+                            self.state.status =
+                                "설정 저장 응답이 올바르지 않습니다. 프로젝트 상태를 확인하세요."
+                                    .into();
+                        }
+                    }
+                }
+            }
+            Kind::AgentSettingsRefresh {
+                project_id,
+                generation,
+            } => {
+                self.state.agent_settings.refreshing.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.generation == generation
+                {
+                    match reply.result {
+                        Ok(ResponseData::Project(project)) if project.id == project_id => {
+                            self.state.project = Some(project);
+                            self.state.agent_settings.refresh.remove(&project_id);
+                        }
+                        Err(error) => {
+                            self.state.status = format!("프로젝트 상태 조회 실패: {error}")
+                        }
+                        _ => self.state.status = "프로젝트 상태 응답이 올바르지 않습니다.".into(),
+                    }
+                }
+            }
             Kind::StartExecution {
                 project_id,
                 generation,
@@ -1336,7 +1434,8 @@ impl App {
                             .get(&project.id)
                             .is_none_or(|form| form.is_clean(&project));
                         let pending = self.state.spec_review_pending.contains(&project.id)
-                            || self.state.execution_pending.contains(&project.id);
+                            || self.state.execution_pending.contains(&project.id)
+                            || self.state.agent_settings.blocked(&project.id);
                         if ui
                             .add_enabled(
                                 run_controls::start_hash(&project, clean, pending).is_some(),
@@ -1520,7 +1619,8 @@ impl App {
                             || self.state.interview_pending.contains(&project.id)
                             || self.state.model_pending.contains(&project.id)
                             || self.state.spec_starting.contains(&project.id)
-                            || self.state.spec_runs.contains_key(&project.id);
+                            || self.state.spec_runs.contains_key(&project.id)
+                            || self.state.agent_settings.blocked(&project.id);
                         if let Some(action) = spec_review::render(
                             ui,
                             &project,
@@ -1679,6 +1779,40 @@ impl App {
                                     )) {
                                         self.state.decisions.pending.insert(project.id.clone());
                                     }
+                                }
+                            }
+                        }
+                        if let Some(action) =
+                            agent_settings_ui::render(ui, &mut self.state.agent_settings, &project)
+                        {
+                            match action {
+                                agent_settings_ui::Action::Agents(Ok(agents)) => {
+                                    if !self.state.agent_settings.blocked(&project.id)
+                                        && self.send(worker::Work::new(
+                                            worker::Kind::AgentSettingsSave {
+                                                project_id: project.id.clone(),
+                                                generation: self.state.generation,
+                                            },
+                                            Command::ConfigureAgents {
+                                                project_id: project.id.clone(),
+                                                agents,
+                                            },
+                                        ))
+                                    {
+                                        self.state
+                                            .agent_settings
+                                            .pending
+                                            .insert(project.id.clone());
+                                    }
+                                }
+                                agent_settings_ui::Action::Agents(Err(error)) => {
+                                    self.state.status = error
+                                }
+                                agent_settings_ui::Action::Mode(mode) => {
+                                    self.save_agent_mode(&project.id, mode)
+                                }
+                                agent_settings_ui::Action::Refresh => {
+                                    self.refresh_agent_project(&project.id)
                                 }
                             }
                         }
@@ -5330,6 +5464,179 @@ mod tests {
         });
         assert_eq!(app.state.status, "다른 프로젝트");
         assert!(!app.state.execution_pending.contains("a"));
+    }
+    #[test]
+    fn agent_mode_save_targets_selected_project_and_blocks_approval() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("b", "step".into());
+        assert!(work.try_recv().is_err());
+        app.save_agent_mode("a", "step".into());
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::SetAutonomy{project_id,mode} if project_id=="a" && mode=="step")
+        );
+        assert!(app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn agent_save_waits_for_project_refresh_before_unblocking() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        let refresh = work.try_recv().unwrap();
+        assert!(matches!(refresh.command,Command::GetProject{project_id} if project_id=="a"));
+        app.apply(worker::Reply {
+            kind: refresh.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(!app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn selected_project_shows_agent_configuration_controls() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="에이전트 설정 저장")));
+    }
+    #[test]
+    fn agent_refresh_does_not_queue_duplicate_requests() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.agent_settings.refresh.insert("a".into());
+        app.refresh_agent_project("a");
+        app.refresh_agent_project("a");
+        assert!(work.try_recv().is_ok());
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn agent_unknown_success_after_switch_keeps_project_blocked() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.state.select("b");
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        assert!(!app.state.agent_settings.blocked("b"));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn agent_save_error_requires_fresh_project_before_approval() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Err("연결 오류".into()),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn late_agent_refresh_after_project_round_trip_stays_blocked() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.agent_settings.refresh.insert("a".into());
+        app.refresh_agent_project("a");
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        app.refresh_agent_project("a");
+        assert!(work.try_recv().is_ok());
     }
     #[test]
     fn mcp_save_uses_explicit_project_and_endpoint_and_blocks_duplicates() {

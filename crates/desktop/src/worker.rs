@@ -18,6 +18,14 @@ pub enum Kind {
         epoch: u64,
         sequence: u64,
     },
+    AgentSettingsSave {
+        project_id: String,
+        generation: u64,
+    },
+    AgentSettingsRefresh {
+        project_id: String,
+        generation: u64,
+    },
     CancelExecution {
         project_id: String,
         run_id: String,
