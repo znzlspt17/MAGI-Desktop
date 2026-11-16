@@ -26,7 +26,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 pwsh -NoProfile -File ./scripts/build-windows.ps1
 ```
 
-이 명령은 workspace의 release 빌드를 실행하고 매번 새로운 `target/windows-build-<식별자>` 폴더를 만듭니다. 성공 시 출력된 폴더의 `release` 아래에 `desktop.exe`, `engine.exe`, `inference.exe`가 생성됩니다. 세 프로그램은 별도 프로세스입니다. 빌드 스크립트 자체는 배포 패키지나 제3자 라이선스 고지를 생성하지 않습니다.
+이 명령은 Rust host target을 명시해 workspace의 release 빌드를 실행하고 매번 새로운 `target/windows-build-<식별자>` 폴더를 만듭니다. 성공 시 target별 release 출력에서 세 실행 파일을 기존 패키징 경로인 출력 폴더의 `release` 아래로 복사하고, `build-info.json`에 공개 빌드 정보를 기록합니다. 세 프로그램은 별도 프로세스입니다. 빌드 스크립트 자체는 배포 패키지나 제3자 라이선스 고지를 생성하지 않습니다.
 
 ## 개발용 ZIP
 
@@ -36,6 +36,6 @@ pwsh -NoProfile -File ./scripts/build-windows.ps1
 pwsh -NoProfile -File ./scripts/package-windows.ps1 -BuildDirectory './target/windows-build-<식별자>/release'
 ```
 
-지정한 폴더의 세 실행 파일과 안내문, `THIRD-PARTY-NOTICES.txt`를 새 `dist/windows-<식별자>` 폴더 및 ZIP에 담습니다. 라이선스 고지 수집은 현재 workspace의 잠금 의존성과 로컬에 있는 공개 Cargo 소스를 사용하며 네트워크 없이 실행됩니다. 필요한 의존성이 로컬에 없으면 패키징이 실패할 수 있습니다.
+지정한 폴더의 세 실행 파일과 안내문, `THIRD-PARTY-NOTICES.txt`를 새 `dist/windows-<식별자>` 폴더 및 ZIP에 담습니다. 유효한 `build-info.json`이 있으면 함께 포함해 총 6개 파일을 담고, 기록이 없으면 5개 파일을 담으며 출처를 미확인으로 표시합니다. 라이선스 고지 수집은 현재 workspace의 잠금 의존성과 Rust host target의 로컬 공개 Cargo 소스를 사용하며 네트워크 없이 실행됩니다. 필요한 의존성이 로컬에 없으면 패키징이 실패할 수 있습니다.
 
-고지 파일에는 찾지 못한 원문이 표시됩니다. 입력 실행 파일이 현재 workspace에서 만들어졌는지는 확인하지 않으므로, 배포 전에는 빌드 출처와 누락된 고지를 별도로 확인해야 합니다. 이 ZIP은 개발용이며 배포 준비가 완료된 패키지가 아닙니다. 실제 모델 추론은 아직 지원하지 않습니다.
+빌드 기록은 schemaVersion, sourceRevision, sourceDirty, rustVersion, target, binaries의 6개 공개 필드로 구성됩니다. 기록과 현재 workspace의 revision, 변경 상태 또는 host target이 다르면 안내문에 표시합니다. 기록은 제공자가 작성한 정보로, 실행 파일의 무결성이나 실제 빌드 출처를 증명하지 않습니다. 고지 파일에는 찾지 못한 원문이 표시됩니다. 배포 전에는 빌드 출처와 누락된 고지를 별도로 확인해야 합니다. 이 ZIP은 개발용이며 배포 준비가 완료된 패키지가 아닙니다. 실제 모델 추론은 아직 지원하지 않습니다.
