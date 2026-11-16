@@ -123,7 +123,8 @@ impl App {
             return;
         }
         if approved
-            && (!tool_approval_ui::approval_matches(project, run)
+            && (!tool_approval_ui::tool_active_permitted(&item, run)
+                || !tool_approval_ui::approval_matches(project, run)
                 || self.state.agent_settings.blocked(&project.id)
                 || self.state.spec_review_pending.contains(&project.id)
                 || !self
@@ -6034,7 +6035,7 @@ mod tests {
         app.state.history.project("a");
         app.state.history.selected = Some("r".into());
         app.state.history.detail = Some(
-            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
         );
         let item =
             tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
@@ -6105,7 +6106,7 @@ mod tests {
         app.state.history.project("a");
         app.state.history.selected = Some("r".into());
         app.state.history.detail = Some(
-            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"old"},"call_id":null}}),
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"old"},"call_id":null}}),
         );
         let item =
             tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
@@ -6171,7 +6172,7 @@ mod tests {
         };
         app.state.history.project("a");
         app.state.history.selected = Some("r".into());
-        let detail = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}});
+        let detail = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}});
         app.state.history.detail = Some(detail.clone());
         let item = tool_approval_ui::pending(&p, &detail, "r").unwrap();
         app.answer_tool(&p, item, true);
@@ -6179,6 +6180,40 @@ mod tests {
         assert!(!app.state.tool_pending.contains("r"));
         assert_eq!(app.state.history.detail.as_ref(), Some(&detail));
         assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn inactive_patch_approval_is_blocked_but_rejection_is_allowed() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":false,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":"call"}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(work.try_recv().is_err());
+        app.answer_tool(&p, item, false);
+        assert!(matches!(
+            work.try_recv().unwrap().command,
+            Command::ApproveTool {
+                approved: false,
+                ..
+            }
+        ));
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
