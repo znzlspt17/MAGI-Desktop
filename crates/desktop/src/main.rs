@@ -123,9 +123,6 @@ struct App {
 }
 
 impl App {
-    fn resume_agent(&mut self, project: &Project) {
-        self.agent_request(project, true);
-    }
     fn semantic_search(&mut self, id: &str) {
         if self.state.selected.as_deref() != Some(id)
             || self.state.semantic_search.active.as_deref() != Some(id)
@@ -403,6 +400,9 @@ impl App {
         }
     }
 
+    fn resume_agent(&mut self, project: &Project) {
+        self.agent_request(project, true);
+    }
     fn start_agent(&mut self, project: &Project) {
         self.agent_request(project, false);
     }
