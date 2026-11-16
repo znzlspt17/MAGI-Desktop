@@ -3,6 +3,46 @@ use domain::ResponseData;
 use std::sync::Arc;
 
 type AuthStamp = (String, (String, Option<String>), Option<(String, bool)>);
+#[cfg(all(test, windows))]
+type ClaimHook = (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(all(test, windows))]
+pub(crate) static TEST_AFTER_MCP_CLAIM: std::sync::Mutex<Option<ClaimHook>> =
+    std::sync::Mutex::new(None);
+
+// 2026-11-16: 취소가 상위 future를 버려도 외부 worker가 끝나기 전 agent lease를 돌려주지 않는다.
+#[derive(Default)]
+pub(crate) struct AgentWorkers {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+impl AgentWorkers {
+    fn register(self: &Arc<Self>) -> AgentWorker {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        AgentWorker(Arc::clone(self))
+    }
+    pub(crate) async fn wait(&self) {
+        loop {
+            let notified = self.changed.notified();
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+struct AgentWorker(Arc<AgentWorkers>);
+impl Drop for AgentWorker {
+    fn drop(&mut self) {
+        self.0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.changed.notify_one();
+    }
+}
 
 // 2026-11-16: 승인 실행의 프로젝트와 정확히 같은 MCP 주소에만 세대가 결박된 토큰을 사용한다.
 fn run_auth(
@@ -59,16 +99,43 @@ pub(crate) async fn call(
     run_id: String,
     approval_id: String,
 ) -> Result<ResponseData, String> {
-    call_inner(engine, run_id, approval_id, None).await
+    call_inner(engine, run_id, approval_id, None, None).await
 }
 
 #[cfg(windows)]
-pub(crate) async fn call_bound(engine: Arc<Engine>, run_id: String, approval_id: String, call_id: String, token: tokio_util::sync::CancellationToken, identity: crate::agent_runtime::RunIdentity) -> Result<ResponseData, String> {
-    call_inner(engine, run_id, approval_id, Some((call_id, token, identity))).await
+pub(crate) async fn call_bound(
+    engine: Arc<Engine>,
+    run_id: String,
+    approval_id: String,
+    call_id: String,
+    token: tokio_util::sync::CancellationToken,
+    identity: crate::agent_runtime::RunIdentity,
+    workers: Arc<AgentWorkers>,
+) -> Result<ResponseData, String> {
+    call_inner(
+        engine,
+        run_id,
+        approval_id,
+        Some((call_id, token, identity)),
+        Some(workers),
+    )
+    .await
 }
 
-async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bound: Option<(String, tokio_util::sync::CancellationToken, crate::agent_runtime::RunIdentity)>) -> Result<ResponseData, String> {
+async fn call_inner(
+    engine: Arc<Engine>,
+    run_id: String,
+    approval_id: String,
+    bound: Option<(
+        String,
+        tokio_util::sync::CancellationToken,
+        crate::agent_runtime::RunIdentity,
+    )>,
+    workers: Option<Arc<AgentWorkers>>,
+) -> Result<ResponseData, String> {
+    let guard = workers.as_ref().map(AgentWorkers::register);
     let task = tokio::spawn(async move {
+        let _guard = guard;
         let worker = Arc::clone(&engine);
         let consume_run = run_id.clone();
         let consume_approval = approval_id.clone();
@@ -88,9 +155,18 @@ async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bo
             }
             let db = worker.db.get().ok_or("storage unavailable")?;
             if let Some((call, token, identity)) = consume_bound {
-                if token.is_cancelled() { return Err("cancelled".into()); }
+                if token.is_cancelled() {
+                    return Err("cancelled".into());
+                }
                 #[cfg(windows)]
-                { crate::agent_runtime::check_identity(&db, &identity)?; return Ok((runs::consume_bound_mcp(&db, &consume_run, &consume_approval, &call)?, Arc::new(token), false)); }
+                {
+                    crate::agent_runtime::check_identity(&db, &identity)?;
+                    return Ok((
+                        runs::consume_bound_mcp(&db, &consume_run, &consume_approval, &call)?,
+                        Arc::new(token),
+                        false,
+                    ));
+                }
                 #[cfg(not(windows))]
                 return Err("agent MCP unavailable".into());
             }
@@ -119,6 +195,27 @@ async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bo
         })
         .await
         .map_err(err)??;
+        #[cfg(all(test, windows))]
+        {
+            let hook = {
+                let mut hook = TEST_AFTER_MCP_CLAIM.lock().unwrap();
+                if hook.as_ref().is_some_and(|v| v.0 == run_id) {
+                    hook.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, ready, release)) = hook {
+                tokio::task::spawn_blocking(move || {
+                    ready.send(()).unwrap();
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                })
+                .await
+                .map_err(err)?;
+            }
+        }
         let _lease = owned.then(|| CancellationLease {
             engine: Arc::clone(&engine),
             run_id: run_id.clone(),
@@ -131,6 +228,7 @@ async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bo
             let cwd=request["cwd"].as_str().ok_or("invalid cwd")?;
             let e=engine.clone();let r=run_id.clone();let target=endpoint.to_owned();
             let (auth_stamp, credential)=tokio::task::spawn_blocking(move || run_auth(&e,&r,&target)).await.map_err(err)??;
+            if bound.is_some() && auth_stamp.as_ref().is_none_or(|(_,endpoint,_)| request["_endpoint_stamp"] != serde_json::json!(endpoint)) { return Err("MCP endpoint changed".into()); }
             let client=match credential {
                 Some(credential) => tokio::select! { biased; _ = token.cancelled() => return Err("MCP connection cancelled".into()), result = integrations::mcp::McpClient::connect_authenticated(endpoint,credential.0.clone()) => result? },
                 None => integrations::mcp::McpClient::connect_cancelable(endpoint, token.as_ref().clone()).await?,
@@ -147,7 +245,10 @@ async fn call_inner(engine: Arc<Engine>, run_id: String, approval_id: String, bo
             Ok(ResponseData::Data(serde_json::json!({"content":output.content,"structured_content":output.structured_content,"is_error":output.is_error})))
         }.await;
         let finish_engine = Arc::clone(&engine);
-        let saved = result.as_ref().ok().and_then(|v| match v { ResponseData::Data(v) => Some(v.clone()), _ => None });
+        let saved = result.as_ref().ok().and_then(|v| match v {
+            ResponseData::Data(v) => Some(v.clone()),
+            _ => None,
+        });
         let complete = tokio::task::spawn_blocking(move || {
             let db = finish_engine.db.get().ok_or("storage unavailable")?;
             if let Some((call, _, _)) = bound {
