@@ -175,6 +175,22 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if let Command::SearchKnowledge {
+            project_id,
+            query,
+            semantic: true,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::semantic_search(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    query.clone(),
+                )
+                .await,
+            };
+        }
         if let Command::IndexKnowledge {
             project_id,
             document_id,
