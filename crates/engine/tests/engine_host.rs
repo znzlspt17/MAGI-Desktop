@@ -15,7 +15,11 @@ fn status_reports_only_current_engine_capabilities() {
     match response.result.unwrap() {
         ResponseData::Status { message } => assert_eq!(
             message,
-            "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
+            if cfg!(windows) {
+                "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
+            } else {
+                "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
+            }
         ),
         _ => panic!("expected engine status"),
     }

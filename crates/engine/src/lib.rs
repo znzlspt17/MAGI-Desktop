@@ -241,6 +241,10 @@ impl Engine {
         if let Command::StartAgent {
             run_id,
             mock_script,
+        }
+        | Command::ResumeAgent {
+            run_id,
+            mock_script,
         } = &request.command
         {
             return Response {
@@ -249,6 +253,7 @@ impl Engine {
                     Arc::clone(&self),
                     run_id.clone(),
                     mock_script.clone(),
+                    matches!(&request.command, Command::ResumeAgent { .. }),
                 )
                 .await
                 .map(|_| ResponseData::Empty),
@@ -731,6 +736,8 @@ impl Engine {
             Command::Status => Ok(ResponseData::Status {
                 message: if self.completions.blocked() {
                     "engine storage recovery pending"
+                } else if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
                 } else {
                     "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
                 }.into(),
@@ -1264,7 +1271,14 @@ mod status_guidance_tests {
             command: Command::Status,
         });
         match response.result.unwrap() {
-            ResponseData::Status { message } => assert_eq!(message, "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"),
+            ResponseData::Status { message } => assert_eq!(
+                message,
+                if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
+                } else {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
+                }
+            ),
             _ => panic!("expected status"),
         }
         drop(engine);
