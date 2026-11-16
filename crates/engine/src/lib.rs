@@ -7,6 +7,7 @@ pub mod agent_loop;
 // 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
+mod knowledge_indexing;
 mod knowledge_text;
 mod mcp_connections;
 mod mcp_runtime;
@@ -28,6 +29,7 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SCHEMA_VERSION: u64 = 1;
 
 pub struct Engine {
+    indexing: std::sync::Mutex<knowledge_indexing::IndexState>,
     db: storage::StorageSlot,
     run_root: std::path::PathBuf,
     git_gate: Arc<std::sync::Mutex<()>>,
@@ -126,6 +128,7 @@ impl Engine {
         };
         let startup_pending = completions.blocked();
         Ok(Self {
+            indexing: std::sync::Mutex::new(knowledge_indexing::IndexState::default()),
             db,
             run_root: parent,
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -147,6 +150,7 @@ impl Engine {
                 | Command::SaveDecision { .. }
                 | Command::ReviseDecision { .. }
                 | Command::SelectDecision { .. }
+                | Command::ConfigureEmbedding { .. }
                 | Command::PutKnowledge { .. }
                 | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
@@ -171,6 +175,37 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if let Command::SearchKnowledge {
+            project_id,
+            query,
+            semantic: true,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::semantic_search(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    query.clone(),
+                )
+                .await,
+            };
+        }
+        if let Command::IndexKnowledge {
+            project_id,
+            document_id,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::start(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    document_id.clone(),
+                )
+                .await,
+            };
+        }
         if let Command::ListMcpTools { project_id } = &request.command {
             return Response {
                 id: request_id,
@@ -448,6 +483,8 @@ impl Engine {
                 | Command::SearchKnowledgePage { .. }
                 | Command::SearchKnowledgeVector { .. }
                 | Command::GetKnowledgeSource { .. }
+                | Command::CancelKnowledgeIndex { .. }
+                | Command::KnowledgeIndexStatus { .. }
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
                 | Command::GetProject { .. }
@@ -472,6 +509,7 @@ impl Engine {
             | Command::ReviseDecision { project_id, .. }
             | Command::SelectDecision { project_id, .. }
             | Command::ConfigureMcp { project_id, .. }
+            | Command::ConfigureEmbedding { project_id, .. }
             | Command::PutKnowledge { project_id, .. }
             | Command::SetKnowledgeEmbedding { project_id, .. } => Some(project_id),
             _ => None,
@@ -579,6 +617,15 @@ impl Engine {
             Command::GetGraphPage { project_id, offset, limit } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::graph(&db, &project_id, Some((offset, limit)))
+            }
+            Command::ConfigureEmbedding { project_id, endpoint, model, version, dimensions, credential } => {
+                knowledge_indexing::configure(self, project_id, endpoint, model, version, dimensions, credential)
+            }
+            Command::CancelKnowledgeIndex { project_id, document_id } => {
+                knowledge_indexing::cancel(self, &project_id, &document_id)
+            }
+            Command::KnowledgeIndexStatus { project_id, document_id } => {
+                knowledge_indexing::status(self, &project_id, &document_id)
             }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
