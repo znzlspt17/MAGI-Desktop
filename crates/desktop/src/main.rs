@@ -9,11 +9,13 @@ mod agent_settings_ui;
 mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_text_ui;
+mod mcp_connection_ui;
 mod model_settings;
 mod run_controls;
 mod run_history;
 mod spec_review;
 mod storage;
+mod tool_approval_ui;
 mod worker;
 
 #[derive(Default)]
@@ -50,8 +52,10 @@ struct State {
     knowledge: knowledge_text_ui::State,
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
+    mcp: mcp_connection_ui::State,
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
+    tool_pending: std::collections::HashSet<String>,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
 }
@@ -64,6 +68,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.mcp.reselect(id);
         self.graph.select(id);
         self.decisions.select(id);
         self.knowledge.select(id);
@@ -104,6 +109,120 @@ struct App {
 }
 
 impl App {
+    fn answer_tool(&mut self, project: &Project, item: tool_approval_ui::Pending, approved: bool) {
+        let Some(run_id) = self.state.history.selected.clone() else {
+            return;
+        };
+        let Some(run) = self.state.history.detail.as_ref() else {
+            return;
+        };
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.history.project.as_deref() != Some(&project.id)
+            || self.state.tool_pending.contains(&run_id)
+            || self.state.cancel_pending.contains(&run_id)
+            || self.state.agent_pending.contains(&run_id)
+            || tool_approval_ui::pending(project, run, &run_id).as_ref() != Some(&item)
+        {
+            return;
+        }
+        if approved
+            && (!tool_approval_ui::tool_active_permitted(&item, run)
+                || !tool_approval_ui::approval_matches(project, run)
+                || self.state.agent_settings.blocked(&project.id)
+                || self.state.spec_review_pending.contains(&project.id)
+                || !self
+                    .state
+                    .spec_forms
+                    .get(&project.id)
+                    .is_none_or(|form| form.is_clean(project)))
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::ToolAnswer {
+                project_id: project.id.clone(),
+                run_id: run_id.clone(),
+                request: self.state.history.selection_request,
+                approval_id: item.id.clone(),
+                snapshot: item.raw.clone(),
+            },
+            Command::ApproveTool {
+                run_id: run_id.clone(),
+                approval_id: item.id,
+                approved,
+            },
+        )) {
+            self.state.tool_pending.insert(run_id);
+        }
+    }
+
+    fn mcp_save(&mut self, id: &str, endpoint: &str) {
+        if self.state.selected.as_deref() != Some(id)
+            || self.state.mcp.active.as_deref() != Some(id)
+        {
+            return;
+        }
+        let form = self.state.mcp.form(id);
+        if form.save_pending
+            || form.list_pending
+            || form.endpoint != endpoint
+            || endpoint.trim().is_empty()
+        {
+            return;
+        }
+        let sequence = form.sequence.wrapping_add(1);
+        if self.send(worker::Work::new(
+            worker::Kind::McpSave {
+                project_id: id.into(),
+                endpoint: endpoint.into(),
+                epoch: self.state.mcp.epoch,
+                sequence,
+            },
+            Command::ConfigureMcp {
+                project_id: id.into(),
+                endpoint: endpoint.into(),
+            },
+        )) {
+            let form = self.state.mcp.form(id);
+            form.sequence = sequence;
+            form.save_pending = true;
+            form.tools.clear();
+            form.message = None;
+            form.error = None;
+        }
+    }
+    fn mcp_list(&mut self, id: &str) {
+        if self.state.selected.as_deref() != Some(id)
+            || self.state.mcp.active.as_deref() != Some(id)
+        {
+            return;
+        }
+        let form = self.state.mcp.form(id);
+        let can_list = form.saved.as_ref().is_some_and(|v| v == &form.endpoint)
+            || (form.saved.is_none() && form.endpoint.is_empty());
+        if form.save_pending || form.list_pending || !can_list {
+            return;
+        }
+        let sequence = form.sequence.wrapping_add(1);
+        if self.send(worker::Work::new(
+            worker::Kind::McpList {
+                project_id: id.into(),
+                epoch: self.state.mcp.epoch,
+                sequence,
+            },
+            Command::ListMcpTools {
+                project_id: id.into(),
+            },
+        )) {
+            let form = self.state.mcp.form(id);
+            form.sequence = sequence;
+            form.list_pending = true;
+            form.tools.clear();
+            form.message = None;
+            form.error = None;
+        }
+    }
+
     fn start_agent(&mut self, project: &Project) {
         let Some(run_id) = self.state.history.selected.clone() else {
             return;
@@ -1074,6 +1193,44 @@ impl App {
                     ));
                 }
             }
+            Kind::ToolAnswer {
+                project_id,
+                run_id,
+                request,
+                approval_id,
+                snapshot,
+            } => {
+                self.state.tool_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                {
+                    let same = self.state.history.selection_request == request
+                        && self.state.history.detail.as_ref().is_some_and(|v| {
+                            v["pending"] == snapshot && v["pending"]["id"] == approval_id
+                        });
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if same {
+                        self.state.status = match reply.result {
+                            Ok(ResponseData::Data(_)) => {
+                                "승인 응답을 받았습니다. 실행 상태를 다시 확인합니다.".into()
+                            }
+                            Err(error) => format!("승인 요청 실패: {error}"),
+                            _ => "승인 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
+                }
+            }
             Kind::AgentStart {
                 project_id,
                 run_id,
@@ -1108,6 +1265,72 @@ impl App {
                         },
                         Command::GetRun { run_id },
                     ));
+                }
+            }
+            Kind::McpSave {
+                project_id,
+                endpoint,
+                epoch,
+                sequence,
+            } => {
+                let current = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.mcp.active.as_deref() == Some(&project_id)
+                    && self.state.mcp.epoch == epoch;
+                let form = self.state.mcp.form(&project_id);
+                form.save_pending = false;
+                form.tools.clear();
+                match reply.result {
+                    Ok(ResponseData::Empty) => {
+                        form.saved = Some(endpoint);
+                        if current && form.sequence == sequence {
+                            form.message = Some("엔드포인트를 저장했습니다.".into());
+                            form.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        form.saved = None;
+                        if current && form.sequence == sequence {
+                            form.error = Some(format!("엔드포인트 저장 실패: {error}"));
+                        }
+                    }
+                    _ => {
+                        form.saved = None;
+                        if current && form.sequence == sequence {
+                            form.error = Some("엔드포인트 저장 응답이 올바르지 않습니다.".into());
+                        }
+                    }
+                }
+            }
+            Kind::McpList {
+                project_id,
+                epoch,
+                sequence,
+            } => {
+                let current = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.mcp.active.as_deref() == Some(&project_id)
+                    && self.state.mcp.epoch == epoch;
+                let form = self.state.mcp.form(&project_id);
+                form.list_pending = false;
+                if current && form.sequence == sequence {
+                    match reply.result {
+                        Ok(ResponseData::Data(data)) => match data
+                            .get("tools")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            Some(tools) if tools.iter().all(|t| t.is_object()) => {
+                                form.tools = tools.clone();
+                                form.message = Some(if tools.is_empty() {
+                                    "서버가 도구를 반환하지 않았습니다.".into()
+                                } else {
+                                    format!("도구 {}개를 조회했습니다.", tools.len())
+                                });
+                                form.error = None;
+                            }
+                            _ => form.error = Some("도구 목록 응답이 올바르지 않습니다.".into()),
+                        },
+                        Err(error) => form.error = Some(format!("도구 목록 조회 실패: {error}")),
+                        _ => form.error = Some("도구 목록 응답이 올바르지 않습니다.".into()),
+                    }
                 }
             }
             Kind::AgentSettingsSave {
@@ -1424,6 +1647,26 @@ impl App {
                                     .is_none_or(|form| form.is_clean(&project));
                             if agent_run_ui::render(ui, &project, run, busy) {
                                 self.start_agent(&project);
+                            }
+                        }
+                        if let (Some(run_id), Some(run)) = (
+                            self.state.history.selected.clone(),
+                            self.state.history.detail.clone(),
+                        ) {
+                            let busy = self.state.tool_pending.contains(&run_id)
+                                || self.state.cancel_pending.contains(&run_id)
+                                || self.state.agent_pending.contains(&run_id)
+                                || self.state.agent_settings.blocked(&project.id)
+                                || self.state.spec_review_pending.contains(&project.id)
+                                || !self
+                                    .state
+                                    .spec_forms
+                                    .get(&project.id)
+                                    .is_none_or(|form| form.is_clean(&project));
+                            if let Some((item, approved)) =
+                                tool_approval_ui::render(ui, &project, &run, &run_id, busy)
+                            {
+                                self.answer_tool(&project, item, approved);
                             }
                         }
                         if let Some(action) = run_history::render(ui, &self.state.history) {
@@ -1783,6 +2026,17 @@ impl App {
                                 agent_settings_ui::Action::Refresh => {
                                     self.refresh_agent_project(&project.id)
                                 }
+                            }
+                        }
+                        self.state.mcp.select(&project.id);
+                        if let Some(action) =
+                            mcp_connection_ui::render(ui, &mut self.state.mcp, &project.id)
+                        {
+                            match action {
+                                mcp_connection_ui::Action::Save(endpoint) => {
+                                    self.mcp_save(&project.id, &endpoint)
+                                }
+                                mcp_connection_ui::Action::List => self.mcp_list(&project.id),
                             }
                         }
                         self.state.graph.select(&project.id);
@@ -5908,6 +6162,502 @@ mod tests {
         assert_eq!(app.state.history.selected.as_deref(), Some("r"));
         assert!(app.state.history.detail.is_some());
         assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn approval_sends_only_the_reviewed_current_pending_id() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.state.history.detail.as_mut().unwrap()["pending"]["arguments"]["content"] =
+            "changed".into();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(work.try_recv().is_err());
+        app.state.history.detail.as_mut().unwrap()["pending"] = item.raw.clone();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ApproveTool{run_id,approval_id,approved} if run_id=="r" && approval_id=="id1" && approved)
+        );
+        app.answer_tool(&p, item, true);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn approval_ack_refreshes_run_without_claiming_completion() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"mcp","arguments":{"endpoint":"example","cwd":"x"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        let workitem = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: workitem.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"status":"approved_mcp"}),
+            )),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.status.contains("상태"));
+        assert!(!app.state.status.contains("완료"));
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn late_approval_error_does_not_overwrite_new_pending_request_notice() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"old"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        let sent = work.try_recv().unwrap();
+        app.state.history.detail.as_mut().unwrap()["pending"]["id"] = "id2".into();
+        app.state.status = "새 요청".into();
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Err("이전 오류".into()),
+        });
+        assert_eq!(app.state.status, "새 요청");
+        assert!(app.state.history.detail.is_none());
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn selected_run_displays_pending_approval_in_actual_panel() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"hello"},"call_id":null}}),
+        );
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="도구 실행 승인 요청")));
+    }
+    #[test]
+    fn approval_queue_full_preserves_request() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let detail = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":true,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}});
+        app.state.history.detail = Some(detail.clone());
+        let item = tool_approval_ui::pending(&p, &detail, "r").unwrap();
+        app.answer_tool(&p, item, true);
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.tool_pending.contains("r"));
+        assert_eq!(app.state.history.detail.as_ref(), Some(&detail));
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn inactive_patch_approval_is_blocked_but_rejection_is_allowed() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":false,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":"call"}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(work.try_recv().is_err());
+        app.answer_tool(&p, item, false);
+        assert!(matches!(
+            work.try_recv().unwrap().command,
+            Command::ApproveTool {
+                approved: false,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn inactive_unbound_patch_approval_remains_available() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":false,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ApproveTool{approval_id,approved:true,..} if approval_id=="id1")
+        );
+    }
+    #[test]
+    fn mcp_save_uses_explicit_project_and_endpoint_and_blocks_duplicates() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/mcp");
+        app.mcp_save("a", "https://example.test/mcp");
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ConfigureMcp{project_id,endpoint} if project_id=="a" && endpoint=="https://example.test/mcp")
+        );
+        assert!(app.state.mcp.form("a").save_pending);
+        app.mcp_save("a", "https://example.test/mcp");
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn mcp_list_only_uses_saved_or_unknown_address_and_blocks_duplicate() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/a");
+        app.mcp_list("a");
+        assert!(work.try_recv().is_err());
+        app.state.mcp.form("a").saved = Some("https://example.test/a".into());
+        app.mcp_list("a");
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ListMcpTools{project_id} if project_id=="a")
+        );
+        assert!(app.state.mcp.form("a").list_pending);
+        app.mcp_list("a");
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn mcp_save_ack_tracks_actual_saved_address_without_overwriting_new_input() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/old");
+        app.mcp_save("a", "https://example.test/old");
+        let sent = work.try_recv().unwrap();
+        app.state.mcp.edit("a", "https://example.test/new");
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        let f = app.state.mcp.form("a");
+        assert_eq!(f.endpoint, "https://example.test/new");
+        assert_eq!(f.saved.as_deref(), Some("https://example.test/old"));
+        assert!(!f.save_pending);
+        assert_ne!(f.message.as_deref(), Some("엔드포인트를 저장했습니다."));
+    }
+    #[test]
+    fn mcp_list_discards_late_reply_after_endpoint_or_project_changes() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/a");
+        app.state.mcp.form("a").saved = Some("https://example.test/a".into());
+        app.mcp_list("a");
+        let old = work.try_recv().unwrap();
+        app.state.mcp.edit("a", "https://example.test/new");
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"tools":[{"name":"old"}]}),
+            )),
+        });
+        assert!(app.state.mcp.form("a").tools.is_empty());
+        assert!(!app.state.mcp.form("a").list_pending);
+        app.state.mcp.edit("a", "https://example.test/a");
+        app.mcp_list("a");
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.mcp.select("b");
+        app.state.select("a");
+        app.state.mcp.select("a");
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"tools":[{"name":"old"}]}),
+            )),
+        });
+        assert!(app.state.mcp.form("a").tools.is_empty());
+        assert!(!app.state.mcp.form("a").list_pending);
+    }
+    #[test]
+    fn mcp_project_round_trip_advances_epoch_without_rendering() {
+        let mut state = State::default();
+        state.select("a");
+        let epoch = state.mcp.epoch;
+        state.select("b");
+        state.select("a");
+        assert!(state.mcp.epoch > epoch);
+        assert_eq!(state.mcp.active.as_deref(), Some("a"));
+    }
+    #[test]
+    fn selected_project_renders_mcp_controls_without_network_request() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="MCP 연결과 도구")));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn mcp_save_and_listing_return_distinct_states_and_raw_tool_values() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/mcp");
+        app.mcp_save("a", "https://example.test/mcp");
+        let save = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert_eq!(
+            app.state.mcp.form("a").message.as_deref(),
+            Some("엔드포인트를 저장했습니다.")
+        );
+        app.mcp_list("a");
+        let list = work.try_recv().unwrap();
+        let tools = serde_json::json!([{"name":"test","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]);
+        app.apply(worker::Reply {
+            kind: list.kind,
+            result: Ok(ResponseData::Data(serde_json::json!({"tools":tools}))),
+        });
+        let form = app.state.mcp.form("a");
+        assert_eq!(form.tools, tools.as_array().unwrap().clone());
+        assert_eq!(form.message.as_deref(), Some("도구 1개를 조회했습니다."));
+        assert!(!form.list_pending);
+    }
+    #[test]
+    fn mcp_full_queue_preserves_endpoint_and_reports_failure() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/mcp");
+        app.mcp_save("a", "https://example.test/mcp");
+        assert!(work.try_recv().is_err());
+        let f = app.state.mcp.form("a");
+        assert_eq!(f.endpoint, "https://example.test/mcp");
+        assert!(!f.save_pending);
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn mcp_reselecting_same_project_invalidates_old_reply_epoch() {
+        let mut state = State::default();
+        state.select("a");
+        let epoch = state.mcp.epoch;
+        state.select("a");
+        assert!(state.mcp.epoch > epoch);
+    }
+    #[test]
+    fn mcp_list_displays_empty_and_actual_error_without_losing_address() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/mcp");
+        app.state.mcp.form("a").saved = Some("https://example.test/mcp".into());
+        app.mcp_list("a");
+        let sent = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Ok(ResponseData::Data(serde_json::json!({"tools":[]}))),
+        });
+        assert_eq!(
+            app.state.mcp.form("a").message.as_deref(),
+            Some("서버가 도구를 반환하지 않았습니다.")
+        );
+        app.mcp_list("a");
+        let sent = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Err("연결 실패".into()),
+        });
+        let f = app.state.mcp.form("a");
+        assert_eq!(f.endpoint, "https://example.test/mcp");
+        assert!(f.error.as_deref().unwrap().contains("연결 실패"));
+        assert!(!f.list_pending);
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
