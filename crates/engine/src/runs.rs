@@ -8,6 +8,75 @@ fn checkpoint_has_inflight(value: &serde_json::Value) -> bool {
             .as_object()
             .is_some_and(|states| states.values().any(checkpoint_has_inflight))
 }
+
+// 2026-11-16: 미소모 patch 승인만 체크포인트 커서·인자·ledger와 결박해 재개한다.
+fn waiting_checkpoint_call(
+    run: &serde_json::Value,
+    saved: &crate::agent_loop::LoopCheckpoint,
+    spec: &domain::ApprovedSpec,
+) -> Result<(String, String, String, String, String), String> {
+    use sha2::{Digest, Sha256};
+    if run["status"] != "awaiting_approval"
+        || run["pending"]["tool"] != "patch"
+        || run["pending"]["authorized"] != false
+    {
+        return Err("pending approval cannot resume safely".into());
+    }
+    let expected = run["pending"]["call_id"]
+        .as_str()
+        .ok_or("pending call missing")?;
+    let approval = run["pending"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("pending approval missing")?;
+    let ordered = crate::agent_loop::validate_plan(spec)?;
+    let states: Vec<(String, &crate::agent_loop::LoopCheckpoint)> = if saved.schema_version == 1 {
+        vec![(
+            ordered
+                .get(saved.task_index)
+                .ok_or("checkpoint task missing")?
+                .clone(),
+            saved,
+        )]
+    } else {
+        saved
+            .task_states
+            .iter()
+            .map(|(id, state)| (id.clone(), state.as_ref()))
+            .collect()
+    };
+    let mut found = None;
+    for (task, state) in states {
+        let Some(call) = state.pending_calls.get(state.pending_index) else {
+            continue;
+        };
+        let role = match state.role_index {
+            0 => "coordinator",
+            1 => "implementer",
+            2 => "reviewer",
+            _ => return Err("invalid checkpoint role".into()),
+        };
+        let logical = serde_json::to_string(&(&task, role, state.round, &call.call_id))
+            .map_err(|_| "invalid call identity")?;
+        if logical != expected {
+            continue;
+        }
+        if found.is_some() || call.name != "patch" || call.arguments != run["pending"]["arguments"]
+        {
+            return Err("pending call mismatch".into());
+        }
+        let identity = serde_json::to_vec(&(role, &task, "patch", &call.arguments))
+            .map_err(|_| "invalid call identity")?;
+        found = Some((
+            logical,
+            approval.to_owned(),
+            format!("{:x}", Sha256::digest(identity)),
+            role.to_owned(),
+            task,
+        ));
+    }
+    found.ok_or("pending checkpoint mismatch".into())
+}
 // 2026-11-16: 시작 호출이 연결되기 전 CAS 경계를 독립적으로 검증한다.
 pub(crate) fn begin_agent(
     db: &Database,
@@ -46,10 +115,12 @@ fn begin_agent_inner(
     normalize_run(&mut run)?;
     if &run != expected
         || (run["status"] != "awaiting_implementation"
-            && !(resume.is_some() && run["status"] == "interrupted"))
+            && !(resume.is_some()
+                && (run["status"] == "interrupted" || run["status"] == "awaiting_approval")))
         || run["agent_active"] != false
         || (resume.is_some() && run["resources_unknown"] == true)
-        || !run["pending"].is_null()
+        || (!run["pending"].is_null()
+            && !(resume.is_some() && run["status"] == "awaiting_approval"))
     {
         return Err("run not ready for agent".into());
     }
@@ -113,6 +184,30 @@ fn begin_agent_inner(
             let (attempt, _) = crate::evidence::context(&run, item)?;
             crate::evidence::resolve(&run, id, attempt)?.ok_or("invalid evidence")?;
         }
+        let waiting = if run["status"] == "awaiting_approval" {
+            let waiting = waiting_checkpoint_call(&run, &saved, spec)?;
+            validate_bound_patch(
+                &tx,
+                &run,
+                &waiting.3,
+                &waiting.4,
+                &run["pending"]["arguments"],
+                false,
+            )?;
+            if run["used_calls"]
+                .as_array()
+                .ok_or("invalid calls")?
+                .iter()
+                .filter(|id| id.as_str() == Some(waiting.0.as_str()))
+                .count()
+                != 1
+            {
+                return Err("pending call mismatch".into());
+            }
+            Some(waiting)
+        } else {
+            None
+        };
         let calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
         let prefix = format!("{id}:");
         for item in calls.iter().map_err(|e| e.to_string())? {
@@ -120,6 +215,19 @@ fn begin_agent_inner(
             if key.value().starts_with(&prefix) {
                 let record: serde_json::Value =
                     serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
+                if let Some((logical, approval, hash, role, task)) = &waiting {
+                    if key.value() == format!("{id}:{logical}") {
+                        if record["status"] != "waiting"
+                            || record["approval_id"] != *approval
+                            || record["hash"] != *hash
+                            || record["role"] != *role
+                            || record["task_id"] != *task
+                        {
+                            return Err("pending call mismatch".into());
+                        }
+                        continue;
+                    }
+                }
                 if record["status"] != "completed" || record.get("result").is_none() {
                     return Err("previous tool outcome uncertain".into());
                 }
@@ -134,11 +242,26 @@ fn begin_agent_inner(
                 .ok_or("previous tool outcome uncertain")?;
             let record: serde_json::Value =
                 serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
+            if let Some((logical, approval, hash, role, task)) = &waiting {
+                if call_id == logical {
+                    if record["status"] != "waiting"
+                        || record["approval_id"] != *approval
+                        || record["hash"] != *hash
+                        || record["role"] != *role
+                        || record["task_id"] != *task
+                    {
+                        return Err("pending call mismatch".into());
+                    }
+                    continue;
+                }
+            }
             if record["status"] != "completed" || record.get("result").is_none() {
                 return Err("previous tool outcome uncertain".into());
             }
         }
-        run["status"] = "awaiting_implementation".into();
+        if waiting.is_none() {
+            run["status"] = "awaiting_implementation".into();
+        }
     }
     let attempt = run["agent_attempt"]
         .as_u64()
@@ -300,6 +423,10 @@ fn append_event(
     kind: &str,
     message: &str,
 ) -> Result<(), String> {
+    let attempt = run["agent_attempt"]
+        .as_u64()
+        .filter(|attempt| *attempt > 0)
+        .unwrap_or(1);
     let events = run["events"].as_array_mut().ok_or("invalid run events")?;
     let sequence = events.last().map_or(Ok(1), |event| {
         event["sequence"]
@@ -307,7 +434,7 @@ fn append_event(
             .and_then(|v| v.checked_add(1))
             .ok_or("invalid event sequence")
     })?;
-    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":1,"kind":kind,"message":message}));
+    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":attempt,"kind":kind,"message":message}));
     Ok(())
 }
 
