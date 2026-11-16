@@ -54,6 +54,16 @@ pub enum Kind {
         epoch: u64,
         sequence: u64,
     },
+    ManualMcp {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        generation: u64,
+        action: crate::manual_mcp_ui::Action,
+        snapshot: serde_json::Value,
+        endpoint_generation: u64,
+        intent: Option<serde_json::Value>,
+    },
     McpList {
         project_id: String,
         epoch: u64,

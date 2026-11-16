@@ -11,6 +11,7 @@ mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_index_ui;
 mod knowledge_text_ui;
+mod manual_mcp_ui;
 mod mcp_connection_ui;
 mod mcp_oauth_ui;
 mod model_settings;
@@ -61,6 +62,7 @@ struct State {
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
+    manual_mcp: manual_mcp_ui::State,
     oauth: mcp_oauth_ui::State,
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
@@ -399,6 +401,85 @@ impl App {
         }
     }
 
+    fn manual_mcp_action(&mut self, project: &Project, action: manual_mcp_ui::Action) {
+        let endpoint_generation = self.state.mcp.form(&project.id).endpoint_generation;
+        let Some(run_id) = self.state.history.selected.clone() else {
+            return;
+        };
+        let Some(run) = self.state.history.detail.as_ref() else {
+            return;
+        };
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.history.project.as_deref() != Some(&project.id)
+            || self.state.manual_mcp.pending.contains(&run_id)
+            || self.state.tool_pending.contains(&run_id)
+            || self.state.agent_pending.contains(&run_id)
+            || self.state.cancel_pending.contains(&run_id)
+            || self.state.agent_settings.blocked(&project.id)
+            || self.state.spec_review_pending.contains(&project.id)
+            || !self
+                .state
+                .spec_forms
+                .get(&project.id)
+                .is_none_or(|form| form.is_clean(project))
+        {
+            return;
+        }
+        let command = match action {
+            manual_mcp_ui::Action::Request => manual_mcp_ui::request(
+                project,
+                run,
+                &run_id,
+                self.state.manual_mcp.form(&project.id),
+            ),
+            manual_mcp_ui::Action::Call => manual_mcp_ui::approved_call(project, run, &run_id),
+        };
+        let Some(command) = command else { return };
+        if action == manual_mcp_ui::Action::Call
+            && !self.state.manual_mcp.permits(
+                &project.id,
+                &run_id,
+                self.state.generation,
+                self.state.history.selection_request,
+                endpoint_generation,
+                &run["pending"],
+            )
+        {
+            return;
+        }
+        let intent = match &command {
+            Command::RequestMcpApproval {
+                endpoint,
+                name,
+                arguments,
+                cwd,
+                ..
+            } => Some(
+                serde_json::json!({"endpoint":endpoint,"name":name,"arguments":arguments,"cwd":cwd}),
+            ),
+            _ => None,
+        };
+        let snapshot = run.clone();
+        if self.send(worker::Work::new(
+            worker::Kind::ManualMcp {
+                project_id: project.id.clone(),
+                run_id: run_id.clone(),
+                request: self.state.history.selection_request,
+                generation: self.state.generation,
+                action,
+                snapshot,
+                endpoint_generation,
+                intent,
+            },
+            command,
+        )) {
+            self.state.manual_mcp.pending.insert(run_id);
+            self.state.manual_mcp.binding = None;
+            if action == manual_mcp_ui::Action::Call {
+                self.state.history.detail = None;
+            }
+        }
+    }
     fn mcp_save(&mut self, id: &str, endpoint: &str) {
         if self.state.selected.as_deref() != Some(id)
             || self.state.mcp.active.as_deref() != Some(id)
@@ -1562,10 +1643,26 @@ impl App {
                         && self.state.history.detail.as_ref().is_some_and(|v| {
                             v["pending"] == snapshot && v["pending"]["id"] == approval_id
                         });
+                    let endpoint_generation = self.state.mcp.form(&project_id).endpoint_generation;
+                    let update_binding = same
+                        && matches!(&reply.result, Ok(ResponseData::Data(_)))
+                        && self.state.manual_mcp.permits(
+                            &project_id,
+                            &run_id,
+                            self.state.generation,
+                            request,
+                            endpoint_generation,
+                            &snapshot,
+                        );
                     self.state.history.detail = None;
                     self.state.history.selection_request =
                         self.state.history.selection_request.wrapping_add(1);
                     let request = self.state.history.selection_request;
+                    if update_binding {
+                        if let Some(binding) = self.state.manual_mcp.binding.as_mut() {
+                            binding.selection = request;
+                        }
+                    }
                     if same {
                         self.state.status = match reply.result {
                             Ok(ResponseData::Data(_)) => {
@@ -1668,6 +1765,86 @@ impl App {
                             form.error = Some("엔드포인트 저장 응답이 올바르지 않습니다.".into());
                         }
                     }
+                }
+            }
+            Kind::ManualMcp {
+                project_id,
+                run_id,
+                request,
+                generation,
+                action,
+                snapshot,
+                endpoint_generation,
+                intent,
+            } => {
+                self.state.manual_mcp.pending.remove(&run_id);
+                let same = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.generation == generation
+                    && self.state.history.selection_request == request
+                    && (action == manual_mcp_ui::Action::Call
+                        || self.state.history.detail.as_ref() == Some(&snapshot));
+                if same {
+                    let same_endpoint =
+                        self.state.mcp.form(&project_id).endpoint_generation == endpoint_generation;
+                    let binding = match (&action, &reply.result, &intent) {
+                        (
+                            manual_mcp_ui::Action::Request,
+                            Ok(ResponseData::Data(data)),
+                            Some(arguments),
+                        ) => data["approval_id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id.to_owned(), arguments.clone())),
+                        _ => None,
+                    };
+                    if same_endpoint {
+                        self.state.status = match (action, reply.result) {
+                            (manual_mcp_ui::Action::Request, Ok(ResponseData::Data(data)))
+                                if data["approval_id"].as_str().is_some_and(|s| !s.is_empty()) =>
+                            {
+                                "승인 요청을 접수했습니다. 실행 상태를 다시 확인합니다.".into()
+                            }
+                            (manual_mcp_ui::Action::Call, Ok(ResponseData::Data(data))) => format!(
+                                "호출 응답: {}",
+                                serde_json::to_string(&data).unwrap_or_default()
+                            ),
+                            (manual_mcp_ui::Action::Call, _) => {
+                                "호출 결과를 확인하지 못했습니다. 자동으로 다시 실행하지 않습니다."
+                                    .into()
+                            }
+                            (_, Err(error)) => format!("승인 요청 실패: {error}"),
+                            _ => "승인 요청 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if let Some((approval_id, arguments)) = binding {
+                        if self.state.mcp.form(&project_id).endpoint_generation
+                            == endpoint_generation
+                        {
+                            self.state.manual_mcp.binding = Some(manual_mcp_ui::Binding {
+                                project: project_id.clone(),
+                                run: run_id.clone(),
+                                generation,
+                                selection: request,
+                                endpoint_generation,
+                                approval_id,
+                                arguments,
+                            });
+                        }
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
                 }
             }
             Kind::McpList {
@@ -2146,6 +2323,28 @@ impl App {
                                 tool_approval_ui::render(ui, &project, &run, &run_id, busy)
                             {
                                 self.answer_tool(&project, item, approved);
+                            }
+                            let busy = busy || self.state.manual_mcp.pending.contains(&run_id);
+                            let endpoint_generation =
+                                self.state.mcp.form(&project.id).endpoint_generation;
+                            let call_allowed = self.state.manual_mcp.permits(
+                                &project.id,
+                                &run_id,
+                                self.state.generation,
+                                self.state.history.selection_request,
+                                endpoint_generation,
+                                &run["pending"],
+                            );
+                            if let Some(action) = manual_mcp_ui::render(
+                                ui,
+                                &project,
+                                &run,
+                                &run_id,
+                                self.state.manual_mcp.form(&project.id),
+                                busy,
+                                call_allowed,
+                            ) {
+                                self.manual_mcp_action(&project, action);
                             }
                         }
                         if let Some(run_id) = self.state.history.selected.clone() {
