@@ -14,6 +14,23 @@ pub enum Kind {
         sequence: u64,
         action: crate::knowledge_index_ui::Action,
     },
+    McpSave {
+        project_id: String,
+        endpoint: String,
+        epoch: u64,
+        sequence: u64,
+    },
+    McpList {
+        project_id: String,
+        epoch: u64,
+        sequence: u64,
+    },
+    AgentStart {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        generation: u64,
+    },
     AgentSettingsSave {
         project_id: String,
         generation: u64,
@@ -282,22 +299,14 @@ fn start_with_pipe(
     start_lane(
         ctx.clone(),
         pipe.clone(),
-        startup,
+        startup.clone(),
         regular_rx,
         reply_tx.clone(),
     );
-    start_lane(ctx.clone(), pipe, None, control_rx, reply_tx.clone());
+    start_lane(ctx.clone(), pipe, startup, control_rx, reply_tx.clone());
     std::thread::spawn(move || {
         while let Ok(work) = work.recv() {
-            let lane = if is_control(&work.kind) {
-                &control_tx
-            } else {
-                &regular_tx
-            };
-            if let Err(error) = lane.try_send(work) {
-                let work = match error {
-                    mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => work,
-                };
+            if let Some(work) = route_control_work(work, &regular_tx, &control_tx) {
                 if reply_tx
                     .send(Reply {
                         kind: work.kind,
@@ -1331,35 +1340,117 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
 }
-#[cfg(test)]
-mod index_control_tests {
-    use super::*;
-    #[test]
-    fn index_status_and_cancel_use_control_lane_while_start_and_config_use_regular() {
-        let kind = |action| Kind::KnowledgeIndex {
-            project_id: "a".into(),
-            document: "doc".into(),
-            epoch: 1,
-            sequence: 1,
-            action,
-        };
-        assert!(is_control(&kind(crate::knowledge_index_ui::Action::Status)));
-        assert!(is_control(&kind(crate::knowledge_index_ui::Action::Cancel)));
-        assert!(!is_control(&kind(crate::knowledge_index_ui::Action::Start)));
-        assert!(!is_control(&kind(
-            crate::knowledge_index_ui::Action::Configure
-        )));
+fn route_control_work(
+    work: Work,
+    regular: &SyncSender<Work>,
+    control: &SyncSender<Work>,
+) -> Option<Work> {
+    let urgent = matches!(
+        &work.command,
+        Command::Status
+            | Command::ListStorageFailures
+            | Command::RetryCompletionSave { .. }
+            | Command::CancelRun { .. }
+            | Command::GetRun { .. }
+            | Command::ListEvents { .. }
+            | Command::CancelKnowledgeIndex { .. }
+            | Command::KnowledgeIndexStatus { .. }
+    );
+    match if urgent {
+        control.try_send(work)
+    } else {
+        regular.try_send(work)
+    } {
+        Ok(()) => None,
+        Err(mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work)) => Some(work),
     }
 }
-fn is_control(kind: &Kind) -> bool {
-    matches!(
-        kind,
-        Kind::Storage
-            | Kind::RetrySave { .. }
-            | Kind::KnowledgeIndex {
-                action: crate::knowledge_index_ui::Action::Status
-                    | crate::knowledge_index_ui::Action::Cancel,
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    #[test]
+    fn control_lane_capacity_returns_original_work_and_regular_stays_available() {
+        let (regular, regular_rx) = mpsc::sync_channel(1);
+        let (control, _control_rx) = mpsc::sync_channel(1);
+        assert!(
+            route_control_work(Work::new(Kind::List, Command::Status), &regular, &control)
+                .is_none()
+        );
+        let error = route_control_work(
+            Work::new(Kind::List, Command::CancelRun { run_id: "r".into() }),
+            &regular,
+            &control,
+        )
+        .unwrap();
+        assert!(matches!(
+            error,
+            Work {
+                command: Command::CancelRun { .. },
                 ..
             }
-    )
+        ));
+        assert!(route_control_work(
+            Work::new(
+                Kind::List,
+                Command::ListMcpTools {
+                    project_id: "a".into()
+                }
+            ),
+            &regular,
+            &control
+        )
+        .is_none());
+        assert!(matches!(
+            regular_rx.try_recv().unwrap().command,
+            Command::ListMcpTools { .. }
+        ));
+    }
+    #[test]
+    fn control_commands_route_when_regular_lane_is_full() {
+        let (regular, regular_rx) = mpsc::sync_channel(1);
+        let (control, control_rx) = mpsc::sync_channel(8);
+        regular
+            .try_send(Work::new(
+                Kind::List,
+                Command::ListMcpTools {
+                    project_id: "a".into(),
+                },
+            ))
+            .unwrap();
+        assert!(
+            route_control_work(Work::new(Kind::Status, Command::Status), &regular, &control)
+                .is_none()
+        );
+        let commands = [
+            Command::CancelRun { run_id: "r".into() },
+            Command::GetRun { run_id: "r".into() },
+            Command::ListEvents {
+                run_id: "r".into(),
+                after: 0,
+            },
+            Command::CancelKnowledgeIndex {
+                project_id: "a".into(),
+                document_id: "d".into(),
+            },
+            Command::KnowledgeIndexStatus {
+                project_id: "a".into(),
+                document_id: "d".into(),
+            },
+            Command::ListStorageFailures,
+            Command::RetryCompletionSave { run_id: "r".into() },
+        ];
+        for command in commands {
+            assert!(
+                route_control_work(Work::new(Kind::List, command), &regular, &control).is_none()
+            );
+        }
+        assert!(matches!(
+            control_rx.try_recv().unwrap().command,
+            Command::Status
+        ));
+        assert!(matches!(
+            regular_rx.try_recv().unwrap().command,
+            Command::ListMcpTools { .. }
+        ));
+    }
 }
