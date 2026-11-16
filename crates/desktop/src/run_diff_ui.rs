@@ -132,7 +132,14 @@ pub(crate) fn render(ui: &mut eframe::egui::Ui, state: &State, detail: Option<&V
                     item["verification_id"].as_str().unwrap_or("제공되지 않음")
                 ));
                 ui.label("종료 코드: 제공되지 않음");
-                ui.label("시도 번호: 제공되지 않음");
+                ui.label(format!(
+                    "시도 번호: {}",
+                    item["agent_attempt"]
+                        .as_u64()
+                        .filter(|n| *n > 0)
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "제공되지 않음".into())
+                ));
                 if let Some(output) = item["output"].as_str() {
                     ui.label(output);
                 }
@@ -215,5 +222,44 @@ mod selection_tests {
         state.bind("a", "r1");
         assert!(state.diff.is_none());
         assert!(state.sequence > old);
+    }
+}
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+    #[test]
+    fn evidence_shows_only_valid_reported_attempt_and_never_infers_exit_code() {
+        let detail = serde_json::json!({"evidence":[{"command":"cmd1","passed":true,"agent_attempt":2},{"command":"cmd2","passed":true},{"command":"cmd3","passed":true,"agent_attempt":"bad"}]});
+        let out = eframe::egui::Context::default().run(eframe::egui::RawInput::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &State::default(), Some(&detail));
+            });
+        });
+        let labels: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| {
+                if let eframe::egui::epaint::Shape::Text(t) = &s.shape {
+                    Some(t.galley.job.text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(labels.iter().any(|s| s == "시도 번호: 2"));
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|s| s.as_str() == "시도 번호: 제공되지 않음")
+                .count(),
+            2
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|s| s.as_str() == "종료 코드: 제공되지 않음")
+                .count(),
+            3
+        );
     }
 }

@@ -936,6 +936,7 @@ mod tests {
         manager.register(&db, &run_id, &project_id, Ok(()));
         let gate = std::sync::Arc::clone(&manager.mutation_gate);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(dbpath.clone(), db),
             run_root: root.clone(),
             git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -944,6 +945,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -1167,6 +1169,7 @@ mod tests {
         manager.register_generation(&db, &run_id, &project_id, Err("fake failure".into()));
         let gate = std::sync::Arc::clone(&manager.mutation_gate);
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(dbpath.clone(), db),
             run_root: root.clone(),
             git_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
@@ -1175,6 +1178,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: std::sync::Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -1926,6 +1930,7 @@ mod agent_journal_tests {
             Arc::clone(&gate),
         ));
         let engine = crate::Engine {
+            indexing: std::sync::Mutex::new(crate::knowledge_indexing::IndexState::default()),
             db: crate::storage::StorageSlot::new(path.clone(), db),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1935,6 +1940,7 @@ mod agent_journal_tests {
             completions: Arc::clone(&manager),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let record = CompletionManager::agent_record(&run_id, &project_id, false, 1);
         crate::save_agent_result(Arc::clone(&manager), engine.db.get(), record.clone()).await;
