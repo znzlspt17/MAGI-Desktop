@@ -14,6 +14,19 @@ pub enum Kind {
         nonce: u64,
         action: crate::mcp_oauth_ui::Action,
     },
+    KnowledgeIndex {
+        project_id: String,
+        document: String,
+        epoch: u64,
+        sequence: u64,
+        action: crate::knowledge_index_ui::Action,
+    },
+    RunDiff {
+        project_id: String,
+        run_id: String,
+        selection: u64,
+        sequence: u64,
+    },
     ToolAnswer {
         project_id: String,
         run_id: String,
