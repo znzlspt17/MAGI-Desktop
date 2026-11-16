@@ -26,7 +26,7 @@ fn status_reports_only_current_engine_capabilities() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn process_serves_status_and_rejects_unavailable_commands() {
+async fn process_serves_status_and_reports_missing_project() {
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command as Process, Stdio};
     struct ChildGuard(Child);
@@ -99,17 +99,14 @@ async fn process_serves_status_and_rejects_unavailable_commands() {
         result.unwrap();
     }
     let request = Request {
-        id: "unsupported".into(),
-        command: Command::ListHistory {
+        id: "missing-project".into(),
+        command: Command::GetProject {
             project_id: "fixture".into(),
         },
     };
     let response = transport::request(&pipe, &request).await.unwrap();
     assert_eq!(response.id, request.id);
-    assert_eq!(
-        response.result.unwrap_err(),
-        "requested feature is not available"
-    );
+    assert_eq!(response.result.unwrap_err(), "project not found");
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     assert!(transport::request(
