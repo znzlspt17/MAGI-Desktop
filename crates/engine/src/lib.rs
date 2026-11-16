@@ -472,6 +472,7 @@ impl Engine {
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
                 | Command::GetProject { .. }
+                | Command::ListHistory { .. }
                 | Command::ListProjects
                 | Command::GetRun { .. }
                 | Command::GetDiff { .. }
@@ -736,6 +737,13 @@ impl Engine {
                 }
                 tx.commit().map_err(err)?;
                 Ok(ResponseData::Project(project))
+            }
+            // 2026-11-16: 기존 승인 스냅샷만 조회해 미승인 초안을 이력으로 만들지 않는다.
+            Command::ListHistory { project_id } => {
+                match self.execute(Command::GetProject { project_id })? {
+                    ResponseData::Project(project) => Ok(ResponseData::Data(serde_json::json!({"approvals":project.approval_history}))),
+                    _ => Err("invalid project response".into()),
+                }
             }
             Command::GetProject { project_id } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
