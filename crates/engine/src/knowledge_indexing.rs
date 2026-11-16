@@ -13,6 +13,83 @@ const PROFILES: TableDefinition<&str, &str> =
     TableDefinition::new("integration_embedding_profiles");
 const STATUSES: TableDefinition<&str, &str> = TableDefinition::new("integration_embedding_status");
 
+struct SearchSlot(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SearchSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// 2026-11-16: 쿼리 임베딩도 공통 슬롯을 사용하고 설정 세대가 바뀐 결과는 반환하지 않는다.
+pub(crate) async fn semantic_search(
+    engine: Arc<Engine>,
+    project: String,
+    query: String,
+) -> Result<ResponseData, String> {
+    if query.trim().is_empty() {
+        return Err("search query is empty".into());
+    }
+    let profile = {
+        let state = engine
+            .indexing
+            .lock()
+            .map_err(|_| "index state unavailable")?;
+        if state.configuring.contains(&project) {
+            return Err("embedding configuration in progress".into());
+        }
+        state.profiles.get(&project).cloned()
+    };
+    let mut vector = None;
+    if let Some(profile) = &profile {
+        engine
+            .slots
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < 4).then_some(n + 1)
+            })
+            .map_err(|_| "run capacity reached")?;
+        let _slot = SearchSlot(engine.slots.clone());
+        let provider = provider::OpenAiEmbeddingProvider::new(provider::OpenAiEmbeddingConfig {
+            endpoint: profile.endpoint.clone(),
+            model: profile.model.clone(),
+            api_key: profile.credential.0.clone(),
+            dimensions: profile.dimensions,
+            max_response_bytes: 1024 * 1024,
+        });
+        if let Ok(provider) = provider {
+            if let Ok(vectors) = provider
+                .embed(vec![query.clone()], CancellationToken::new())
+                .await
+            {
+                vector = vectors.into_iter().next();
+            }
+        }
+    }
+    let e = engine.clone();
+    let p = project.clone();
+    let q = query.clone();
+    let profile_copy = profile.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<ResponseData, String> {
+        let db = e.db.get().ok_or("storage unavailable")?;
+        if let (Some(profile), Some(vector)) = (&profile_copy, vector) {
+            let model = serde_json::json!({"model":profile.model,"version":profile.version,"dimensions":profile.dimensions});
+            if let Ok(result) = knowledge_text::search_vector(&db, &p, model, vector, 0, 100) { return Ok(result); }
+        }
+        let result = knowledge_text::search(&db, &p, &q, 0, 100)?;
+        match result { ResponseData::Data(mut value) => { value["mode"] = "text_fallback".into(); Ok(ResponseData::Data(value)) }, _ => Err("invalid search result".into()) }
+    }).await.map_err(err)??;
+    let state = engine
+        .indexing
+        .lock()
+        .map_err(|_| "index state unavailable")?;
+    if state.configuring.contains(&project)
+        || state.profiles.get(&project).map(|p| &p.generation)
+            != profile.as_ref().map(|p| &p.generation)
+    {
+        return Err("embedding configuration changed".into());
+    }
+    Ok(result)
+}
+
 #[derive(Clone)]
 struct Profile {
     endpoint: String,

@@ -4,10 +4,13 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod agent_run_ui;
+mod agent_settings_ui;
 mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_text_ui;
 mod model_settings;
+mod run_controls;
 mod run_history;
 mod spec_review;
 mod storage;
@@ -47,6 +50,10 @@ struct State {
     knowledge: knowledge_text_ui::State,
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
+    agent_settings: agent_settings_ui::State,
+    agent_pending: std::collections::HashSet<String>,
+    execution_pending: std::collections::HashSet<String>,
+    cancel_pending: std::collections::HashSet<String>,
 }
 
 impl State {
@@ -97,6 +104,136 @@ struct App {
 }
 
 impl App {
+    fn start_agent(&mut self, project: &Project) {
+        let Some(run_id) = self.state.history.selected.clone() else {
+            return;
+        };
+        let Some(run) = self.state.history.detail.as_ref() else {
+            return;
+        };
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.history.project.as_deref() != Some(&project.id)
+            || run["id"] != run_id
+            || self.state.agent_pending.contains(&run_id)
+            || self.state.cancel_pending.contains(&run_id)
+            || self.state.agent_settings.blocked(&project.id)
+            || self.state.spec_review_pending.contains(&project.id)
+            || !self
+                .state
+                .spec_forms
+                .get(&project.id)
+                .is_none_or(|form| form.is_clean(project))
+            || !agent_run_ui::start_available(project, run)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::AgentStart {
+                project_id: project.id.clone(),
+                run_id: run_id.clone(),
+                request: self.state.history.selection_request,
+                generation: self.state.generation,
+            },
+            Command::StartAgent {
+                run_id: run_id.clone(),
+                mock_script: vec![],
+            },
+        )) {
+            self.state.agent_pending.insert(run_id);
+        }
+    }
+
+    fn refresh_agent_project(&mut self, project_id: &str) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || !self.state.agent_settings.refresh.contains(project_id)
+            || self.state.agent_settings.refreshing.contains(project_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::AgentSettingsRefresh {
+                project_id: project_id.into(),
+                generation: self.state.generation,
+            },
+            Command::GetProject {
+                project_id: project_id.into(),
+            },
+        )) {
+            self.state
+                .agent_settings
+                .refreshing
+                .insert(project_id.into());
+        }
+    }
+    fn save_agent_mode(&mut self, project_id: &str, mode: String) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || self.state.agent_settings.blocked(project_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::AgentSettingsSave {
+                project_id: project_id.into(),
+                generation: self.state.generation,
+            },
+            Command::SetAutonomy {
+                project_id: project_id.into(),
+                mode,
+            },
+        )) {
+            self.state.agent_settings.pending.insert(project_id.into());
+        }
+    }
+
+    fn cancel_execution(&mut self, project_id: &str, run_id: &str) {
+        if self.state.selected.as_deref() != Some(project_id)
+            || self.state.history.project.as_deref() != Some(project_id)
+            || self.state.history.selected.as_deref() != Some(run_id)
+            || self.state.cancel_pending.contains(run_id)
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::CancelExecution {
+                project_id: project_id.into(),
+                run_id: run_id.into(),
+                request: self.state.history.selection_request,
+            },
+            Command::CancelRun {
+                run_id: run_id.into(),
+            },
+        )) {
+            self.state.cancel_pending.insert(run_id.into());
+        }
+    }
+    fn start_execution(&mut self, project: &Project) {
+        let clean = self
+            .state
+            .spec_forms
+            .get(&project.id)
+            .is_none_or(|form| form.is_clean(project));
+        let pending = self.state.spec_review_pending.contains(&project.id)
+            || self.state.execution_pending.contains(&project.id)
+            || self.state.agent_settings.blocked(&project.id);
+        if self.state.selected.as_deref() != Some(&project.id) {
+            return;
+        }
+        if let Some(hash) = run_controls::start_hash(project, clean, pending) {
+            if self.send(worker::Work::new(
+                worker::Kind::StartExecution {
+                    project_id: project.id.clone(),
+                    generation: self.state.generation,
+                },
+                Command::StartRun {
+                    project_id: project.id.clone(),
+                    expected_approved_hash: hash,
+                },
+            )) {
+                self.state.execution_pending.insert(project.id.clone());
+            }
+        }
+    }
+
     fn decision_failed(&mut self, project_id: &str, message: String) {
         self.state
             .decisions
@@ -904,6 +1041,145 @@ impl App {
                     self.state.decisions.refresh_needed.insert(project_id);
                 }
             }
+            Kind::CancelExecution {
+                project_id,
+                run_id,
+                request,
+            } => {
+                self.state.cancel_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                {
+                    let same_request = self.state.history.selection_request == request;
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if same_request {
+                        self.state.status = match reply.result {
+                            Ok(ResponseData::Empty) => {
+                                "취소를 요청했습니다. 실행 상태를 다시 확인합니다.".into()
+                            }
+                            Err(error) => format!("취소 요청 실패: {error}"),
+                            _ => "취소 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
+                }
+            }
+            Kind::AgentStart {
+                project_id,
+                run_id,
+                request,
+                generation,
+            } => {
+                self.state.agent_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                {
+                    let same_request = self.state.generation == generation
+                        && self.state.history.selection_request == request;
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if same_request {
+                        self.state.status = match reply.result {
+                            Ok(ResponseData::Empty) => {
+                                "에이전트 시작 요청을 접수했습니다. 실행 상태를 다시 확인합니다."
+                                    .into()
+                            }
+                            Err(error) => format!("에이전트 시작 실패: {error}"),
+                            _ => "에이전트 시작 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
+                }
+            }
+            Kind::AgentSettingsSave {
+                project_id,
+                generation,
+            } => {
+                self.state.agent_settings.pending.remove(&project_id);
+                match reply.result {
+                    Ok(ResponseData::Project(project)) if project.id == project_id => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.generation == generation {
+                            self.refresh_agent_project(&project_id);
+                        }
+                    }
+                    Err(error) => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                        {
+                            self.state.status =
+                                format!("설정 저장 실패: {error}. 프로젝트 상태를 확인하세요.");
+                        }
+                    }
+                    Ok(_) => {
+                        self.state.agent_settings.refresh.insert(project_id.clone());
+                        if self.state.selected.as_deref() == Some(&project_id)
+                            && self.state.generation == generation
+                        {
+                            self.state.status =
+                                "설정 저장 응답이 올바르지 않습니다. 프로젝트 상태를 확인하세요."
+                                    .into();
+                        }
+                    }
+                }
+            }
+            Kind::AgentSettingsRefresh {
+                project_id,
+                generation,
+            } => {
+                self.state.agent_settings.refreshing.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.generation == generation
+                {
+                    match reply.result {
+                        Ok(ResponseData::Project(project)) if project.id == project_id => {
+                            self.state.project = Some(project);
+                            self.state.agent_settings.refresh.remove(&project_id);
+                        }
+                        Err(error) => {
+                            self.state.status = format!("프로젝트 상태 조회 실패: {error}")
+                        }
+                        _ => self.state.status = "프로젝트 상태 응답이 올바르지 않습니다.".into(),
+                    }
+                }
+            }
+            Kind::StartExecution {
+                project_id,
+                generation,
+            } => {
+                self.state.execution_pending.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.generation == generation
+                {
+                    match reply.result {
+                        Ok(ResponseData::Run { run_id }) => {
+                            self.state.status = format!("실행 시작: {run_id}")
+                        }
+                        Err(error) => self.state.status = format!("실행 시작 실패: {error}"),
+                        _ => self.state.status = "실행 시작 응답이 올바르지 않습니다.".into(),
+                    }
+                }
+            }
             Kind::GraphPage {
                 project_id,
                 epoch,
@@ -1098,7 +1374,58 @@ impl App {
                     if let Some(project) = self.state.project.clone() {
                         ui.heading(&project.name);
                         ui.label(&project.path);
+                        let clean = self
+                            .state
+                            .spec_forms
+                            .get(&project.id)
+                            .is_none_or(|form| form.is_clean(&project));
+                        let pending = self.state.spec_review_pending.contains(&project.id)
+                            || self.state.execution_pending.contains(&project.id)
+                            || self.state.agent_settings.blocked(&project.id);
+                        if ui
+                            .add_enabled(
+                                run_controls::start_hash(&project, clean, pending).is_some(),
+                                egui::Button::new("실행 시작"),
+                            )
+                            .clicked()
+                        {
+                            self.start_execution(&project);
+                        }
                         self.state.history.project(&project.id);
+                        if let Some(run_id) = self.state.history.selected.clone() {
+                            if ui
+                                .add_enabled(
+                                    !self.state.cancel_pending.contains(&run_id),
+                                    egui::Button::new("취소 요청"),
+                                )
+                                .clicked()
+                            {
+                                self.cancel_execution(&project.id, &run_id);
+                            }
+                        }
+                        if let Some(run) = self.state.history.detail.as_ref() {
+                            let matches_selection = self
+                                .state
+                                .history
+                                .selected
+                                .as_deref()
+                                .is_some_and(|id| run["id"] == id);
+                            let busy = !matches_selection
+                                || self.state.agent_settings.blocked(&project.id)
+                                || self.state.spec_review_pending.contains(&project.id)
+                                || self.state.history.selected.as_ref().is_some_and(|id| {
+                                    self.state.agent_pending.contains(id)
+                                        || self.state.cancel_pending.contains(id)
+                                })
+                                || !self
+                                    .state
+                                    .spec_forms
+                                    .get(&project.id)
+                                    .is_none_or(|form| form.is_clean(&project));
+                            if agent_run_ui::render(ui, &project, run, busy) {
+                                self.start_agent(&project);
+                            }
+                        }
                         if let Some(action) = run_history::render(ui, &self.state.history) {
                             match action {
                                 run_history::Action::Page(offset) => {
@@ -1261,7 +1588,8 @@ impl App {
                             || self.state.interview_pending.contains(&project.id)
                             || self.state.model_pending.contains(&project.id)
                             || self.state.spec_starting.contains(&project.id)
-                            || self.state.spec_runs.contains_key(&project.id);
+                            || self.state.spec_runs.contains_key(&project.id)
+                            || self.state.agent_settings.blocked(&project.id);
                         if let Some(action) = spec_review::render(
                             ui,
                             &project,
@@ -1420,6 +1748,40 @@ impl App {
                                     )) {
                                         self.state.decisions.pending.insert(project.id.clone());
                                     }
+                                }
+                            }
+                        }
+                        if let Some(action) =
+                            agent_settings_ui::render(ui, &mut self.state.agent_settings, &project)
+                        {
+                            match action {
+                                agent_settings_ui::Action::Agents(Ok(agents)) => {
+                                    if !self.state.agent_settings.blocked(&project.id)
+                                        && self.send(worker::Work::new(
+                                            worker::Kind::AgentSettingsSave {
+                                                project_id: project.id.clone(),
+                                                generation: self.state.generation,
+                                            },
+                                            Command::ConfigureAgents {
+                                                project_id: project.id.clone(),
+                                                agents,
+                                            },
+                                        ))
+                                    {
+                                        self.state
+                                            .agent_settings
+                                            .pending
+                                            .insert(project.id.clone());
+                                    }
+                                }
+                                agent_settings_ui::Action::Agents(Err(error)) => {
+                                    self.state.status = error
+                                }
+                                agent_settings_ui::Action::Mode(mode) => {
+                                    self.save_agent_mode(&project.id, mode)
+                                }
+                                agent_settings_ui::Action::Refresh => {
+                                    self.refresh_agent_project(&project.id)
                                 }
                             }
                         }
@@ -4902,6 +5264,650 @@ mod tests {
         assert_eq!(page.offset, 30);
         assert_eq!(page.edges.len(), 1);
         assert!(page.error.is_none());
+    }
+    #[test]
+    fn start_execution_sends_the_saved_approval_identifier() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.start_execution(&p);
+        assert!(
+            matches!(work.try_recv().unwrap().command, Command::StartRun{project_id,expected_approved_hash} if project_id=="a" && expected_approved_hash=="h")
+        );
+    }
+    #[test]
+    fn execution_start_button_is_visible_for_approved_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let out = egui::Context::default().run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="실행 시작")
+        ));
+    }
+    #[test]
+    fn cancel_execution_targets_only_the_selected_run() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        app.cancel_execution("a", "r2");
+        assert!(work.try_recv().is_err());
+        app.cancel_execution("a", "r1");
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::CancelRun{run_id} if run_id=="r1")
+        );
+    }
+    #[test]
+    fn selected_run_shows_cancel_control() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        let out = egui::Context::default().run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="취소 요청")
+        ));
+    }
+    #[test]
+    fn execution_queue_full_and_late_cancel_preserve_selection() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        app.start_execution(&p);
+        assert!(!app.state.execution_pending.contains("a"));
+        assert!(app.state.status.contains("대기열"));
+        app.cancel_execution("a", "r1");
+        assert!(!app.state.cancel_pending.contains("r1"));
+        assert!(work.try_recv().is_err());
+        let old = app.state.history.selection_request;
+        app.state.history.selection_request += 1;
+        app.state.history.selected = Some("r2".into());
+        app.state.status = "현재 선택".into();
+        app.apply(worker::Reply {
+            kind: worker::Kind::CancelExecution {
+                project_id: "a".into(),
+                run_id: "r1".into(),
+                request: old,
+            },
+            result: Err("늦은 오류".into()),
+        });
+        assert_eq!(app.state.status, "현재 선택");
+        assert_eq!(app.state.history.selected.as_deref(), Some("r2"));
+    }
+    #[test]
+    fn start_execution_blocks_pending_and_ignores_old_project_reply() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.spec_review_pending.insert("a".into());
+        app.start_execution(&p);
+        assert!(work.try_recv().is_err());
+        app.state.spec_review_pending.clear();
+        app.start_execution(&p);
+        let item = work.try_recv().unwrap();
+        app.start_execution(&p);
+        assert!(work.try_recv().is_err());
+        app.state.select("b");
+        app.state.status = "다른 프로젝트".into();
+        app.apply(worker::Reply {
+            kind: item.kind,
+            result: Err("이전 오류".into()),
+        });
+        assert_eq!(app.state.status, "다른 프로젝트");
+        assert!(!app.state.execution_pending.contains("a"));
+    }
+    #[test]
+    fn agent_mode_save_targets_selected_project_and_blocks_approval() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("b", "step".into());
+        assert!(work.try_recv().is_err());
+        app.save_agent_mode("a", "step".into());
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::SetAutonomy{project_id,mode} if project_id=="a" && mode=="step")
+        );
+        assert!(app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn agent_save_waits_for_project_refresh_before_unblocking() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        let refresh = work.try_recv().unwrap();
+        assert!(matches!(refresh.command,Command::GetProject{project_id} if project_id=="a"));
+        app.apply(worker::Reply {
+            kind: refresh.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(!app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn selected_project_shows_agent_configuration_controls() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="에이전트 설정 저장")));
+    }
+    #[test]
+    fn agent_refresh_does_not_queue_duplicate_requests() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.agent_settings.refresh.insert("a".into());
+        app.refresh_agent_project("a");
+        app.refresh_agent_project("a");
+        assert!(work.try_recv().is_ok());
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn agent_unknown_success_after_switch_keeps_project_blocked() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.state.select("b");
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        assert!(!app.state.agent_settings.blocked("b"));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn agent_save_error_requires_fresh_project_before_approval() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.save_agent_mode("a", "step".into());
+        let save = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: save.kind,
+            result: Err("연결 오류".into()),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+    }
+    #[test]
+    fn late_agent_refresh_after_project_round_trip_stays_blocked() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.agent_settings.refresh.insert("a".into());
+        app.refresh_agent_project("a");
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Project(project("a"))),
+        });
+        assert!(app.state.agent_settings.blocked("a"));
+        app.refresh_agent_project("a");
+        assert!(work.try_recv().is_ok());
+    }
+    #[test]
+    fn start_agent_sends_selected_run_and_never_invents_mock_output() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.start_agent(&p);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::StartAgent{run_id,mock_script} if run_id=="r" && mock_script.is_empty())
+        );
+        app.start_agent(&p);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn selected_run_shows_agent_actions_in_the_real_panel() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail =
+            Some(serde_json::json!({"id":"r","project_id":"a","model_provider":"mock"}));
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="에이전트 시작")));
+    }
+    #[test]
+    fn agent_ack_invalidates_old_detail_before_refresh() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.start_agent(&p);
+        let start = work.try_recv().unwrap();
+        let old_request = app.state.history.selection_request;
+        let old_detail = app.state.history.detail.clone().unwrap();
+        app.apply(worker::Reply {
+            kind: start.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::HistoryDetail {
+                project_id: "a".into(),
+                run_id: "r".into(),
+                request: old_request,
+            },
+            result: Ok(ResponseData::Data(old_detail)),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+        app.start_agent(&p);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn agent_error_refreshes_state_before_allowing_retry() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.start_agent(&p);
+        let start = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: start.kind,
+            result: Err("연결 오류".into()),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.status.contains("시작 실패"));
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn old_agent_ack_after_reselection_invalidates_reselected_run_without_changing_notice() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let detail = serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null});
+        app.state.history.detail = Some(detail.clone());
+        app.start_agent(&p);
+        let start = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(p);
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(detail);
+        app.state.status = "새 선택".into();
+        app.apply(worker::Reply {
+            kind: start.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert_eq!(app.state.status, "새 선택");
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn agent_start_is_blocked_while_cancel_request_is_pending() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.state.cancel_pending.insert("r".into());
+        app.start_agent(&p);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn cancel_ack_invalidates_old_detail_before_agent_can_start() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.cancel_execution("a", "r");
+        let cancel = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: cancel.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+        app.start_agent(&p);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn cancel_error_refreshes_run_before_starting_agent() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"r"}));
+        app.cancel_execution("a", "r");
+        let cancel = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: cancel.kind,
+            result: Err("연결 오류".into()),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.status.contains("실패"));
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn old_cancel_ack_rechecks_reselected_run_without_overwriting_notice() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"r"}));
+        app.cancel_execution("a", "r");
+        let cancel = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(serde_json::json!({"id":"r"}));
+        app.state.status = "새 선택".into();
+        app.apply(worker::Reply {
+            kind: cancel.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert_eq!(app.state.status, "새 선택");
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn agent_start_queue_full_preserves_run_selection() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","spec_hash":"h","spec_version":1,"context_version":0,"revision":"rev","scope":["src"],"agent_configs":[],"model_provider":"openai","status":"awaiting_implementation","agent_active":false,"pending":null}),
+        );
+        app.start_agent(&p);
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.agent_pending.contains("r"));
+        assert_eq!(app.state.history.selected.as_deref(), Some("r"));
+        assert!(app.state.history.detail.is_some());
+        assert!(app.state.status.contains("대기열"));
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
