@@ -7,6 +7,13 @@ use std::sync::{
 };
 
 pub enum Kind {
+    KnowledgeIndex {
+        project_id: String,
+        document: String,
+        epoch: u64,
+        sequence: u64,
+        action: crate::knowledge_index_ui::Action,
+    },
     AgentSettingsSave {
         project_id: String,
         generation: u64,
@@ -282,7 +289,7 @@ fn start_with_pipe(
     start_lane(ctx.clone(), pipe, None, control_rx, reply_tx.clone());
     std::thread::spawn(move || {
         while let Ok(work) = work.recv() {
-            let lane = if matches!(&work.kind, Kind::Storage | Kind::RetrySave { .. }) {
+            let lane = if is_control(&work.kind) {
                 &control_tx
             } else {
                 &regular_tx
@@ -1323,4 +1330,36 @@ mod tests {
         std::fs::remove_file(dir.join("test.redb")).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
+}
+#[cfg(test)]
+mod index_control_tests {
+    use super::*;
+    #[test]
+    fn index_status_and_cancel_use_control_lane_while_start_and_config_use_regular() {
+        let kind = |action| Kind::KnowledgeIndex {
+            project_id: "a".into(),
+            document: "doc".into(),
+            epoch: 1,
+            sequence: 1,
+            action,
+        };
+        assert!(is_control(&kind(crate::knowledge_index_ui::Action::Status)));
+        assert!(is_control(&kind(crate::knowledge_index_ui::Action::Cancel)));
+        assert!(!is_control(&kind(crate::knowledge_index_ui::Action::Start)));
+        assert!(!is_control(&kind(
+            crate::knowledge_index_ui::Action::Configure
+        )));
+    }
+}
+fn is_control(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Storage
+            | Kind::RetrySave { .. }
+            | Kind::KnowledgeIndex {
+                action: crate::knowledge_index_ui::Action::Status
+                    | crate::knowledge_index_ui::Action::Cancel,
+                ..
+            }
+    )
 }
