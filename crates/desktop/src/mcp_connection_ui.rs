@@ -6,6 +6,7 @@ pub(crate) struct Form {
     pub save_pending: bool,
     pub list_pending: bool,
     pub sequence: u64,
+    pub endpoint_generation: u64,
     pub tools: Vec<serde_json::Value>,
     pub message: Option<String>,
     pub error: Option<String>,
@@ -32,6 +33,7 @@ impl State {
         if form.endpoint != text {
             form.endpoint = text.into();
             form.sequence = form.sequence.wrapping_add(1);
+            form.endpoint_generation = form.endpoint_generation.wrapping_add(1);
             form.tools.clear();
             form.message = None;
             form.error = None;
@@ -39,6 +41,14 @@ impl State {
     }
     pub fn form(&mut self, id: &str) -> &mut Form {
         self.forms.entry(id.into()).or_default()
+    }
+}
+impl Form {
+    pub fn can_use_endpoint(&self) -> bool {
+        self.saved
+            .as_ref()
+            .is_some_and(|saved| saved == &self.endpoint)
+            || (self.saved.is_none() && self.endpoint.is_empty())
     }
 }
 #[cfg(test)]
@@ -99,8 +109,7 @@ pub(crate) fn render(ui: &mut eframe::egui::Ui, state: &mut State, id: &str) -> 
     {
         action = Some(Action::Save(form.endpoint.clone()));
     }
-    let can_list = form.saved.as_ref().is_some_and(|v| v == &form.endpoint)
-        || (form.saved.is_none() && form.endpoint.is_empty());
+    let can_list = form.can_use_endpoint();
     if ui
         .add_enabled(
             !busy && can_list,

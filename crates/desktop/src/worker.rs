@@ -7,6 +7,13 @@ use std::sync::{
 };
 
 pub enum Kind {
+    McpOAuth {
+        project_id: String,
+        epoch: u64,
+        sequence: u64,
+        nonce: u64,
+        action: crate::mcp_oauth_ui::Action,
+    },
     KnowledgeIndex {
         project_id: String,
         document: String,
