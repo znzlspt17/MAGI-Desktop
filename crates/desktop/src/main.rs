@@ -6216,6 +6216,34 @@ mod tests {
         ));
     }
     #[test]
+    fn inactive_unbound_patch_approval_remains_available() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","agent_active":false,"spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ApproveTool{approval_id,approved:true,..} if approval_id=="id1")
+        );
+    }
+    #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
         let (tx, _work) = std::sync::mpsc::sync_channel(8);
         let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
