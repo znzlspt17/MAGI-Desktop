@@ -14,6 +14,12 @@ pub enum Kind {
         document_id: String,
         version: u64,
     },
+    SemanticSearch {
+        project_id: String,
+        query: String,
+        epoch: u64,
+        sequence: u64,
+    },
     McpOAuth {
         project_id: String,
         epoch: u64,
