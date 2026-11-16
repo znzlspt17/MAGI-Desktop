@@ -14,6 +14,13 @@ pub enum Kind {
         sequence: u64,
         action: crate::knowledge_index_ui::Action,
     },
+    ToolAnswer {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        approval_id: String,
+        snapshot: serde_json::Value,
+    },
     McpSave {
         project_id: String,
         endpoint: String,
