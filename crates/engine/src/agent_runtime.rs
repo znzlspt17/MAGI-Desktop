@@ -891,6 +891,198 @@ mod bridge_integration_tests {
     struct Model(AtomicUsize);
 
     #[tokio::test]
+    async fn completed_patch_before_checkpoint_advance_is_reused_after_resume() {
+        let mut fixture = Fixture::new("step_by_step");
+        let db = fixture.engine.db.get().unwrap();
+        let logical_id = serde_json::to_string(&("task", "implementer", 0, "patch-1")).unwrap();
+        let args = json!({"path":"src/new.txt","content":"fixture"});
+        let pending = runs::submit_bound_patch(
+            &db,
+            &fixture.run_id,
+            "implementer",
+            "task",
+            &logical_id,
+            args.clone(),
+        )
+        .unwrap();
+        let approval = pending["approval_id"].as_str().unwrap().to_owned();
+        let run = runs::get(&db, &fixture.run_id).unwrap();
+        let checkpoint = json!({"schema_version":1,"revision":1,"spec_hash":"fixture","spec_version":1,"model_identity":"model","config_hash":"config","task_index":0,"role_index":1,"round":0,"input":[],"pending_calls":[{"call_id":"patch-1","name":"patch","arguments":args}],"pending_index":0,"evidence":[],"completed_tasks":[],"used_calls":[],"tokens_used":0,"model_inflight":false,"role_complete":false,"validation_index":0,"reserved_tokens":0});
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(!fixture.work.join("src/new.txt").exists());
+        let mut inactive = run.clone();
+        inactive["agent_active"] = false.into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), inactive.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let denied = fixture
+            .engine
+            .handle(domain::Request {
+                id: "approve-inactive".into(),
+                command: domain::Command::ApproveTool {
+                    run_id: fixture.run_id.clone(),
+                    approval_id: approval.clone(),
+                    approved: true,
+                },
+            })
+            .result;
+        assert!(denied.is_err());
+        assert!(!fixture.work.join("src/new.txt").exists());
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let result = fixture
+            .engine
+            .handle(domain::Request {
+                id: "approve-active".into(),
+                command: domain::Command::ApproveTool {
+                    run_id: fixture.run_id.clone(),
+                    approval_id: approval,
+                    approved: true,
+                },
+            })
+            .result;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("src/new.txt")).unwrap(),
+            "fixture"
+        );
+        drop(db);
+        Arc::get_mut(&mut fixture.engine).unwrap().db =
+            crate::storage::StorageSlot::empty(fixture.root.join("closed.redb"));
+        fixture.engine = Arc::new(Engine::open(&fixture.root.join("state.redb")).unwrap());
+        let db = fixture.engine.db.get().unwrap();
+        let before_resume = runs::get(&db, &fixture.run_id).unwrap();
+        assert_eq!(before_resume["agent_active"], false);
+        assert_eq!(before_resume["status"], "interrupted");
+        let mut mismatch = checkpoint.clone();
+        mismatch["pending_calls"][0]["arguments"]["content"] = "other".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), mismatch.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            runs::begin_resume(&db, &fixture.run_id, &before_resume, "model", "config").is_err()
+        );
+        assert_eq!(runs::get(&db, &fixture.run_id).unwrap(), before_resume);
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), checkpoint.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let key = format!("{}:{logical_id}", fixture.run_id);
+        let original_record: Value = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap();
+            serde_json::from_str(table.get(key.as_str()).unwrap().unwrap().value()).unwrap()
+        };
+        for (field, value) in [
+            ("approval_id", json!("different")),
+            ("role", json!("reviewer")),
+            ("origin_agent_attempt", json!(2)),
+            ("status", json!("uncertain")),
+        ] {
+            let mut altered = original_record.clone();
+            altered[field] = value;
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                    .unwrap()
+                    .insert(key.as_str(), altered.to_string().as_str())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            assert!(
+                runs::begin_resume(&db, &fixture.run_id, &before_resume, "model", "config")
+                    .is_err()
+            );
+        }
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap()
+                .insert(key.as_str(), original_record.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let resumed =
+            runs::begin_resume(&db, &fixture.run_id, &before_resume, "model", "config").unwrap();
+        assert_eq!(resumed["agent_attempt"], 2);
+        let before_record: Value = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap();
+            serde_json::from_str(table.get(key.as_str()).unwrap().unwrap().value()).unwrap()
+        };
+        assert_eq!(before_record["origin_agent_attempt"], 1);
+        std::fs::write(fixture.work.join("src/new.txt"), "preserve").unwrap();
+        let runtime = Runtime::new(
+            Arc::clone(&fixture.engine),
+            fixture.run_id.clone(),
+            fixture.spec.clone(),
+            2,
+            2,
+        );
+        let result = runtime
+            .execute_durable(
+                "implementer",
+                &fixture.spec.tasks[0],
+                "patch",
+                &logical_id,
+                args,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "applied");
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("src/new.txt")).unwrap(),
+            "preserve"
+        );
+        let after_record: Value = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap();
+            serde_json::from_str(table.get(key.as_str()).unwrap().unwrap().value()).unwrap()
+        };
+        assert_eq!(after_record, before_record);
+    }
+
+    #[tokio::test]
     async fn resume_waiting_patch_keeps_original_approval_and_runs_only_after_user_accepts() {
         let fixture = Fixture::new("step_by_step");
         let db = fixture.engine.db.get().unwrap();
