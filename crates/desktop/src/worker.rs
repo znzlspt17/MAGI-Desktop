@@ -7,6 +7,14 @@ use std::sync::{
 };
 
 pub enum Kind {
+    PackageExport {
+        project_id: String,
+        target: crate::package_export_ui::Target,
+        destination: String,
+        expected: String,
+        generation: u64,
+        selection: u64,
+    },
     SemanticSearch {
         project_id: String,
         query: String,
