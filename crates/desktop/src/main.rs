@@ -6,6 +6,7 @@ use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
 mod agent_run_ui;
 mod agent_settings_ui;
+mod approval_history_ui;
 mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_index_ui;
@@ -62,6 +63,7 @@ struct State {
     agent_pending: std::collections::HashSet<String>,
     tool_pending: std::collections::HashSet<String>,
     run_diff: run_diff_ui::State,
+    approval_history: approval_history_ui::State,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
 }
@@ -2292,6 +2294,7 @@ impl App {
                                 }
                             }
                         }
+                        approval_history_ui::render(ui, &mut self.state.approval_history, &project);
                         self.state.mcp.select(&project.id);
                         if let Some(action) =
                             mcp_connection_ui::render(ui, &mut self.state.mcp, &project.id)
@@ -6778,6 +6781,35 @@ mod tests {
             Some("old")
         );
         assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn selected_project_displays_approval_history() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(
+            |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="승인 이력")
+        ));
     }
     #[test]
     fn inactive_patch_approval_is_blocked_but_rejection_is_allowed() {
