@@ -691,6 +691,33 @@ impl App {
         true
     }
 
+    fn request_graph_source(&mut self, project: &str) {
+        if self.state.selected.as_deref() != Some(project)
+            || self.state.graph.active.as_deref() != Some(project)
+        {
+            return;
+        }
+        let Some((document_id, version)) = self.state.graph.source_intent.take() else {
+            return;
+        };
+        let request = self.state.graph.source_request;
+        if !self.send(worker::Work::new(
+            worker::Kind::GraphSource {
+                project_id: project.into(),
+                epoch: self.state.graph.epoch,
+                request,
+                document_id: document_id.clone(),
+                version,
+            },
+            Command::GetKnowledgeSource {
+                project_id: project.into(),
+                document_id,
+            },
+        )) {
+            self.state.graph.source_error =
+                Some("원문 조회 요청을 대기열에 넣지 못했습니다. 문서를 다시 선택하세요.".into());
+        }
+    }
     fn apply(&mut self, reply: worker::Reply) {
         use worker::Kind;
         let is_status = matches!(&reply.kind, Kind::Status);
@@ -1834,6 +1861,27 @@ impl App {
                     }
                 }
             }
+            Kind::GraphSource {
+                project_id,
+                epoch,
+                request,
+                document_id,
+                version,
+            } => {
+                let result = match reply.result {
+                    Ok(ResponseData::Data(data)) => Ok(data),
+                    Ok(_) => Err("응답 형식이 올바르지 않습니다.".into()),
+                    Err(error) => Err(error),
+                };
+                self.state.graph.apply_source(
+                    &project_id,
+                    epoch,
+                    request,
+                    &document_id,
+                    version,
+                    result,
+                );
+            }
             Kind::GraphPage {
                 project_id,
                 epoch,
@@ -2532,8 +2580,10 @@ impl App {
                                 },
                             )) {
                                 self.state.graph.page_request = request;
+                                self.state.graph.invalidate_source();
                             }
                         }
+                        self.request_graph_source(&project.id);
                         self.state.knowledge_index.select(&project.id);
                         if let Some(action) = knowledge_index_ui::render(
                             ui,

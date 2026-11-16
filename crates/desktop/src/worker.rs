@@ -82,6 +82,13 @@ pub enum Kind {
         project_id: String,
         generation: u64,
     },
+    GraphSource {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        document_id: String,
+        version: u64,
+    },
     GraphPage {
         project_id: String,
         epoch: u64,
