@@ -14,6 +14,7 @@ mod run_controls;
 mod run_history;
 mod spec_review;
 mod storage;
+mod tool_approval_ui;
 mod worker;
 
 #[derive(Default)]
@@ -52,6 +53,7 @@ struct State {
     graph: knowledge_graph_ui::State,
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
+    tool_pending: std::collections::HashSet<String>,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
 }
@@ -104,6 +106,52 @@ struct App {
 }
 
 impl App {
+    fn answer_tool(&mut self, project: &Project, item: tool_approval_ui::Pending, approved: bool) {
+        let Some(run_id) = self.state.history.selected.clone() else {
+            return;
+        };
+        let Some(run) = self.state.history.detail.as_ref() else {
+            return;
+        };
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.history.project.as_deref() != Some(&project.id)
+            || self.state.tool_pending.contains(&run_id)
+            || self.state.cancel_pending.contains(&run_id)
+            || self.state.agent_pending.contains(&run_id)
+            || tool_approval_ui::pending(project, run, &run_id).as_ref() != Some(&item)
+        {
+            return;
+        }
+        if approved
+            && (!tool_approval_ui::approval_matches(project, run)
+                || self.state.agent_settings.blocked(&project.id)
+                || self.state.spec_review_pending.contains(&project.id)
+                || !self
+                    .state
+                    .spec_forms
+                    .get(&project.id)
+                    .is_none_or(|form| form.is_clean(project)))
+        {
+            return;
+        }
+        if self.send(worker::Work::new(
+            worker::Kind::ToolAnswer {
+                project_id: project.id.clone(),
+                run_id: run_id.clone(),
+                request: self.state.history.selection_request,
+                approval_id: item.id.clone(),
+                snapshot: item.raw.clone(),
+            },
+            Command::ApproveTool {
+                run_id: run_id.clone(),
+                approval_id: item.id,
+                approved,
+            },
+        )) {
+            self.state.tool_pending.insert(run_id);
+        }
+    }
+
     fn start_agent(&mut self, project: &Project) {
         let Some(run_id) = self.state.history.selected.clone() else {
             return;
@@ -1074,6 +1122,44 @@ impl App {
                     ));
                 }
             }
+            Kind::ToolAnswer {
+                project_id,
+                run_id,
+                request,
+                approval_id,
+                snapshot,
+            } => {
+                self.state.tool_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                {
+                    let same = self.state.history.selection_request == request
+                        && self.state.history.detail.as_ref().is_some_and(|v| {
+                            v["pending"] == snapshot && v["pending"]["id"] == approval_id
+                        });
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if same {
+                        self.state.status = match reply.result {
+                            Ok(ResponseData::Data(_)) => {
+                                "승인 응답을 받았습니다. 실행 상태를 다시 확인합니다.".into()
+                            }
+                            Err(error) => format!("승인 요청 실패: {error}"),
+                            _ => "승인 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
+                }
+            }
             Kind::AgentStart {
                 project_id,
                 run_id,
@@ -1424,6 +1510,26 @@ impl App {
                                     .is_none_or(|form| form.is_clean(&project));
                             if agent_run_ui::render(ui, &project, run, busy) {
                                 self.start_agent(&project);
+                            }
+                        }
+                        if let (Some(run_id), Some(run)) = (
+                            self.state.history.selected.clone(),
+                            self.state.history.detail.clone(),
+                        ) {
+                            let busy = self.state.tool_pending.contains(&run_id)
+                                || self.state.cancel_pending.contains(&run_id)
+                                || self.state.agent_pending.contains(&run_id)
+                                || self.state.agent_settings.blocked(&project.id)
+                                || self.state.spec_review_pending.contains(&project.id)
+                                || !self
+                                    .state
+                                    .spec_forms
+                                    .get(&project.id)
+                                    .is_none_or(|form| form.is_clean(&project));
+                            if let Some((item, approved)) =
+                                tool_approval_ui::render(ui, &project, &run, &run_id, busy)
+                            {
+                                self.answer_tool(&project, item, approved);
                             }
                         }
                         if let Some(action) = run_history::render(ui, &self.state.history) {
@@ -5907,6 +6013,171 @@ mod tests {
         assert!(!app.state.agent_pending.contains("r"));
         assert_eq!(app.state.history.selected.as_deref(), Some("r"));
         assert!(app.state.history.detail.is_some());
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn approval_sends_only_the_reviewed_current_pending_id() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.state.history.detail.as_mut().unwrap()["pending"]["arguments"]["content"] =
+            "changed".into();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(work.try_recv().is_err());
+        app.state.history.detail.as_mut().unwrap()["pending"] = item.raw.clone();
+        app.answer_tool(&p, item.clone(), true);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ApproveTool{run_id,approval_id,approved} if run_id=="r" && approval_id=="id1" && approved)
+        );
+        app.answer_tool(&p, item, true);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn approval_ack_refreshes_run_without_claiming_completion() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"mcp","arguments":{"endpoint":"example","cwd":"x"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        let workitem = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: workitem.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"status":"approved_mcp"}),
+            )),
+        });
+        assert!(app.state.history.detail.is_none());
+        assert!(app.state.status.contains("상태"));
+        assert!(!app.state.status.contains("완료"));
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn late_approval_error_does_not_overwrite_new_pending_request_notice() {
+        let (tx, work) = std::sync::mpsc::sync_channel(3);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"old"},"call_id":null}}),
+        );
+        let item =
+            tool_approval_ui::pending(&p, app.state.history.detail.as_ref().unwrap(), "r").unwrap();
+        app.answer_tool(&p, item, true);
+        let sent = work.try_recv().unwrap();
+        app.state.history.detail.as_mut().unwrap()["pending"]["id"] = "id2".into();
+        app.state.status = "새 요청".into();
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Err("이전 오류".into()),
+        });
+        assert_eq!(app.state.status, "새 요청");
+        assert!(app.state.history.detail.is_none());
+        assert!(matches!(work.try_recv().unwrap().command,Command::GetRun{run_id} if run_id=="r"));
+    }
+    #[test]
+    fn selected_run_displays_pending_approval_in_actual_panel() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(
+            serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"hello"},"call_id":null}}),
+        );
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="도구 실행 승인 요청")));
+    }
+    #[test]
+    fn approval_queue_full_preserves_request() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":["src"],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        let detail = serde_json::json!({"id":"r","project_id":"a","status":"awaiting_approval","spec_hash":"h","spec_version":1,"scope":["src"],"pending":{"id":"id1","tool":"patch","arguments":{"path":"src/a","content":"one"},"call_id":null}});
+        app.state.history.detail = Some(detail.clone());
+        let item = tool_approval_ui::pending(&p, &detail, "r").unwrap();
+        app.answer_tool(&p, item, true);
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.tool_pending.contains("r"));
+        assert_eq!(app.state.history.detail.as_ref(), Some(&detail));
         assert!(app.state.status.contains("대기열"));
     }
     #[test]

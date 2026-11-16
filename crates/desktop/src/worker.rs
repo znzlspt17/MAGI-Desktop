@@ -7,6 +7,13 @@ use std::sync::{
 };
 
 pub enum Kind {
+    ToolAnswer {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        approval_id: String,
+        snapshot: serde_json::Value,
+    },
     AgentStart {
         project_id: String,
         run_id: String,
