@@ -4,6 +4,13 @@ use std::sync::Mutex;
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
 const CALLS: TableDefinition<&str, &str> = TableDefinition::new("calls");
+pub(crate) fn review_call_id(attempt: u64) -> String {
+    if attempt == 1 {
+        "final-review".into()
+    } else {
+        format!("final-review:{attempt}")
+    }
+}
 #[cfg(test)]
 type SnapshotHook = (
     String,
@@ -70,10 +77,7 @@ fn review_proof(
     {
         return Ok(None);
     }
-    let Some(items) = run["evidence"].as_array() else {
-        return Ok(None);
-    };
-    let Some(contexts) = run["evidence_contexts"].as_object() else {
+    let Some(_items) = run["evidence"].as_array() else {
         return Ok(None);
     };
     let mut selected = Vec::new();
@@ -96,20 +100,13 @@ fn review_proof(
             }
             let verification_id = serde_json::to_string(&(&task.id, "final_validation", index))
                 .map_err(|_| "invalid verification id")?;
-            let mut matches = items
-                .iter()
-                .filter(|item| item["verification_id"] == verification_id);
-            let Some(item) = matches.next() else {
+            let attempt = run["agent_attempt"].as_u64().ok_or("invalid attempt")?;
+            let Some((item, context)) = crate::evidence::resolve(run, &verification_id, attempt)?
+            else {
                 return Ok(None);
             };
-            if matches.next().is_some() {
-                return Ok(None);
-            }
             let evidence: domain::VerificationEvidence =
                 serde_json::from_value(item.clone()).map_err(|_| "invalid evidence")?;
-            let context = contexts
-                .get(&verification_id)
-                .ok_or("verification context missing")?;
             if !evidence.passed
                 || evidence.spec_hash != spec.hash
                 || evidence.command != *command
@@ -340,7 +337,7 @@ pub(crate) fn finish_agent(
                         false
                     } else if let Some((binding, digest)) = proof {
                         let calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
-                        let key = format!("{id}:final-review");
+                        let key = format!("{id}:{}", review_call_id(binding.agent_attempt));
                         let call = calls.get(key.as_str()).map_err(|e| e.to_string())?;
                         let call: Option<serde_json::Value> = call
                             .map(|v| serde_json::from_str(v.value()))
@@ -526,6 +523,12 @@ mod tests {
             verification_ids: vec![id],
         };
         let (_, digest) = review_input(&spec, &evidence, &diff, &binding).unwrap();
+        let mut old_only = run.clone();
+        old_only["agent_attempt"] = 2.into();
+        let saved_project: domain::Project = serde_json::from_value(project.clone()).unwrap();
+        assert!(review_proof(&db, &run_id, &old_only, &saved_project)
+            .unwrap()
+            .is_none());
         let mut missing_binding: domain::Project = serde_json::from_value(project.clone()).unwrap();
         missing_binding
             .approved

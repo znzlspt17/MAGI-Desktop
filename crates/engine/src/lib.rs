@@ -7,10 +7,12 @@ pub mod agent_loop;
 // 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
+mod evidence;
 mod knowledge_indexing;
 mod knowledge_text;
 mod mcp_connections;
 mod mcp_oauth;
+mod mcp_policy;
 mod mcp_runtime;
 mod package_export;
 mod project_decisions;
@@ -158,6 +160,7 @@ impl Engine {
                 | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
                 | Command::ConfigureMcp { .. }
+                | Command::ConfigureMcpPolicy { .. }
                 | Command::RequestMcpApproval { .. }
                 | Command::ApproveTool { .. }
                 | Command::SaveDraft { .. }
@@ -178,6 +181,12 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if matches!(&request.command, Command::CallMcpTool { .. }) {
+            return Response {
+                id: request_id,
+                result: Err("tool approval required; use an approved run".into()),
+            };
+        }
         if matches!(
             &request.command,
             Command::DiscoverMcpOAuth { .. }
@@ -669,6 +678,10 @@ impl Engine {
                 let result = mcp_connections::configure(&db, &project_id, &endpoint)?;
                 self.oauth.lock().map_err(|_| "OAuth state unavailable")?.remove(&project_id);
                 Ok(result)
+            }
+            Command::ConfigureMcpPolicy { project_id, allowlist } => {
+                let db = self.db.get().ok_or("storage unavailable")?;
+                mcp_policy::configure(&db, &project_id, allowlist)
             }
             Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
                 let db = self.db.get().ok_or("storage unavailable")?;

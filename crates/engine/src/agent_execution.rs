@@ -698,13 +698,14 @@ async fn final_review(
         let engine = std::sync::Arc::clone(engine);
         let id = run_id.to_owned();
         let hash = digest.clone();
+        let call_id = crate::agent_completion::review_call_id(attempt);
         tokio::task::spawn_blocking(move || {
             let _gate = engine
                 .mutation_gate
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let db = engine.db.get().ok_or("storage unavailable")?;
-            crate::runs::claim_call(&db, &id, "final-review", &hash)
+            crate::runs::claim_call(&db, &id, &call_id, &hash)
         })
         .await
         .map_err(|_| "review claim worker failed")??
@@ -768,6 +769,7 @@ async fn final_review(
     runtime.fresh(spec).await?;
     let engine = std::sync::Arc::clone(engine);
     let id = run_id.to_owned();
+    let call_id = crate::agent_completion::review_call_id(attempt);
     tokio::task::spawn_blocking(move || {
         let _gate = engine
             .mutation_gate
@@ -777,7 +779,7 @@ async fn final_review(
         crate::runs::complete_call(
             &db,
             &id,
-            "final-review",
+            &call_id,
             serde_json::json!({"approved":true,"binding":binding}),
         )
     })
@@ -1062,7 +1064,7 @@ mod tests {
         assert!(
             crate::runs::begin_resume(&db, "run", &old_evidence, "model", "config")
                 .unwrap_err()
-                .contains("evidence")
+                .contains("verification id")
         );
         let tx = db.begin_write().unwrap();
         {
@@ -1420,6 +1422,11 @@ mod tests {
         resumed_run["id"] = "resumable".into();
         resumed_run["status"] = "interrupted".into();
         resumed_run["agent_attempt"] = 1.into();
+        let logical_id = serde_json::to_string(&("task", "final_validation", 0)).unwrap();
+        let old_row = serde_json::json!({"revision":revision,"spec_hash":"fixture","command":"read_contains:src/a.txt:after","passed":true,"output":"old fixture","verification_id":logical_id,"worktree_hash":"old-snapshot","requirement_ids":["requirement-0"],"acceptance_ids":["acceptance-0"]});
+        let old_context = serde_json::json!({"schema_version":1,"spec_version":1,"context_version":2,"agent_attempt":1,"task_id":"task"});
+        resumed_run["evidence"] = serde_json::json!([old_row]);
+        resumed_run["evidence_contexts"] = serde_json::json!({logical_id.clone():old_context});
         let tx = db.begin_write().unwrap();
         {
             tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
@@ -1456,6 +1463,13 @@ mod tests {
         assert_eq!(resumed_run["status"], "completed", "{resumed_run}");
         assert_eq!(resumed_run["agent_attempt"], 2);
         assert_eq!(resumed_run["events"][0]["attempt"], 2);
+        assert_eq!(resumed_run["evidence"][0], old_row);
+        assert_eq!(resumed_run["evidence_contexts"][&logical_id], old_context);
+        let (new_row, context) = crate::evidence::resolve(&resumed_run, &logical_id, 2)
+            .unwrap()
+            .expect("fresh verification missing");
+        assert_eq!(new_row["agent_attempt"], 2);
+        assert_eq!(context["agent_attempt"], 2);
         std::fs::write(work.join("src/a.txt"), "before").unwrap();
         let mut unsupported = project.clone();
         unsupported["approved"]["tasks"][0]["validation"] = serde_json::json!(["exec_json:{}"]);
