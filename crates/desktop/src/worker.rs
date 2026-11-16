@@ -315,18 +315,35 @@ fn start_with_pipe(
     let (tx, work) = mpsc::sync_channel::<Work>(32);
     let (reply_tx, rx) = mpsc::sync_channel::<Reply>(64);
     let (regular_tx, regular_rx) = mpsc::sync_channel::<Work>(16);
-    let (control_tx, control_rx) = mpsc::sync_channel::<Work>(8);
+    let (control_tx, control_rx) = mpsc::sync_channel::<Work>(4);
+    let (cancel_tx, cancel_rx) = mpsc::sync_channel::<Work>(4);
+    let cancel_rx = Arc::new(std::sync::Mutex::new(cancel_rx));
     start_lane(
         ctx.clone(),
         pipe.clone(),
         startup.clone(),
-        regular_rx,
+        Arc::new(std::sync::Mutex::new(regular_rx)),
         reply_tx.clone(),
     );
-    start_lane(ctx.clone(), pipe, startup, control_rx, reply_tx.clone());
+    start_lane(
+        ctx.clone(),
+        pipe.clone(),
+        startup,
+        Arc::new(std::sync::Mutex::new(control_rx)),
+        reply_tx.clone(),
+    );
+    for _ in 0..2 {
+        start_lane(
+            ctx.clone(),
+            pipe.clone(),
+            None,
+            cancel_rx.clone(),
+            reply_tx.clone(),
+        );
+    }
     std::thread::spawn(move || {
         while let Ok(work) = work.recv() {
-            if let Some(work) = route_control_work(work, &regular_tx, &control_tx) {
+            if let Some(work) = route_control_work(work, &regular_tx, &control_tx, &cancel_tx) {
                 if reply_tx
                     .send(Reply {
                         kind: work.kind,
@@ -347,7 +364,7 @@ fn start_lane(
     ctx: egui::Context,
     pipe: String,
     startup: Option<Arc<AtomicBool>>,
-    work: Receiver<Work>,
+    work: Arc<std::sync::Mutex<Receiver<Work>>>,
     reply_tx: SyncSender<Reply>,
 ) {
     std::thread::spawn(move || {
@@ -357,7 +374,7 @@ fn start_lane(
         {
             Ok(runtime) => runtime,
             Err(e) => {
-                while let Ok(work) = work.recv() {
+                while let Some(work) = receive_work(&work) {
                     if reply_tx
                         .send(Reply {
                             kind: work.kind,
@@ -373,7 +390,7 @@ fn start_lane(
             }
         };
         let mut id = 0u64;
-        while let Ok(work) = work.recv() {
+        while let Some(work) = receive_work(&work) {
             id = id.wrapping_add(1);
             let request = Request {
                 id: id.to_string(),
@@ -417,6 +434,10 @@ fn start_lane(
             ctx.request_repaint();
         }
     });
+}
+
+fn receive_work(work: &std::sync::Mutex<Receiver<Work>>) -> Option<Work> {
+    work.lock().ok()?.recv().ok()
 }
 
 fn launch_engine() -> Result<std::process::Child, String> {
@@ -796,6 +817,107 @@ mod tests {
         drop(db);
     }
 
+    #[test]
+    fn cancel_requests_reach_engine_while_other_control_responses_are_held() {
+        let pipe = format!(
+            r"\\.\pipe\magi-control-hold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (seen_tx, seen_rx) = std::sync::mpsc::sync_channel(4);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let name = pipe.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let (requests, mut incoming) = tokio::sync::mpsc::channel::<(
+                    Request,
+                    tokio::sync::oneshot::Sender<domain::Response>,
+                )>(8);
+                let handler = tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Some((request, reply)) = incoming.recv().await {
+                        let label = match &request.command {
+                            Command::GetRun { .. } => Some("read"),
+                            Command::CancelRun { run_id } if run_id == "first" => Some("first"),
+                            Command::CancelRun { .. } => Some("second"),
+                            _ => None,
+                        };
+                        if let Some(label) = label {
+                            seen_tx.send(label).unwrap();
+                        }
+                        if matches!(label, Some("read" | "first")) {
+                            held.push(reply);
+                        } else {
+                            let _ = reply.send(domain::Response {
+                                id: request.id,
+                                result: Ok(ResponseData::Empty),
+                            });
+                        }
+                    }
+                });
+                let server_name = name.clone();
+                let task =
+                    tokio::spawn(async move { transport::serve(&server_name, requests).await });
+                let probe = Request {
+                    id: "probe".into(),
+                    command: Command::Status,
+                };
+                for _ in 0..100 {
+                    if transport::request(&name, &probe).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                ready_tx.send(()).unwrap();
+                let _ = stop_rx.await;
+                task.abort();
+                handler.abort();
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (tx, _rx) = start_with_pipe(egui::Context::default(), pipe, None);
+        tx.send(Work::new(
+            Kind::List,
+            Command::GetRun {
+                run_id: "read".into(),
+            },
+        ))
+        .unwrap();
+        let read = seen_rx.recv_timeout(Duration::from_secs(2));
+        tx.send(Work::new(
+            Kind::List,
+            Command::CancelRun {
+                run_id: "first".into(),
+            },
+        ))
+        .unwrap();
+        tx.send(Work::new(
+            Kind::List,
+            Command::CancelRun {
+                run_id: "second".into(),
+            },
+        ))
+        .unwrap();
+        let first = seen_rx.recv_timeout(Duration::from_millis(900));
+        let second = seen_rx.recv_timeout(Duration::from_millis(900));
+        drop(tx);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        assert_eq!(read, Ok("read"));
+        let seen = [first.ok(), second.ok()];
+        assert!(
+            seen.contains(&Some("first")) && seen.contains(&Some("second")),
+            "서로 다른 취소는 지연된 제어 응답을 기다리지 않아야 함"
+        );
+    }
     #[test]
     fn storage_poll_is_not_blocked_by_slow_project_request() {
         let pipe = format!(r"\\.\pipe\magi-storage-priority-{}", std::process::id());
@@ -1364,19 +1486,24 @@ fn route_control_work(
     work: Work,
     regular: &SyncSender<Work>,
     control: &SyncSender<Work>,
+    cancel: &SyncSender<Work>,
 ) -> Option<Work> {
+    let cancellation = matches!(
+        &work.command,
+        Command::CancelRun { .. } | Command::CancelKnowledgeIndex { .. }
+    );
     let urgent = matches!(
         &work.command,
         Command::Status
             | Command::ListStorageFailures
             | Command::RetryCompletionSave { .. }
-            | Command::CancelRun { .. }
             | Command::GetRun { .. }
             | Command::ListEvents { .. }
-            | Command::CancelKnowledgeIndex { .. }
             | Command::KnowledgeIndexStatus { .. }
     );
-    match if urgent {
+    match if cancellation {
+        cancel.try_send(work)
+    } else if urgent {
         control.try_send(work)
     } else {
         regular.try_send(work)
@@ -1389,23 +1516,101 @@ fn route_control_work(
 mod priority_tests {
     use super::*;
     #[test]
+    fn split_control_queues_keep_bounded_capacity_and_preserve_overflow() {
+        let (regular, _regular_rx) = mpsc::sync_channel(1);
+        let (control, _control_rx) = mpsc::sync_channel(4);
+        let (cancel, _cancel_rx) = mpsc::sync_channel(4);
+        for _ in 0..4 {
+            assert!(route_control_work(
+                Work::new(Kind::Status, Command::Status),
+                &regular,
+                &control,
+                &cancel
+            )
+            .is_none());
+            assert!(route_control_work(
+                Work::new(Kind::List, Command::CancelRun { run_id: "r".into() }),
+                &regular,
+                &control,
+                &cancel
+            )
+            .is_none());
+        }
+        assert!(matches!(
+            route_control_work(
+                Work::new(Kind::Status, Command::Status),
+                &regular,
+                &control,
+                &cancel
+            ),
+            Some(Work {
+                kind: Kind::Status,
+                command: Command::Status
+            })
+        ));
+        assert!(matches!(
+            route_control_work(
+                Work::new(
+                    Kind::CancelExecution {
+                        project_id: "p".into(),
+                        run_id: "r".into(),
+                        request: 77
+                    },
+                    Command::CancelRun { run_id: "r".into() }
+                ),
+                &regular,
+                &control,
+                &cancel
+            ),
+            Some(Work {
+                kind: Kind::CancelExecution { request: 77, .. },
+                command: Command::CancelRun { .. }
+            })
+        ));
+    }
+    #[test]
     fn control_lane_capacity_returns_original_work_and_regular_stays_available() {
         let (regular, regular_rx) = mpsc::sync_channel(1);
         let (control, _control_rx) = mpsc::sync_channel(1);
-        assert!(
-            route_control_work(Work::new(Kind::List, Command::Status), &regular, &control)
-                .is_none()
-        );
-        let error = route_control_work(
-            Work::new(Kind::List, Command::CancelRun { run_id: "r".into() }),
+        let (cancel, _cancel_rx) = mpsc::sync_channel(1);
+        assert!(route_control_work(
+            Work::new(Kind::List, Command::Status),
             &regular,
             &control,
+            &cancel
+        )
+        .is_none());
+        assert!(route_control_work(
+            Work::new(
+                Kind::List,
+                Command::CancelRun {
+                    run_id: "first".into()
+                }
+            ),
+            &regular,
+            &control,
+            &cancel
+        )
+        .is_none());
+        let error = route_control_work(
+            Work::new(
+                Kind::CancelExecution {
+                    project_id: "p".into(),
+                    run_id: "r".into(),
+                    request: 42,
+                },
+                Command::CancelRun { run_id: "r".into() },
+            ),
+            &regular,
+            &control,
+            &cancel,
         )
         .unwrap();
         assert!(matches!(
             error,
             Work {
                 command: Command::CancelRun { .. },
+                kind: Kind::CancelExecution { request: 42, .. },
                 ..
             }
         ));
@@ -1417,7 +1622,8 @@ mod priority_tests {
                 }
             ),
             &regular,
-            &control
+            &control,
+            &cancel
         )
         .is_none());
         assert!(matches!(
@@ -1429,6 +1635,7 @@ mod priority_tests {
     fn control_commands_route_when_regular_lane_is_full() {
         let (regular, regular_rx) = mpsc::sync_channel(1);
         let (control, control_rx) = mpsc::sync_channel(8);
+        let (cancel, cancel_rx) = mpsc::sync_channel(4);
         regular
             .try_send(Work::new(
                 Kind::List,
@@ -1437,10 +1644,13 @@ mod priority_tests {
                 },
             ))
             .unwrap();
-        assert!(
-            route_control_work(Work::new(Kind::Status, Command::Status), &regular, &control)
-                .is_none()
-        );
+        assert!(route_control_work(
+            Work::new(Kind::Status, Command::Status),
+            &regular,
+            &control,
+            &cancel
+        )
+        .is_none());
         let commands = [
             Command::CancelRun { run_id: "r".into() },
             Command::GetRun { run_id: "r".into() },
@@ -1460,9 +1670,13 @@ mod priority_tests {
             Command::RetryCompletionSave { run_id: "r".into() },
         ];
         for command in commands {
-            assert!(
-                route_control_work(Work::new(Kind::List, command), &regular, &control).is_none()
-            );
+            assert!(route_control_work(
+                Work::new(Kind::List, command),
+                &regular,
+                &control,
+                &cancel
+            )
+            .is_none());
         }
         assert!(matches!(
             control_rx.try_recv().unwrap().command,
@@ -1471,6 +1685,14 @@ mod priority_tests {
         assert!(matches!(
             regular_rx.try_recv().unwrap().command,
             Command::ListMcpTools { .. }
+        ));
+        assert!(matches!(
+            cancel_rx.try_recv().unwrap().command,
+            Command::CancelRun { .. }
+        ));
+        assert!(matches!(
+            cancel_rx.try_recv().unwrap().command,
+            Command::CancelKnowledgeIndex { .. }
         ));
     }
 }
