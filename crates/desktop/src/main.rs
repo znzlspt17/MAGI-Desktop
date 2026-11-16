@@ -12,6 +12,7 @@ mod knowledge_graph_ui;
 mod knowledge_index_ui;
 mod knowledge_text_ui;
 mod mcp_connection_ui;
+mod mcp_oauth_ui;
 mod model_settings;
 mod run_controls;
 mod run_diff_ui;
@@ -57,6 +58,7 @@ struct State {
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
+    oauth: mcp_oauth_ui::State,
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
     tool_pending: std::collections::HashSet<String>,
@@ -76,6 +78,8 @@ impl State {
     fn select(&mut self, id: &str) -> u64 {
         self.knowledge_index.reselect(id);
         self.mcp.reselect(id);
+        let sequence = self.mcp.form(id).endpoint_generation;
+        self.oauth.bind(id, self.mcp.epoch, sequence);
         self.graph.select(id);
         self.decisions.select(id);
         self.knowledge.select(id);
@@ -116,6 +120,36 @@ struct App {
 }
 
 impl App {
+    fn oauth_request(&mut self, project: &str, action: mcp_oauth_ui::Action) {
+        if self.state.selected.as_deref() != Some(project)
+            || self.state.mcp.active.as_deref() != Some(project)
+        {
+            return;
+        }
+        let form = self.state.mcp.form(project);
+        if form.save_pending || !form.can_use_endpoint() {
+            return;
+        }
+        let sequence = form.endpoint_generation;
+        let epoch = self.state.mcp.epoch;
+        self.state.oauth.bind(project, epoch, sequence);
+        let Some(command) = self.state.oauth.command(action) else {
+            return;
+        };
+        let nonce = self.state.oauth.nonce.wrapping_add(1);
+        if self.send(worker::Work::new(
+            worker::Kind::McpOAuth {
+                project_id: project.into(),
+                epoch,
+                sequence,
+                nonce,
+                action,
+            },
+            command,
+        )) {
+            self.state.oauth.sent(action);
+        }
+    }
     fn index_request(&mut self, id: &str, action: knowledge_index_ui::Action) {
         use knowledge_index_ui::Action;
         if self.state.selected.as_deref() != Some(id)
@@ -291,6 +325,7 @@ impl App {
         )) {
             let form = self.state.mcp.form(id);
             form.sequence = sequence;
+            form.endpoint_generation = form.endpoint_generation.wrapping_add(1);
             form.save_pending = true;
             form.tools.clear();
             form.message = None;
@@ -304,8 +339,7 @@ impl App {
             return;
         }
         let form = self.state.mcp.form(id);
-        let can_list = form.saved.as_ref().is_some_and(|v| v == &form.endpoint)
-            || (form.saved.is_none() && form.endpoint.is_empty());
+        let can_list = form.can_use_endpoint();
         if form.save_pending || form.list_pending || !can_list {
             return;
         }
@@ -1405,6 +1439,21 @@ impl App {
                     ));
                 }
             }
+            Kind::McpOAuth {
+                project_id,
+                epoch,
+                sequence,
+                nonce,
+                action,
+            } => {
+                let current = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.mcp.active.as_deref() == Some(&project_id)
+                    && self.state.mcp.epoch == epoch
+                    && self.state.mcp.form(&project_id).endpoint_generation == sequence;
+                if current {
+                    self.state.oauth.reply(nonce, action, reply.result);
+                }
+            }
             Kind::McpSave {
                 project_id,
                 endpoint,
@@ -2256,6 +2305,22 @@ impl App {
                                 }
                                 mcp_connection_ui::Action::List => self.mcp_list(&project.id),
                             }
+                        }
+                        let sequence = self.state.mcp.form(&project.id).endpoint_generation;
+                        self.state
+                            .oauth
+                            .bind(&project.id, self.state.mcp.epoch, sequence);
+                        let can_oauth = self.state.mcp.form(&project.id).can_use_endpoint()
+                            && !self.state.mcp.form(&project.id).save_pending;
+                        if !can_oauth {
+                            ui.label("OAuth 요청 전에 입력한 MCP 주소를 저장하세요.");
+                        }
+                        let mut action = None;
+                        ui.add_enabled_ui(can_oauth, |ui| {
+                            action = mcp_oauth_ui::render(ui, &mut self.state.oauth);
+                        });
+                        if let Some(action) = action {
+                            self.oauth_request(&project.id, action);
                         }
                         self.state.graph.select(&project.id);
                         if let Some(offset) =
@@ -7076,6 +7141,117 @@ mod tests {
         assert_eq!(f.endpoint, "https://example.test/mcp");
         assert!(f.error.as_deref().unwrap().contains("연결 실패"));
         assert!(!f.list_pending);
+    }
+    #[test]
+    fn oauth_complete_sends_only_explicit_callback_and_preserves_it_when_queue_full() {
+        for capacity in [0, 1] {
+            let (tx, work) = std::sync::mpsc::sync_channel(capacity);
+            let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+            let mut app = App {
+                state: State {
+                    selected: Some("a".into()),
+                    ..Default::default()
+                },
+                tx,
+                rx,
+                cancel_startup: Default::default(),
+            };
+            app.state.mcp.select("a");
+            app.state.oauth.bind("a", app.state.mcp.epoch, 0);
+            app.state.oauth.callback = Some(domain::SecretString("fake-callback".into()));
+            assert!(work.try_recv().is_err());
+            app.oauth_request("a", mcp_oauth_ui::Action::Complete);
+            if capacity == 0 {
+                assert_eq!(
+                    app.state.oauth.callback.as_ref().map(|s| s.0.as_str()),
+                    Some("fake-callback")
+                );
+                assert!(app.state.oauth.pending.is_none());
+            } else {
+                assert!(
+                    matches!(work.try_recv().unwrap().command, Command::CompleteMcpOAuth{project_id,..} if project_id=="a")
+                );
+                assert!(app.state.oauth.callback.is_none());
+                app.oauth_request("a", mcp_oauth_ui::Action::Complete);
+                assert!(work.try_recv().is_err());
+            }
+        }
+    }
+    #[test]
+    fn oauth_late_reply_cannot_cross_endpoint_edit_or_project_reselection() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.oauth.bind("a", app.state.mcp.epoch, 0);
+        app.oauth_request("a", mcp_oauth_ui::Action::Discover);
+        let old = work.try_recv().unwrap();
+        app.state.mcp.edit("a", "https://example.test/new");
+        app.state.select("b");
+        app.state.select("a");
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Data(serde_json::json!({"resource":"old"}))),
+        });
+        assert!(app.state.oauth.metadata.is_none());
+        assert!(app.state.oauth.callback.is_none());
+    }
+    #[test]
+    fn oauth_does_not_authenticate_typed_unsaved_endpoint_when_saved_unknown() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/b");
+        let sequence = app.state.mcp.form("a").endpoint_generation;
+        app.state.oauth.bind("a", app.state.mcp.epoch, sequence);
+        app.state.oauth.client_id = "fake-client".into();
+        app.state.oauth.redirect_uri = "https://example.test/cb".into();
+        app.oauth_request("a", mcp_oauth_ui::Action::Begin);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn oauth_runtime_state_survives_tool_list_without_endpoint_change() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.mcp.select("a");
+        app.state.mcp.edit("a", "https://example.test/a");
+        app.state.mcp.form("a").saved = Some("https://example.test/a".into());
+        let sequence = app.state.mcp.form("a").endpoint_generation;
+        app.state.oauth.bind("a", app.state.mcp.epoch, sequence);
+        app.state.oauth.client_id = "fake-client".into();
+        app.state.oauth.callback = Some(domain::SecretString("fake-callback".into()));
+        app.mcp_list("a");
+        assert!(work.try_recv().is_ok());
+        let sequence = app.state.mcp.form("a").endpoint_generation;
+        app.state.oauth.bind("a", app.state.mcp.epoch, sequence);
+        assert_eq!(app.state.oauth.client_id, "fake-client");
+        assert!(app.state.oauth.callback.is_some());
     }
     #[test]
     fn indexing_actions_target_explicit_document_and_prevent_duplicate() {
