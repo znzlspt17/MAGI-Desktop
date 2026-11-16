@@ -7,6 +7,13 @@ use std::sync::{
 };
 
 pub enum Kind {
+    KnowledgeIndex {
+        project_id: String,
+        document: String,
+        epoch: u64,
+        sequence: u64,
+        action: crate::knowledge_index_ui::Action,
+    },
     RunDiff {
         project_id: String,
         run_id: String,

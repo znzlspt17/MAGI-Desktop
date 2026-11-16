@@ -8,6 +8,7 @@ mod agent_run_ui;
 mod agent_settings_ui;
 mod decisions_ui;
 mod knowledge_graph_ui;
+mod knowledge_index_ui;
 mod knowledge_text_ui;
 mod mcp_connection_ui;
 mod model_settings;
@@ -51,6 +52,7 @@ struct State {
     spec_submitted: std::collections::HashMap<String, domain::SpecDraft>,
     history: run_history::History,
     knowledge: knowledge_text_ui::State,
+    knowledge_index: knowledge_index_ui::State,
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
@@ -70,6 +72,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.knowledge_index.reselect(id);
         self.mcp.reselect(id);
         self.graph.select(id);
         self.decisions.select(id);
@@ -111,6 +114,78 @@ struct App {
 }
 
 impl App {
+    fn index_request(&mut self, id: &str, action: knowledge_index_ui::Action) {
+        use knowledge_index_ui::Action;
+        if self.state.selected.as_deref() != Some(id)
+            || self.state.knowledge_index.active.as_deref() != Some(id)
+        {
+            return;
+        }
+        let form = self.state.knowledge_index.form(id);
+        let mutation = matches!(action, Action::Configure | Action::Start);
+        if (mutation && (form.pending || form.control_request.is_some()))
+            || (!mutation && form.control_request.is_some())
+        {
+            return;
+        }
+        let document = form.document.clone();
+        let sequence = form.sequence.wrapping_add(1);
+        let command = match action {
+            Action::Configure => {
+                match knowledge_index_ui::configuration(&self.state.knowledge_index, id) {
+                    Some(c) => c,
+                    None => {
+                        self.state.knowledge_index.form(id).error =
+                            Some("설정 값과 런타임 자격정보를 확인하세요.".into());
+                        return;
+                    }
+                }
+            }
+            _ if document.trim().is_empty() => {
+                self.state.knowledge_index.form(id).error = Some("문서 ID를 입력하세요.".into());
+                return;
+            }
+            Action::Start => Command::IndexKnowledge {
+                project_id: id.into(),
+                document_id: document.clone(),
+            },
+            Action::Status => Command::KnowledgeIndexStatus {
+                project_id: id.into(),
+                document_id: document.clone(),
+            },
+            Action::Cancel => Command::CancelKnowledgeIndex {
+                project_id: id.into(),
+                document_id: document.clone(),
+            },
+        };
+        if self.send(worker::Work::new(
+            worker::Kind::KnowledgeIndex {
+                project_id: id.into(),
+                document: document.clone(),
+                epoch: self.state.knowledge_index.epoch,
+                sequence,
+                action,
+            },
+            command,
+        )) {
+            let epoch = self.state.knowledge_index.epoch;
+            let form = self.state.knowledge_index.form(id);
+            form.sequence = sequence;
+            if mutation {
+                form.pending = true;
+                form.mutation_request = Some((epoch, sequence));
+            } else {
+                form.control_request = Some((epoch, sequence, document));
+            }
+            form.error = None;
+            form.message = None;
+            if action == Action::Start || action == Action::Cancel {
+                form.status = None;
+                form.released = None;
+            }
+        }
+    }
+
     fn request_run_diff(&mut self, project: &str, run: &str) {
         if self.state.selected.as_deref() != Some(project)
             || self.state.history.project.as_deref() != Some(project)
@@ -1394,6 +1469,69 @@ impl App {
                     }
                 }
             }
+            Kind::KnowledgeIndex {
+                project_id,
+                document,
+                epoch,
+                sequence,
+                action,
+            } => {
+                use knowledge_index_ui::Action;
+                let current = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge_index.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge_index.epoch == epoch;
+                let form = self.state.knowledge_index.form(&project_id);
+                if matches!(action, Action::Configure | Action::Start) {
+                    if form.mutation_request == Some((epoch, sequence)) {
+                        form.mutation_request = None;
+                        form.pending = false;
+                    }
+                } else if form
+                    .control_request
+                    .as_ref()
+                    .is_some_and(|(e, s, _)| *e == epoch && *s == sequence)
+                {
+                    form.control_request = None;
+                }
+                let matches = form.sequence == sequence
+                    && (action == Action::Configure || form.document == document);
+                let mut clear_secret = false;
+                if current && matches {
+                    match (action, reply.result) {
+                        (Action::Configure, Ok(ResponseData::Empty)) => {
+                            form.message = Some("런타임 임베딩 설정을 적용했습니다.".into());
+                            clear_secret = true;
+                        }
+                        (Action::Start, Ok(ResponseData::Data(data)))
+                            if data["status"] == "running" =>
+                        {
+                            form.status = Some("running".into());
+                            form.released = None;
+                            form.message =
+                                Some("색인 요청을 접수했습니다. 상태를 확인하세요.".into());
+                        }
+                        (Action::Cancel, Ok(ResponseData::Empty)) => {
+                            form.status = None;
+                            form.released = None;
+                            form.message=Some("취소 요청을 접수했습니다. 작업 종료와 자원 반환은 상태 조회로 확인하세요.".into());
+                        }
+                        (Action::Status, Ok(ResponseData::Data(data))) => {
+                            match knowledge_index_ui::parse_status(&data) {
+                                Ok(status) => {
+                                    form.status = Some(status.phase);
+                                    form.released = Some(status.released);
+                                }
+                                Err(error) => form.error = Some(error),
+                            }
+                        }
+                        (_, Err(error)) => form.error = Some(format!("요청 실패: {error}")),
+                        _ => form.error = Some("색인 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+                if clear_secret {
+                    self.state.knowledge_index.secret = None;
+                }
+            }
             Kind::AgentSettingsSave {
                 project_id,
                 generation,
@@ -2136,6 +2274,14 @@ impl App {
                             )) {
                                 self.state.graph.page_request = request;
                             }
+                        }
+                        self.state.knowledge_index.select(&project.id);
+                        if let Some(action) = knowledge_index_ui::render(
+                            ui,
+                            &mut self.state.knowledge_index,
+                            &project.id,
+                        ) {
+                            self.index_request(&project.id, action);
                         }
                         self.state.knowledge.select(&project.id);
                         if let Some(action) =
@@ -6898,6 +7044,307 @@ mod tests {
         assert_eq!(f.endpoint, "https://example.test/mcp");
         assert!(f.error.as_deref().unwrap().contains("연결 실패"));
         assert!(!f.list_pending);
+    }
+    #[test]
+    fn indexing_actions_target_explicit_document_and_prevent_duplicate() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        app.state.knowledge_index.form("a").document = "doc".into();
+        app.index_request("a", knowledge_index_ui::Action::Start);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::IndexKnowledge{project_id,document_id} if project_id=="a" && document_id=="doc")
+        );
+        assert!(app.state.knowledge_index.form("a").pending);
+        app.index_request("a", knowledge_index_ui::Action::Start);
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn index_control_is_sent_while_mutation_ack_is_pending() {
+        for action in [
+            knowledge_index_ui::Action::Start,
+            knowledge_index_ui::Action::Configure,
+        ] {
+            for control in [
+                knowledge_index_ui::Action::Status,
+                knowledge_index_ui::Action::Cancel,
+            ] {
+                let (tx, work) = std::sync::mpsc::sync_channel(4);
+                let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+                let mut app = App {
+                    state: State {
+                        selected: Some("a".into()),
+                        ..Default::default()
+                    },
+                    tx,
+                    rx,
+                    cancel_startup: Default::default(),
+                };
+                app.state.knowledge_index.select("a");
+                let f = app.state.knowledge_index.form("a");
+                f.document = "doc".into();
+                f.endpoint = "https://example.test".into();
+                f.model = "m".into();
+                f.version = "v".into();
+                f.dimensions = "2".into();
+                app.state
+                    .knowledge_index
+                    .set_secret("a", domain::SecretString("fake".into()));
+                app.index_request("a", action);
+                let first = work.try_recv().expect("mutation must be sent");
+                app.index_request("a", action);
+                assert!(
+                    work.try_recv().is_err(),
+                    "duplicate mutation must be blocked"
+                );
+                app.index_request("a", control);
+                let sent = work
+                    .try_recv()
+                    .expect("control must not wait for mutation ACK");
+                match (control, &sent.command) {
+                    (
+                        knowledge_index_ui::Action::Status,
+                        Command::KnowledgeIndexStatus {
+                            project_id,
+                            document_id,
+                        },
+                    )
+                    | (
+                        knowledge_index_ui::Action::Cancel,
+                        Command::CancelKnowledgeIndex {
+                            project_id,
+                            document_id,
+                        },
+                    ) => {
+                        assert_eq!(project_id, "a");
+                        assert_eq!(document_id, "doc");
+                    }
+                    _ => panic!("wrong control command"),
+                }
+                app.apply(worker::Reply {
+                    kind: first.kind,
+                    result: Ok(ResponseData::Empty),
+                });
+                app.index_request("a", control);
+                assert!(
+                    work.try_recv().is_err(),
+                    "old mutation ACK must not release control pending"
+                );
+            }
+        }
+    }
+    #[test]
+    fn cancel_ack_is_not_reported_as_worker_release() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        let f = app.state.knowledge_index.form("a");
+        f.document = "doc".into();
+        f.released = Some(true);
+        app.index_request("a", knowledge_index_ui::Action::Cancel);
+        let sent = work.try_recv().unwrap();
+        assert!(
+            matches!(sent.command,Command::CancelKnowledgeIndex{document_id,..} if document_id=="doc")
+        );
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Ok(ResponseData::Empty),
+        });
+        let f = app.state.knowledge_index.form("a");
+        assert!(!f.pending);
+        assert_eq!(f.released, None);
+        assert!(f.message.as_ref().unwrap().contains("취소 요청"));
+    }
+    #[test]
+    fn index_project_reselection_invalidates_old_epoch_and_clears_runtime_secret() {
+        let mut state = State::default();
+        state.select("a");
+        state
+            .knowledge_index
+            .set_secret("a", domain::SecretString("fake".into()));
+        let old = state.knowledge_index.epoch;
+        state.select("a");
+        assert!(state.knowledge_index.epoch > old);
+        assert!(state.knowledge_index.secret.is_none());
+    }
+    #[test]
+    fn selected_project_shows_index_controls_without_sending_requests() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="임베딩 설정과 문서 색인")));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn embedding_queue_full_keeps_only_own_runtime_input() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        let f = app.state.knowledge_index.form("a");
+        f.endpoint = "https://example.test".into();
+        f.model = "fake".into();
+        f.version = "v1".into();
+        f.dimensions = "3".into();
+        app.state
+            .knowledge_index
+            .set_secret("a", domain::SecretString("fake".into()));
+        app.index_request("a", knowledge_index_ui::Action::Configure);
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.knowledge_index.form("a").pending);
+        assert_eq!(app.state.knowledge_index.secret.as_ref().unwrap().0, "a");
+        assert!(app.state.status.contains("대기열"));
+        app.state.select("b");
+        assert!(app.state.knowledge_index.secret.is_none());
+    }
+    #[test]
+    fn starting_new_index_clears_previous_document_status_immediately() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        let f = app.state.knowledge_index.form("a");
+        f.document = "doc".into();
+        f.status = Some("completed".into());
+        f.released = Some(true);
+        app.index_request("a", knowledge_index_ui::Action::Start);
+        assert!(work.try_recv().is_ok());
+        let f = app.state.knowledge_index.form("a");
+        assert!(f.status.is_none());
+        assert!(f.released.is_none());
+    }
+    #[test]
+    fn index_status_uses_document_target_and_reports_false_resource_release() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        app.state.knowledge_index.form("a").document = "doc".into();
+        app.index_request("a", knowledge_index_ui::Action::Status);
+        let sent = work.try_recv().unwrap();
+        assert!(
+            matches!(sent.command,Command::KnowledgeIndexStatus{project_id,document_id} if project_id=="a" && document_id=="doc")
+        );
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"status":"cancelling","resources_released":false}),
+            )),
+        });
+        let f = app.state.knowledge_index.form("a");
+        assert_eq!(f.status.as_deref(), Some("cancelling"));
+        assert_eq!(f.released, Some(false));
+    }
+    #[test]
+    fn index_late_status_after_document_change_or_project_round_trip_is_ignored() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge_index.select("a");
+        app.state.knowledge_index.form("a").document = "doc1".into();
+        app.index_request("a", knowledge_index_ui::Action::Status);
+        let old = work.try_recv().unwrap();
+        let f = app.state.knowledge_index.form("a");
+        f.document = "doc2".into();
+        f.sequence += 1;
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"status":"completed","resources_released":true}),
+            )),
+        });
+        let f = app.state.knowledge_index.form("a");
+        assert_eq!(f.document, "doc2");
+        assert!(f.status.is_none());
+        assert!(!f.pending);
+        app.index_request("a", knowledge_index_ui::Action::Status);
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Err("old".into()),
+        });
+        let f = app.state.knowledge_index.form("a");
+        assert!(f.error.is_none());
+        assert!(!f.pending);
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
