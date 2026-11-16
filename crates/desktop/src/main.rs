@@ -4,6 +4,9 @@ use domain::Project;
 use domain::{Command, ResponseData};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, SyncSender};
+mod decisions_ui;
+mod knowledge_graph_ui;
+mod knowledge_text_ui;
 mod model_settings;
 mod run_history;
 mod spec_review;
@@ -41,6 +44,9 @@ struct State {
     spec_review_pending: std::collections::HashSet<String>,
     spec_submitted: std::collections::HashMap<String, domain::SpecDraft>,
     history: run_history::History,
+    knowledge: knowledge_text_ui::State,
+    decisions: decisions_ui::State,
+    graph: knowledge_graph_ui::State,
 }
 
 impl State {
@@ -51,6 +57,9 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.graph.select(id);
+        self.decisions.select(id);
+        self.knowledge.select(id);
         self.history.project(id);
         self.selected = Some(id.to_owned());
         self.project = None;
@@ -88,6 +97,45 @@ struct App {
 }
 
 impl App {
+    fn decision_failed(&mut self, project_id: &str, message: String) {
+        self.state
+            .decisions
+            .forms
+            .entry(project_id.into())
+            .or_default()
+            .error = Some(message.clone());
+        if self.state.selected.as_deref() == Some(project_id) {
+            self.state.status = message;
+            self.refresh_after_decision(project_id);
+        } else {
+            self.state
+                .decisions
+                .refresh_needed
+                .insert(project_id.into());
+        }
+    }
+    fn refresh_after_decision(&mut self, project_id: &str) {
+        self.state.generation = self.state.generation.wrapping_add(1);
+        let generation = self.state.generation;
+        if !self.send(worker::Work::new(
+            worker::Kind::DecisionRefresh {
+                project_id: project_id.into(),
+                epoch: self.state.decisions.epoch,
+                generation,
+            },
+            Command::GetProject {
+                project_id: project_id.into(),
+            },
+        )) {
+            self.state
+                .decisions
+                .refresh_needed
+                .insert(project_id.into());
+            self.state.status = "결정 반영 상태를 조회하지 못했습니다. 다시 확인하세요.".into();
+        } else {
+            self.state.decisions.refresh_needed.remove(project_id);
+        }
+    }
     fn poll_storage(&mut self) {
         if self.state.storage.pending_poll {
             self.state.storage.poll_again = true;
@@ -612,6 +660,279 @@ impl App {
                     }
                 }
             }
+            Kind::KnowledgePut { project_id, epoch } => {
+                self.state.knowledge.put_pending.remove(&project_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                {
+                    self.state.status = match reply.result {
+                        Ok(ResponseData::Empty) => "원문을 저장했습니다.".into(),
+                        Err(error) => format!("원문 저장 실패: {error}"),
+                        _ => "원문 저장 응답이 올바르지 않습니다.".into(),
+                    };
+                }
+            }
+            Kind::KnowledgeSearch {
+                project_id,
+                epoch,
+                request,
+                query,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                    && self.state.knowledge.search_request == request
+                {
+                    let form = self.state.knowledge.forms.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["mode"] == "text"
+                                && data["results"].as_array().is_some_and(|docs| {
+                                    docs.len() <= 20
+                                        && docs.iter().all(|d| {
+                                            d["id"].as_str().is_some()
+                                                && d["source"].as_str().is_some()
+                                                && d["text"].as_str().is_some()
+                                                && d["version"].as_u64().is_some()
+                                        })
+                                }) =>
+                        {
+                            form.results = data["results"].as_array().unwrap().clone();
+                            form.result_query = query;
+                            form.offset = offset;
+                            form.loaded = true;
+                            form.error = None;
+                        }
+                        Err(error) => form.error = Some(format!("텍스트 검색 실패: {error}")),
+                        _ => form.error = Some("텍스트 검색 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
+            Kind::KnowledgeSource {
+                project_id,
+                epoch,
+                request,
+                document_id,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.knowledge.active.as_deref() == Some(&project_id)
+                    && self.state.knowledge.epoch == epoch
+                    && self.state.knowledge.source_request == request
+                {
+                    let form = self.state.knowledge.forms.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(doc))
+                            if doc["id"] == document_id
+                                && doc["source"].as_str().is_some()
+                                && doc["text"].as_str().is_some()
+                                && doc["version"].as_u64().is_some() =>
+                        {
+                            form.source_document = Some(doc);
+                            form.error = None;
+                        }
+                        Err(error) => form.error = Some(format!("원문 조회 실패: {error}")),
+                        _ => form.error = Some("원문 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
+            Kind::DecisionSave { project_id, epoch } => {
+                if reply.result.is_ok() {
+                    self.state.decisions.changed(&project_id);
+                }
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.decisions.active.as_deref() == Some(&project_id)
+                    && self.state.decisions.epoch == epoch
+                {
+                    match reply.result {
+                        Ok(ResponseData::Project(updated))
+                            if updated.id == project_id
+                                && self.state.project.as_ref().is_some_and(|p| {
+                                    p.id == project_id
+                                        && p.draft_hash == updated.draft_hash
+                                        && p.context_version < updated.context_version
+                                        && p.approval_version <= updated.approval_version
+                                }) =>
+                        {
+                            self.state.decisions.pending.remove(&project_id);
+                            self.state.generation = self.state.generation.wrapping_add(1);
+                            self.state.project = Some(updated);
+                            self.state.status =
+                                "결정을 저장했습니다. 이전 명세 승인이 해제되었습니다.".into();
+                        }
+                        Err(error) => {
+                            self.decision_failed(&project_id, format!("결정 저장 실패: {error}"))
+                        }
+                        _ => self.refresh_after_decision(&project_id),
+                    }
+                } else if let Err(error) = reply.result {
+                    self.decision_failed(&project_id, format!("결정 저장 실패: {error}"));
+                } else {
+                    self.state.decisions.refresh_needed.insert(project_id);
+                }
+            }
+            Kind::DecisionList {
+                project_id,
+                epoch,
+                request,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.decisions.active.as_deref() == Some(&project_id)
+                    && self.state.decisions.epoch == epoch
+                    && self.state.decisions.list_request == request
+                {
+                    let form = self.state.decisions.forms.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(data))
+                            if data["decisions"].as_array().is_some_and(|items| {
+                                items.iter().all(|d| {
+                                    d["id"].as_str().is_some()
+                                        && d["version"].as_u64().is_some_and(|v| v > 0)
+                                        && d["text"].as_str().is_some()
+                                })
+                            }) =>
+                        {
+                            form.records = data["decisions"].as_array().unwrap().clone();
+                            form.loaded = true;
+                            form.error = None;
+                        }
+                        Err(error) => form.error = Some(format!("결정 목록 조회 실패: {error}")),
+                        _ => form.error = Some("결정 목록 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
+            Kind::DecisionRevise {
+                project_id,
+                epoch,
+                id,
+            } => {
+                if reply.result.is_ok() {
+                    self.state.decisions.changed(&project_id);
+                }
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.decisions.epoch == epoch
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(value))
+                            if value["id"] == id
+                                && value["version"].as_u64().is_some()
+                                && value["text"].as_str().is_some() =>
+                        {
+                            self.refresh_after_decision(&project_id)
+                        }
+                        Err(error) => {
+                            self.decision_failed(&project_id, format!("결정 개정 실패: {error}"));
+                        }
+                        _ => {
+                            self.state.status =
+                                "결정 개정 응답이 올바르지 않아 프로젝트를 다시 조회합니다.".into();
+                            self.refresh_after_decision(&project_id);
+                        }
+                    }
+                } else if let Err(error) = reply.result {
+                    self.decision_failed(&project_id, format!("결정 개정 실패: {error}"));
+                } else {
+                    self.state.decisions.refresh_needed.insert(project_id);
+                }
+            }
+            Kind::DecisionSelect {
+                project_id,
+                epoch,
+                id,
+                version,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.decisions.epoch == epoch
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(value))
+                            if value["id"] == id
+                                && value["version"].as_u64() == Some(version)
+                                && value["text"].as_str().is_some() =>
+                        {
+                            self.refresh_after_decision(&project_id)
+                        }
+                        Err(error) => {
+                            self.decision_failed(&project_id, format!("결정 선택 실패: {error}"));
+                        }
+                        _ => {
+                            self.state.status =
+                                "결정 선택 응답이 올바르지 않아 프로젝트를 다시 조회합니다.".into();
+                            self.refresh_after_decision(&project_id);
+                        }
+                    }
+                } else if let Err(error) = reply.result {
+                    self.decision_failed(&project_id, format!("결정 선택 실패: {error}"));
+                } else {
+                    self.state.decisions.refresh_needed.insert(project_id);
+                }
+            }
+            Kind::DecisionRefresh {
+                project_id,
+                epoch,
+                generation,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.decisions.epoch == epoch
+                    && self.state.generation == generation
+                {
+                    match reply.result {
+                        Ok(ResponseData::Project(project))
+                            if project.id == project_id
+                                && self.state.project.as_ref().is_none_or(|current| {
+                                    current.id == project_id
+                                        && current.context_version <= project.context_version
+                                        && current.approval_version <= project.approval_version
+                                }) =>
+                        {
+                            self.state.decisions.pending.remove(&project_id);
+                            self.state.decisions.refresh_needed.remove(&project_id);
+                            self.state.project = Some(project);
+                            self.state.status = "프로젝트 상태를 다시 확인했습니다.".into();
+                        }
+                        Err(error) => {
+                            self.state.decisions.refresh_needed.insert(project_id);
+                            self.state.status = format!("결정 반영 상태 조회 실패: {error}");
+                        }
+                        _ => {
+                            self.state.decisions.refresh_needed.insert(project_id);
+                            self.state.status = "결정 반영 상태 응답이 올바르지 않습니다.".into();
+                        }
+                    }
+                } else {
+                    self.state.decisions.refresh_needed.insert(project_id);
+                }
+            }
+            Kind::GraphPage {
+                project_id,
+                epoch,
+                request,
+                offset,
+            } => {
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.graph.active.as_deref() == Some(&project_id)
+                    && self.state.graph.epoch == epoch
+                    && self.state.graph.page_request == request
+                {
+                    let page = self.state.graph.pages.entry(project_id).or_default();
+                    match reply.result {
+                        Ok(ResponseData::Data(data)) => match knowledge_graph_ui::edges(&data) {
+                            Ok(edges) => {
+                                page.edges = edges;
+                                page.offset = offset;
+                                page.loaded = true;
+                                page.error = None;
+                            }
+                            Err(_) => {
+                                page.error = Some("출처 관계 응답이 올바르지 않습니다.".into())
+                            }
+                        },
+                        Err(error) => page.error = Some(format!("출처 관계 조회 실패: {error}")),
+                        _ => page.error = Some("출처 관계 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
             Kind::Create { name, path } => {
                 self.state.creating = false;
                 let result = match reply.result {
@@ -936,6 +1257,7 @@ impl App {
 
                         ui.heading("명세 초안");
                         let review_busy = self.state.spec_review_pending.contains(&project.id)
+                            || self.state.decisions.pending.contains(&project.id)
                             || self.state.interview_pending.contains(&project.id)
                             || self.state.model_pending.contains(&project.id)
                             || self.state.spec_starting.contains(&project.id)
@@ -1027,6 +1349,170 @@ impl App {
                                 .chain(&binding.acceptance_ids)
                             {
                                 ui.label(value);
+                            }
+                        }
+                        self.state.decisions.select(&project.id);
+                        if let Some(action) =
+                            decisions_ui::render(ui, &mut self.state.decisions, &project)
+                        {
+                            match action {
+                                decisions_ui::Action::Refresh => {
+                                    self.refresh_after_decision(&project.id)
+                                }
+                                decisions_ui::Action::Save(decision) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::DecisionSave {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.decisions.epoch,
+                                        },
+                                        Command::SaveDecision {
+                                            project_id: project.id.clone(),
+                                            decision,
+                                        },
+                                    )) {
+                                        self.state.decisions.pending.insert(project.id.clone());
+                                    }
+                                }
+                                decisions_ui::Action::List => {
+                                    let request = self.state.decisions.list_request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::DecisionList {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.decisions.epoch,
+                                            request,
+                                        },
+                                        Command::ListDecisions {
+                                            project_id: project.id.clone(),
+                                        },
+                                    )) {
+                                        self.state.decisions.list_request = request;
+                                    }
+                                }
+                                decisions_ui::Action::Revise(id, text) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::DecisionRevise {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.decisions.epoch,
+                                            id: id.clone(),
+                                        },
+                                        Command::ReviseDecision {
+                                            project_id: project.id.clone(),
+                                            id,
+                                            text,
+                                        },
+                                    )) {
+                                        self.state.decisions.pending.insert(project.id.clone());
+                                    }
+                                }
+                                decisions_ui::Action::Select(id, version) => {
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::DecisionSelect {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.decisions.epoch,
+                                            id: id.clone(),
+                                            version,
+                                        },
+                                        Command::SelectDecision {
+                                            project_id: project.id.clone(),
+                                            id,
+                                            version,
+                                        },
+                                    )) {
+                                        self.state.decisions.pending.insert(project.id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        self.state.graph.select(&project.id);
+                        if let Some(offset) =
+                            knowledge_graph_ui::render(ui, &mut self.state.graph, &project.id)
+                        {
+                            let request = self.state.graph.page_request.wrapping_add(1);
+                            if self.send(worker::Work::new(
+                                worker::Kind::GraphPage {
+                                    project_id: project.id.clone(),
+                                    epoch: self.state.graph.epoch,
+                                    request,
+                                    offset,
+                                },
+                                Command::GetGraphPage {
+                                    project_id: project.id.clone(),
+                                    offset,
+                                    limit: knowledge_graph_ui::PAGE_SIZE,
+                                },
+                            )) {
+                                self.state.graph.page_request = request;
+                            }
+                        }
+                        self.state.knowledge.select(&project.id);
+                        if let Some(action) =
+                            knowledge_text_ui::render(ui, &mut self.state.knowledge, &project.id)
+                        {
+                            match action {
+                                knowledge_text_ui::Action::Put(result) => match result {
+                                    Ok(document) => {
+                                        if self.send(worker::Work::new(
+                                            worker::Kind::KnowledgePut {
+                                                project_id: project.id.clone(),
+                                                epoch: self.state.knowledge.epoch,
+                                            },
+                                            Command::PutKnowledge {
+                                                project_id: project.id.clone(),
+                                                document,
+                                            },
+                                        )) {
+                                            self.state
+                                                .knowledge
+                                                .put_pending
+                                                .insert(project.id.clone());
+                                        }
+                                    }
+                                    Err(error) => self.state.status = error,
+                                },
+                                knowledge_text_ui::Action::Search(query, offset) => {
+                                    let request =
+                                        self.state.knowledge.search_request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::KnowledgeSearch {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.knowledge.epoch,
+                                            request,
+                                            query: query.clone(),
+                                            offset,
+                                        },
+                                        Command::SearchKnowledgePage {
+                                            project_id: project.id.clone(),
+                                            query,
+                                            offset,
+                                            limit: 20,
+                                        },
+                                    )) {
+                                        self.state.knowledge.search_request = request;
+                                    }
+                                }
+                                knowledge_text_ui::Action::Source(document_id) => {
+                                    let request =
+                                        self.state.knowledge.source_request.wrapping_add(1);
+                                    if self.send(worker::Work::new(
+                                        worker::Kind::KnowledgeSource {
+                                            project_id: project.id.clone(),
+                                            epoch: self.state.knowledge.epoch,
+                                            request,
+                                            document_id: document_id.clone(),
+                                        },
+                                        Command::GetKnowledgeSource {
+                                            project_id: project.id.clone(),
+                                            document_id,
+                                        },
+                                    )) {
+                                        self.state.knowledge.source_request = request;
+                                        if let Some(form) =
+                                            self.state.knowledge.forms.get_mut(&project.id)
+                                        {
+                                            form.source_document = None;
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -3048,6 +3534,76 @@ mod tests {
     }
 
     #[test]
+    fn decision_change_blocks_approval_until_project_refresh() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.title = "제목".into();
+        p.draft.base_revision = "rev".into();
+        p.draft.scope = vec!["src".into()];
+        p.draft.requirements = vec!["요구".into()];
+        p.draft.acceptance = vec!["기준".into()];
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.pending.insert("a".into());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 7000.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "명세 승인" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(work.try_recv().is_err());
+    }
+
+    #[test]
     fn saved_draft_response_updates_selected_project() {
         let (tx, _work) = std::sync::mpsc::sync_channel(8);
         let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -3690,6 +4246,663 @@ mod tests {
             .contains("올바르지"));
     }
 
+    #[test]
+    fn knowledge_text_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_reply_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in [
+            "원문 저장",
+            "텍스트 검색",
+            "문서 ID",
+            "버전",
+            "출처",
+            "원문",
+            "검색어",
+        ] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn knowledge_search_displays_document_hits() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        let request = app.state.knowledge.search_request;
+        app.apply(worker::Reply{kind:worker::Kind::KnowledgeSearch{project_id:"a".into(),epoch,request,query:"검색".into(),offset:0},result:Ok(ResponseData::Data(serde_json::json!({"mode":"text","results":[{"id":"doc1","version":1,"source":"가상 출처","text":"첫 줄\n둘째 줄"}]})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("doc1"))));
+    }
+
+    #[test]
+    fn knowledge_source_displays_exact_multiline_text_and_provenance() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        let request = app.state.knowledge.source_request;
+        app.apply(worker::Reply{kind:worker::Kind::KnowledgeSource{project_id:"a".into(),epoch,request,document_id:"doc".into()},result:Ok(ResponseData::Data(serde_json::json!({"id":"doc","version":2,"source":"출처 예시","text":"첫 줄\n  다음 줄"})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in ["출처 예시", "첫 줄\n  다음 줄"] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn knowledge_empty_results_and_source_error_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSearch {
+                project_id: "a".into(),
+                epoch,
+                request: 0,
+                query: "없는 단어".into(),
+                offset: 0,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"mode":"text","results":[]}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="검색 결과가 없습니다.")));
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 0,
+                document_id: "doc".into(),
+            },
+            result: Err("document not found".into()),
+        });
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text.contains("document not found"))));
+    }
+    #[test]
+    fn older_source_reply_does_not_replace_newer_selection() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.knowledge.select("a");
+        let epoch = app.state.knowledge.epoch;
+        app.state.knowledge.source_request = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 2,
+                document_id: "new".into(),
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"new","version":1,"source":"s","text":"new"}),
+            )),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::KnowledgeSource {
+                project_id: "a".into(),
+                epoch,
+                request: 1,
+                document_id: "old".into(),
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"old","version":1,"source":"s","text":"old"}),
+            )),
+        });
+        assert_eq!(
+            app.state.knowledge.forms["a"]
+                .source_document
+                .as_ref()
+                .unwrap()["id"],
+            "new"
+        );
+    }
+
+    #[test]
+    fn decisions_controls_are_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for label in [
+            "새 결정 저장",
+            "결정 개정",
+            "결정 목록 조회",
+            "이 버전 선택",
+            "결정 내용",
+            "결정 ID",
+            "결정 버전",
+        ] {
+            assert!(
+                out.shapes.iter().any(
+                    |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==label)
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_list_displays_full_versioned_text() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        let epoch = app.state.decisions.epoch;
+        let request = app.state.decisions.list_request;
+        app.apply(worker::Reply{kind:worker::Kind::DecisionList{project_id:"a".into(),epoch,request},result:Ok(ResponseData::Data(serde_json::json!({"decisions":[{"id":"d","version":3,"text":"첫 줄\n두 번째 줄"}]})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="첫 줄\n두 번째 줄")));
+    }
+
+    #[test]
+    fn decision_snapshot_is_separate_from_current_versions() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft.reused_decisions.push(
+            serde_json::json!({"id":"d","version":1,"text":"이전 사본\n둘째 줄"}).to_string(),
+        );
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        let epoch = app.state.decisions.epoch;
+        let request = app.state.decisions.list_request;
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionList {
+                project_id: "a".into(),
+                epoch,
+                request,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"decisions":[{"id":"d","version":2,"text":"개정된 현재"}]}),
+            )),
+        });
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in ["선택 당시 사본", "이전 사본\n둘째 줄", "개정된 현재"] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn saved_decision_updates_project_without_erasing_interview_input() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        app.state.decisions.pending.insert("a".into());
+        app.state
+            .interview_inputs
+            .insert("a".into(), "입력 중".into());
+        let epoch = app.state.decisions.epoch;
+        let mut updated = project("a");
+        updated.context_version = 1;
+        updated.decisions.push("결정".into());
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionSave {
+                project_id: "a".into(),
+                epoch,
+            },
+            result: Ok(ResponseData::Project(updated)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().context_version, 1);
+        assert_eq!(app.state.interview_inputs["a"], "입력 중");
+        assert!(!app.state.decisions.pending.contains("a"));
+    }
+
+    #[test]
+    fn selecting_decision_refreshes_project_before_unblocking_edits() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        app.state.decisions.pending.insert("a".into());
+        let epoch = app.state.decisions.epoch;
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionSelect {
+                project_id: "a".into(),
+                epoch,
+                id: "d".into(),
+                version: 2,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"d","version":2,"text":"선택 당시\n사본"}),
+            )),
+        });
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetProject{project_id} if project_id=="a")
+        );
+        assert!(app.state.decisions.pending.contains("a"));
+    }
+
+    #[test]
+    fn stale_decision_save_response_requests_fresh_project_and_keeps_review_blocked() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.draft_hash = "newer".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        app.state.decisions.pending.insert("a".into());
+        let epoch = app.state.decisions.epoch;
+        let mut stale = project("a");
+        stale.context_version = 1;
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionSave {
+                project_id: "a".into(),
+                epoch,
+            },
+            result: Ok(ResponseData::Project(stale)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "newer");
+        assert!(app.state.decisions.pending.contains("a"));
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetProject{project_id} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn delayed_selection_after_project_round_trip_requires_fresh_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.select("a");
+        let epoch = app.state.decisions.epoch;
+        app.state.decisions.pending.insert("a".into());
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionSelect {
+                project_id: "a".into(),
+                epoch,
+                id: "d".into(),
+                version: 1,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"id":"d","version":1,"text":"결정"}),
+            )),
+        });
+        assert!(app.state.decisions.pending.contains("a"));
+        assert!(app.state.decisions.refresh_needed.contains("a"));
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "h");
+    }
+
+    #[test]
+    fn stale_decision_refresh_does_not_replace_newer_project() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.context_version = 5;
+        p.draft_hash = "newer".into();
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.decisions.select("a");
+        app.state.decisions.pending.insert("a".into());
+        let epoch = app.state.decisions.epoch;
+        let mut old = project("a");
+        old.context_version = 2;
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionRefresh {
+                project_id: "a".into(),
+                epoch,
+                generation: 0,
+            },
+            result: Ok(ResponseData::Project(old)),
+        });
+        assert_eq!(app.state.project.as_ref().unwrap().draft_hash, "newer");
+        assert!(app.state.decisions.pending.contains("a"));
+        assert!(app.state.decisions.refresh_needed.contains("a"));
+    }
+
+    #[test]
+    fn old_project_mutation_does_not_discard_current_project_list() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State::default(),
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.select("a");
+        let old_epoch = app.state.decisions.epoch;
+        app.state.decisions.pending.insert("a".into());
+        app.state.select("b");
+        app.state.project = Some(project("b"));
+        let epoch = app.state.decisions.epoch;
+        let request = app.state.decisions.list_request;
+        let mut old = project("a");
+        old.context_version = 1;
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionSave {
+                project_id: "a".into(),
+                epoch: old_epoch,
+            },
+            result: Ok(ResponseData::Project(old)),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::DecisionList {
+                project_id: "b".into(),
+                epoch,
+                request,
+            },
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"decisions":[{"id":"b1","version":1,"text":"b"}]}),
+            )),
+        });
+        assert_eq!(app.state.decisions.forms["b"].records[0]["id"], "b1");
+    }
+
+    #[test]
+    fn graph_query_control_is_visible() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="출처 관계 불러오기")));
+    }
+
+    #[test]
+    fn graph_query_requests_page_for_selected_project() {
+        let (tx, work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 10000.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render(ctx),
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "출처 관계 불러오기" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::GetGraphPage{project_id,offset:0,limit:30} if project_id=="a")
+        );
+    }
+
+    #[test]
+    fn graph_page_distinguishes_source_and_document_with_same_id() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        let request = app.state.graph.page_request;
+        app.apply(worker::Reply{kind:worker::Kind::GraphPage{project_id:"a".into(),epoch,request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"nodes":[{"id":"같은","kind":"source"},{"id":"같은","kind":"document","version":2}],"edges":[{"source":"같은","document_id":"같은","document_version":2}]})))});
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.render(ctx));
+        for expected in ["출처: 같은", "문서: 같은 (v2)"] {
+            assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==expected)),"{expected}");
+        }
+    }
+
+    #[test]
+    fn graph_rejects_edge_without_corresponding_typed_nodes() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        let request = app.state.graph.page_request;
+        app.apply(worker::Reply{kind:worker::Kind::GraphPage{project_id:"a".into(),epoch,request,offset:0},result:Ok(ResponseData::Data(serde_json::json!({"nodes":[{"id":"same","kind":"source"}],"edges":[{"source":"same","document_id":"same","document_version":1}]})))});
+        assert!(app.state.graph.pages["a"].edges.is_empty());
+        assert!(app.state.graph.pages["a"].error.is_some());
+    }
+
+    #[test]
+    fn graph_late_error_and_project_round_trip_do_not_replace_current_page() {
+        let (tx, _work) = std::sync::mpsc::sync_channel(8);
+        let (_rt, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.graph.select("a");
+        let old_epoch = app.state.graph.epoch;
+        app.state.graph.select("b");
+        app.state.graph.select("a");
+        let epoch = app.state.graph.epoch;
+        app.state.graph.page_request = 2;
+        let data = serde_json::json!({"nodes":[{"id":"s","kind":"source"},{"id":"d","kind":"document","version":1}],"edges":[{"source":"s","document_id":"d","document_version":1}]});
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch,
+                request: 2,
+                offset: 30,
+            },
+            result: Ok(ResponseData::Data(data)),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch,
+                request: 1,
+                offset: 0,
+            },
+            result: Err("늦은 오류".into()),
+        });
+        app.apply(worker::Reply {
+            kind: worker::Kind::GraphPage {
+                project_id: "a".into(),
+                epoch: old_epoch,
+                request: 2,
+                offset: 0,
+            },
+            result: Err("이전 선택 오류".into()),
+        });
+        let page = &app.state.graph.pages["a"];
+        assert_eq!(page.offset, 30);
+        assert_eq!(page.edges.len(), 1);
+        assert!(page.error.is_none());
+    }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {
         let (tx, _work) = std::sync::mpsc::sync_channel(8);

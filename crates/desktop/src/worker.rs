@@ -7,6 +7,54 @@ use std::sync::{
 };
 
 pub enum Kind {
+    GraphPage {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        offset: usize,
+    },
+    DecisionSave {
+        project_id: String,
+        epoch: u64,
+    },
+    DecisionList {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+    },
+    DecisionRevise {
+        project_id: String,
+        epoch: u64,
+        id: String,
+    },
+    DecisionSelect {
+        project_id: String,
+        epoch: u64,
+        id: String,
+        version: u64,
+    },
+    DecisionRefresh {
+        project_id: String,
+        epoch: u64,
+        generation: u64,
+    },
+    KnowledgePut {
+        project_id: String,
+        epoch: u64,
+    },
+    KnowledgeSearch {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        query: String,
+        offset: usize,
+    },
+    KnowledgeSource {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        document_id: String,
+    },
     HistoryPage {
         project_id: String,
         request: u64,
