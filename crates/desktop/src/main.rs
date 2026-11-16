@@ -118,7 +118,10 @@ impl App {
             return;
         }
         let form = self.state.knowledge_index.form(id);
-        if form.pending {
+        let mutation = matches!(action, Action::Configure | Action::Start);
+        if (mutation && (form.pending || form.control_request.is_some()))
+            || (!mutation && form.control_request.is_some())
+        {
             return;
         }
         let document = form.document.clone();
@@ -154,16 +157,22 @@ impl App {
         if self.send(worker::Work::new(
             worker::Kind::KnowledgeIndex {
                 project_id: id.into(),
-                document,
+                document: document.clone(),
                 epoch: self.state.knowledge_index.epoch,
                 sequence,
                 action,
             },
             command,
         )) {
+            let epoch = self.state.knowledge_index.epoch;
             let form = self.state.knowledge_index.form(id);
             form.sequence = sequence;
-            form.pending = true;
+            if mutation {
+                form.pending = true;
+                form.mutation_request = Some((epoch, sequence));
+            } else {
+                form.control_request = Some((epoch, sequence, document));
+            }
             form.error = None;
             form.message = None;
             if action == Action::Start || action == Action::Cancel {
@@ -1324,7 +1333,18 @@ impl App {
                     && self.state.knowledge_index.active.as_deref() == Some(&project_id)
                     && self.state.knowledge_index.epoch == epoch;
                 let form = self.state.knowledge_index.form(&project_id);
-                form.pending = false;
+                if matches!(action, Action::Configure | Action::Start) {
+                    if form.mutation_request == Some((epoch, sequence)) {
+                        form.mutation_request = None;
+                        form.pending = false;
+                    }
+                } else if form
+                    .control_request
+                    .as_ref()
+                    .is_some_and(|(e, s, _)| *e == epoch && *s == sequence)
+                {
+                    form.control_request = None;
+                }
                 let matches = form.sequence == sequence
                     && (action == Action::Configure || form.document == document);
                 let mut clear_secret = false;
@@ -6474,6 +6494,80 @@ mod tests {
         assert!(app.state.knowledge_index.form("a").pending);
         app.index_request("a", knowledge_index_ui::Action::Start);
         assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn index_control_is_sent_while_mutation_ack_is_pending() {
+        for action in [
+            knowledge_index_ui::Action::Start,
+            knowledge_index_ui::Action::Configure,
+        ] {
+            for control in [
+                knowledge_index_ui::Action::Status,
+                knowledge_index_ui::Action::Cancel,
+            ] {
+                let (tx, work) = std::sync::mpsc::sync_channel(4);
+                let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+                let mut app = App {
+                    state: State {
+                        selected: Some("a".into()),
+                        ..Default::default()
+                    },
+                    tx,
+                    rx,
+                    cancel_startup: Default::default(),
+                };
+                app.state.knowledge_index.select("a");
+                let f = app.state.knowledge_index.form("a");
+                f.document = "doc".into();
+                f.endpoint = "https://example.test".into();
+                f.model = "m".into();
+                f.version = "v".into();
+                f.dimensions = "2".into();
+                app.state
+                    .knowledge_index
+                    .set_secret("a", domain::SecretString("fake".into()));
+                app.index_request("a", action);
+                let first = work.try_recv().expect("mutation must be sent");
+                app.index_request("a", action);
+                assert!(
+                    work.try_recv().is_err(),
+                    "duplicate mutation must be blocked"
+                );
+                app.index_request("a", control);
+                let sent = work
+                    .try_recv()
+                    .expect("control must not wait for mutation ACK");
+                match (control, &sent.command) {
+                    (
+                        knowledge_index_ui::Action::Status,
+                        Command::KnowledgeIndexStatus {
+                            project_id,
+                            document_id,
+                        },
+                    )
+                    | (
+                        knowledge_index_ui::Action::Cancel,
+                        Command::CancelKnowledgeIndex {
+                            project_id,
+                            document_id,
+                        },
+                    ) => {
+                        assert_eq!(project_id, "a");
+                        assert_eq!(document_id, "doc");
+                    }
+                    _ => panic!("wrong control command"),
+                }
+                app.apply(worker::Reply {
+                    kind: first.kind,
+                    result: Ok(ResponseData::Empty),
+                });
+                app.index_request("a", control);
+                assert!(
+                    work.try_recv().is_err(),
+                    "old mutation ACK must not release control pending"
+                );
+            }
+        }
     }
     #[test]
     fn cancel_ack_is_not_reported_as_worker_release() {
