@@ -7,6 +7,29 @@ use std::sync::{
 };
 
 pub enum Kind {
+    AgentSettingsSave {
+        project_id: String,
+        generation: u64,
+    },
+    AgentSettingsRefresh {
+        project_id: String,
+        generation: u64,
+    },
+    CancelExecution {
+        project_id: String,
+        run_id: String,
+        request: u64,
+    },
+    StartExecution {
+        project_id: String,
+        generation: u64,
+    },
+    GraphPage {
+        project_id: String,
+        epoch: u64,
+        request: u64,
+        offset: usize,
+    },
     DecisionSave {
         project_id: String,
         epoch: u64,

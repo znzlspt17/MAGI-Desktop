@@ -2,11 +2,37 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 const RUNS: TableDefinition<&str, &str> = TableDefinition::new("runs");
 const COMPLETIONS: TableDefinition<&str, u8> = TableDefinition::new("completion_commits_v1");
+fn checkpoint_has_inflight(value: &serde_json::Value) -> bool {
+    value["model_inflight"] != false
+        || value["task_states"]
+            .as_object()
+            .is_some_and(|states| states.values().any(checkpoint_has_inflight))
+}
 // 2026-11-16: 시작 호출이 연결되기 전 CAS 경계를 독립적으로 검증한다.
 pub(crate) fn begin_agent(
     db: &Database,
     id: &str,
     expected: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    begin_agent_inner(db, id, expected, None)
+}
+
+// 2026-11-16: 재개 선점은 체크포인트와 모든 호출 기록을 같은 트랜잭션에서 검사한다.
+pub(crate) fn begin_resume(
+    db: &Database,
+    id: &str,
+    expected: &serde_json::Value,
+    model: &str,
+    config: &str,
+) -> Result<serde_json::Value, String> {
+    begin_agent_inner(db, id, expected, Some((model, config)))
+}
+
+fn begin_agent_inner(
+    db: &Database,
+    id: &str,
+    expected: &serde_json::Value,
+    resume: Option<(&str, &str)>,
 ) -> Result<serde_json::Value, String> {
     let tx = db.begin_write().map_err(|e| e.to_string())?;
     let mut run: serde_json::Value = {
@@ -19,16 +45,19 @@ pub(crate) fn begin_agent(
     };
     normalize_run(&mut run)?;
     if &run != expected
-        || run["status"] != "awaiting_implementation"
+        || (run["status"] != "awaiting_implementation"
+            && !(resume.is_some() && run["status"] == "interrupted"))
         || run["agent_active"] != false
+        || (resume.is_some() && run["resources_unknown"] == true)
         || !run["pending"].is_null()
     {
         return Err("run not ready for agent".into());
     }
-    if !run["used_calls"]
-        .as_array()
-        .ok_or("invalid calls")?
-        .is_empty()
+    if resume.is_none()
+        && !run["used_calls"]
+            .as_array()
+            .ok_or("invalid calls")?
+            .is_empty()
     {
         return Err("previous calls require resume".into());
     }
@@ -52,6 +81,67 @@ pub(crate) fn begin_agent(
         return Err("approved specification changed".into());
     }
     crate::agent_loop::validate_plan(spec)?;
+    if let Some((model, config)) = resume {
+        let table = tx.open_table(CHECKPOINTS).map_err(|e| e.to_string())?;
+        let value = table
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("checkpoint unavailable")?;
+        let checkpoint: serde_json::Value =
+            serde_json::from_str(value.value()).map_err(|_| "invalid saved checkpoint")?;
+        let saved: crate::agent_loop::LoopCheckpoint =
+            serde_json::from_value(checkpoint.clone()).map_err(|_| "invalid saved checkpoint")?;
+        if ![1, 2].contains(&saved.schema_version)
+            || saved.revision == 0
+            || saved.role_index > 2
+            || saved.pending_index > saved.pending_calls.len()
+        {
+            return Err("invalid saved checkpoint".into());
+        }
+        if checkpoint["spec_hash"] != run["spec_hash"]
+            || checkpoint["spec_version"] != run["spec_version"]
+            || checkpoint["model_identity"] != model
+            || checkpoint["config_hash"] != config
+            || checkpoint_has_inflight(&checkpoint)
+        {
+            return Err("checkpoint does not match run configuration".into());
+        }
+        if run["evidence"]
+            .as_array()
+            .is_none_or(|evidence| !evidence.is_empty())
+        {
+            return Err("previous attempt evidence cannot be reused safely".into());
+        }
+        let calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+        let prefix = format!("{id}:");
+        for item in calls.iter().map_err(|e| e.to_string())? {
+            let (key, value) = item.map_err(|e| e.to_string())?;
+            if key.value().starts_with(&prefix) {
+                let record: serde_json::Value =
+                    serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
+                if key.value() == format!("{id}:final-review") {
+                    return Err("previous review cannot be reused safely".into());
+                }
+                if record["status"] != "completed" || record.get("result").is_none() {
+                    return Err("previous tool outcome uncertain".into());
+                }
+            }
+        }
+        for call_id in run["used_calls"].as_array().ok_or("invalid calls")? {
+            let call_id = call_id.as_str().ok_or("invalid call identity")?;
+            let key = format!("{id}:{call_id}");
+            let value = calls
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .ok_or("previous tool outcome uncertain")?;
+            let record: serde_json::Value =
+                serde_json::from_str(value.value()).map_err(|_| "invalid call record")?;
+            if record["status"] != "completed" || record.get("result").is_none() {
+                return Err("previous tool outcome uncertain".into());
+            }
+        }
+        run["status"] = "awaiting_implementation".into();
+    }
     let attempt = run["agent_attempt"]
         .as_u64()
         .and_then(|v| v.checked_add(1))
@@ -65,7 +155,12 @@ pub(crate) fn begin_agent(
             .and_then(|v| v.checked_add(1))
             .ok_or("invalid event sequence")
     })?;
-    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":attempt,"kind":"agent_started","message":"설정된 에이전트 작업을 시작합니다."}));
+    let (kind, message) = if resume.is_some() {
+        ("agent_resumed", "저장된 checkpoint에서 재개합니다.")
+    } else {
+        ("agent_started", "설정된 에이전트 작업을 시작합니다.")
+    };
+    events.push(serde_json::json!({"sequence":sequence,"run_id":id,"attempt":attempt,"kind":kind,"message":message}));
     {
         let mut table = tx.open_table(RUNS).map_err(|e| e.to_string())?;
         table
@@ -2265,6 +2360,24 @@ fn diff_snapshot(
         result.insert(name, format!("{:x}", Sha256::digest(text.as_bytes())));
     }
     Ok(result)
+}
+
+// 2026-11-16: 재개 시 파일 해시 없이 저장된 실제 경로와 Git HEAD가 승인 revision과 일치하는지 확인한다.
+#[cfg(windows)]
+pub(crate) fn verify_resume_revision(run: &serde_json::Value) -> Result<(), String> {
+    let root = std::path::Path::new(run["worktree"].as_str().ok_or("invalid worktree")?);
+    let canonical = root.canonicalize().map_err(|_| "invalid worktree")?;
+    if canonical != root {
+        return Err("worktree path changed".into());
+    }
+    let _pins = crate::tools::pin_directories(root, std::path::Path::new(""), false)?;
+    let head = String::from_utf8(diff_git(root, &["rev-parse", "--verify", "HEAD"], 128)?)
+        .map_err(|_| "invalid Git revision")?;
+    let revision = run["revision"].as_str().ok_or("invalid revision")?;
+    if !head.trim().eq_ignore_ascii_case(revision) {
+        return Err("worktree revision changed".into());
+    }
+    Ok(())
 }
 
 // 2026-11-16: 승인된 기준과 현재 HEAD 및 범위를 묶고 읽기 전후 스냅샷이 달라지면 결과를 폐기한다.

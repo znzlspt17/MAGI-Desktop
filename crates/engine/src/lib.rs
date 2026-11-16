@@ -7,6 +7,7 @@ pub mod agent_loop;
 // 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
+mod knowledge_indexing;
 mod knowledge_text;
 mod mcp_connections;
 mod mcp_oauth;
@@ -30,6 +31,7 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SCHEMA_VERSION: u64 = 1;
 
 pub struct Engine {
+    indexing: std::sync::Mutex<knowledge_indexing::IndexState>,
     db: storage::StorageSlot,
     run_root: std::path::PathBuf,
     git_gate: Arc<std::sync::Mutex<()>>,
@@ -129,6 +131,7 @@ impl Engine {
         };
         let startup_pending = completions.blocked();
         Ok(Self {
+            indexing: std::sync::Mutex::new(knowledge_indexing::IndexState::default()),
             db,
             run_root: parent,
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -151,6 +154,7 @@ impl Engine {
                 | Command::SaveDecision { .. }
                 | Command::ReviseDecision { .. }
                 | Command::SelectDecision { .. }
+                | Command::ConfigureEmbedding { .. }
                 | Command::PutKnowledge { .. }
                 | Command::SetKnowledgeEmbedding { .. }
                 | Command::SubmitTool { .. }
@@ -193,6 +197,37 @@ impl Engine {
                 result: mcp_oauth::handle(Arc::clone(&self), request.command).await,
             };
         }
+        if let Command::SearchKnowledge {
+            project_id,
+            query,
+            semantic: true,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::semantic_search(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    query.clone(),
+                )
+                .await,
+            };
+        }
+        if let Command::IndexKnowledge {
+            project_id,
+            document_id,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::start(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    document_id.clone(),
+                )
+                .await,
+            };
+        }
         if let Command::ListMcpTools { project_id } = &request.command {
             return Response {
                 id: request_id,
@@ -214,6 +249,10 @@ impl Engine {
         if let Command::StartAgent {
             run_id,
             mock_script,
+        }
+        | Command::ResumeAgent {
+            run_id,
+            mock_script,
         } = &request.command
         {
             return Response {
@@ -222,6 +261,7 @@ impl Engine {
                     Arc::clone(&self),
                     run_id.clone(),
                     mock_script.clone(),
+                    matches!(&request.command, Command::ResumeAgent { .. }),
                 )
                 .await
                 .map(|_| ResponseData::Empty),
@@ -470,9 +510,12 @@ impl Engine {
                 | Command::SearchKnowledgePage { .. }
                 | Command::SearchKnowledgeVector { .. }
                 | Command::GetKnowledgeSource { .. }
+                | Command::CancelKnowledgeIndex { .. }
+                | Command::KnowledgeIndexStatus { .. }
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
                 | Command::GetProject { .. }
+                | Command::ListHistory { .. }
                 | Command::ListProjects
                 | Command::GetRun { .. }
                 | Command::GetDiff { .. }
@@ -494,6 +537,7 @@ impl Engine {
             | Command::ReviseDecision { project_id, .. }
             | Command::SelectDecision { project_id, .. }
             | Command::ConfigureMcp { project_id, .. }
+            | Command::ConfigureEmbedding { project_id, .. }
             | Command::PutKnowledge { project_id, .. }
             | Command::SetKnowledgeEmbedding { project_id, .. } => Some(project_id),
             _ => None,
@@ -602,6 +646,15 @@ impl Engine {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::graph(&db, &project_id, Some((offset, limit)))
             }
+            Command::ConfigureEmbedding { project_id, endpoint, model, version, dimensions, credential } => {
+                knowledge_indexing::configure(self, project_id, endpoint, model, version, dimensions, credential)
+            }
+            Command::CancelKnowledgeIndex { project_id, document_id } => {
+                knowledge_indexing::cancel(self, &project_id, &document_id)
+            }
+            Command::KnowledgeIndexStatus { project_id, document_id } => {
+                knowledge_indexing::status(self, &project_id, &document_id)
+            }
             Command::PutKnowledge { project_id, document } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
                 knowledge_text::put(&db, &project_id, document)
@@ -695,6 +748,8 @@ impl Engine {
             Command::Status => Ok(ResponseData::Status {
                 message: if self.completions.blocked() {
                     "engine storage recovery pending"
+                } else if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
                 } else {
                     "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
                 }.into(),
@@ -733,6 +788,13 @@ impl Engine {
                 }
                 tx.commit().map_err(err)?;
                 Ok(ResponseData::Project(project))
+            }
+            // 2026-11-16: 기존 승인 스냅샷만 조회해 미승인 초안을 이력으로 만들지 않는다.
+            Command::ListHistory { project_id } => {
+                match self.execute(Command::GetProject { project_id })? {
+                    ResponseData::Project(project) => Ok(ResponseData::Data(serde_json::json!({"approvals":project.approval_history}))),
+                    _ => Err("invalid project response".into()),
+                }
             }
             Command::GetProject { project_id } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
@@ -1221,7 +1283,14 @@ mod status_guidance_tests {
             command: Command::Status,
         });
         match response.result.unwrap() {
-            ResponseData::Status { message } => assert_eq!(message, "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"),
+            ResponseData::Status { message } => assert_eq!(
+                message,
+                if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
+                } else {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
+                }
+            ),
             _ => panic!("expected status"),
         }
         drop(engine);

@@ -1,6 +1,6 @@
 use domain::{Command, Request, ResponseData};
 use engine::Engine;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,75 @@ fn call(engine: &Engine, id: &str, command: Command) -> Result<ResponseData, Str
     });
     assert_eq!(response.id, id);
     response.result
+}
+
+#[test]
+fn history_returns_only_the_selected_projects_saved_approvals_after_restart() {
+    let dir = TestDirectory::new();
+    let path = dir.path().join("state.redb");
+    let engine = Engine::open(&path).unwrap();
+    let mut ids = Vec::new();
+    for name in ["a", "b"] {
+        let ResponseData::Project(project) = call(
+            &engine,
+            "create",
+            Command::CreateProject {
+                name: name.into(),
+                path: "fixture".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("project")
+        };
+        ids.push(project.id);
+    }
+    drop(engine);
+    let db = Database::open(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx.open_table(PROJECTS).unwrap();
+        let mut project: serde_json::Value =
+            serde_json::from_str(table.get(ids[0].as_str()).unwrap().unwrap().value()).unwrap();
+        project["approval_history"] = serde_json::json!([{"version":1,"hash":"fixture-hash","base_revision":"fixture","scope":["src"],"requirements":["r"],"acceptance":["a"],"accepted_optional":[],"markdown":"approved fixture","source_links":[],"constraints":[],"tasks":[],"reused_decisions":[],"task_bindings":[]}]);
+        project["draft"]["markdown"] = "unapproved fixture".into();
+        table
+            .insert(ids[0].as_str(), project.to_string().as_str())
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let engine = Engine::open(&path).unwrap();
+    let ResponseData::Data(a) = call(
+        &engine,
+        "history",
+        Command::ListHistory {
+            project_id: ids[0].clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("history")
+    };
+    assert_eq!(a["approvals"].as_array().unwrap().len(), 1);
+    assert_eq!(a["approvals"][0]["markdown"], "approved fixture");
+    let ResponseData::Data(b) = call(
+        &engine,
+        "history",
+        Command::ListHistory {
+            project_id: ids[1].clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("history")
+    };
+    assert!(b["approvals"].as_array().unwrap().is_empty());
+    assert!(call(
+        &engine,
+        "history",
+        Command::ListHistory {
+            project_id: "missing".into()
+        }
+    )
+    .is_err());
 }
 
 #[test]
@@ -199,17 +268,16 @@ async fn projects_keep_original_contract_and_survive_reopening() {
         .unwrap_err(),
         "project not found"
     );
-    assert_eq!(
+    assert!(matches!(
         call(
             &engine,
-            "unsupported",
+            "history",
             Command::ListHistory {
                 project_id: first.id.clone()
             }
-        )
-        .unwrap_err(),
-        "requested feature is not available"
-    );
+        ).unwrap(),
+        ResponseData::Data(value) if value["approvals"].as_array().unwrap().is_empty()
+    ));
 
     drop(engine);
     let reopened = Engine::open(&database).unwrap();

@@ -79,21 +79,39 @@ pub(crate) async fn list(engine: Arc<Engine>, project_id: String) -> Result<Resp
     let first_engine = Arc::clone(&engine);
     let first_id = project_id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
+        let _gate = first_engine
+            .mutation_gate
+            .lock()
+            .map_err(|_| "OAuth state unavailable")?;
         let db = first_engine.db.get().ok_or("storage unavailable")?;
-        endpoint(&db, &first_id)
+        let endpoint = endpoint(&db, &first_id)?;
+        let (auth, token) = crate::mcp_oauth::authentication(&first_engine, &first_id, &endpoint)?;
+        Ok::<_, String>((endpoint, auth, token))
     })
     .await
     .map_err(err)??;
-    let client = integrations::mcp::McpClient::connect(&snapshot.0).await?;
+    let client = match &snapshot.2 {
+        Some(token) => {
+            integrations::mcp::McpClient::connect_authenticated(&snapshot.0 .0, token.0.clone())
+                .await?
+        }
+        None => integrations::mcp::McpClient::connect(&snapshot.0 .0).await?,
+    };
     let tools = client.list_tools().await?;
     let current = tokio::task::spawn_blocking(move || {
+        let _gate = engine
+            .mutation_gate
+            .lock()
+            .map_err(|_| "OAuth state unavailable")?;
         let db = engine.db.get().ok_or("storage unavailable")?;
-        endpoint(&db, &project_id)
+        let endpoint = endpoint(&db, &project_id)?;
+        let (auth, _) = crate::mcp_oauth::authentication(&engine, &project_id, &endpoint)?;
+        Ok::<_, String>((endpoint, auth))
     })
     .await
     .map_err(err)??;
-    if snapshot != current {
-        return Err("MCP endpoint changed".into());
+    if (snapshot.0, snapshot.1) != current {
+        return Err("MCP endpoint changed or authentication changed".into());
     }
     Ok(ResponseData::Data(serde_json::json!({"tools":tools})))
 }
