@@ -144,6 +144,10 @@ fn validate_completed_checkpoint_calls(
             .as_u64()
             .filter(|v| *v > 0)
             .ok_or("call origin unavailable")?;
+        let effect_attempt = record["effect_agent_attempt"]
+            .as_u64()
+            .filter(|v| *v >= origin)
+            .ok_or("call effect attempt unavailable")?;
         let approval = record["approval_id"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -154,7 +158,7 @@ fn validate_completed_checkpoint_calls(
                 .iter()
                 .filter(|event| {
                     event["kind"] == kind
-                        && event["attempt"].as_u64() == Some(origin)
+                        && event["attempt"].as_u64() == Some(effect_attempt)
                         && event["approval_id"] == approval
                         && event["call_id"] == logical
                 })
@@ -171,7 +175,7 @@ fn validate_completed_checkpoint_calls(
             || record["task_id"] != task
             || run["agent_attempt"]
                 .as_u64()
-                .is_none_or(|attempt| origin > attempt)
+                .is_none_or(|attempt| effect_attempt > attempt)
         {
             return Err("completed checkpoint call mismatch".into());
         }
@@ -1638,6 +1642,12 @@ pub(crate) fn approve_patch(
                 drop(value);
                 drop(projects);
                 validate_bound_patch(&tx, &current, role, task, &pending["arguments"], true)?;
+                let mut claimed = record;
+                claimed["effect_agent_attempt"] = current["agent_attempt"].clone();
+                let mut calls = tx.open_table(CALLS).map_err(|e| e.to_string())?;
+                calls
+                    .insert(key.as_str(), claimed.to_string().as_str())
+                    .map_err(|e| e.to_string())?;
             }
             if pending["tool"] == "mcp" {
                 current["pending"]["authorized"] = true.into();

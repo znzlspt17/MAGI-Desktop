@@ -1249,11 +1249,65 @@ mod bridge_integration_tests {
             "fixture"
         );
         let after = runs::get(&db, &fixture.run_id).unwrap();
+        let record: Value = {
+            let tx = db.begin_read().unwrap();
+            let table = tx
+                .open_table(redb::TableDefinition::<&str, &str>::new("calls"))
+                .unwrap();
+            serde_json::from_str(
+                table
+                    .get(format!("{}:{logical_id}", fixture.run_id).as_str())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+        };
+        assert_eq!(record["origin_agent_attempt"], 1);
+        assert_eq!(record["effect_agent_attempt"], 2);
         assert!(after["events"]
             .as_array()
             .unwrap()
             .iter()
             .any(|event| event["kind"] == "tool_started" && event["attempt"] == 2));
+        let mut interrupted = after.clone();
+        interrupted["agent_active"] = false.into();
+        interrupted["status"] = "interrupted".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert(fixture.run_id.as_str(), interrupted.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let interrupted = runs::get(&db, &fixture.run_id).unwrap();
+        let next =
+            runs::begin_resume(&db, &fixture.run_id, &interrupted, "model", "config").unwrap();
+        assert_eq!(next["agent_attempt"], 3);
+        std::fs::write(fixture.work.join("src/new.txt"), "preserve").unwrap();
+        let runtime = Runtime::new(
+            Arc::clone(&fixture.engine),
+            fixture.run_id.clone(),
+            fixture.spec.clone(),
+            2,
+            3,
+        );
+        runtime
+            .execute_durable(
+                "implementer",
+                &fixture.spec.tasks[0],
+                "patch",
+                &logical_id,
+                json!({"path":"src/new.txt","content":"fixture"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("src/new.txt")).unwrap(),
+            "preserve"
+        );
     }
     impl ModelDriver for Model {
         async fn generate(
