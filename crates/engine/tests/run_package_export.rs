@@ -292,6 +292,55 @@ async fn export_run_uses_recorded_approved_version_and_real_evidence() {
         let mut table = tx
             .open_table(TableDefinition::<&str, &str>::new("runs"))
             .unwrap();
+        let mut run: serde_json::Value =
+            serde_json::from_str(table.get("run1").unwrap().unwrap().value()).unwrap();
+        let mut fresh = run["evidence"][0].clone();
+        fresh["agent_attempt"] = 2.into();
+        fresh["command"] = "fixture check".into();
+        run["evidence"][0]["passed"] = false.into();
+        run["evidence"].as_array_mut().unwrap().push(fresh);
+        run["agent_attempt"] = 2.into();
+        run["evidence_contexts_by_attempt"]["2"][&verification_id] = serde_json::json!({"schema_version":1,"spec_version":2,"context_version":3,"agent_attempt":2,"task_id":"t"});
+        table.insert("run1", run.to_string().as_str()).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let engine = fixture.engine();
+    let attempts = fixture.root.join("attempts");
+    let ResponseData::Data(manifest) = send(
+        &engine,
+        Command::ExportRunPackage {
+            run_id: "run1".into(),
+            destination: attempts.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("manifest")
+    };
+    let verification = std::fs::read_to_string(attempts.join("VERIFICATION.md")).unwrap();
+    let json = verification
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let entries: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 2);
+    assert_eq!(entries[0]["agent_attempt"], 1);
+    assert_eq!(entries[0]["passed"], false);
+    assert_eq!(entries[1]["agent_attempt"], 2);
+    assert_eq!(manifest["test_status"], "passed");
+    assert_eq!(manifest["completeness"], "limited");
+    drop(engine);
+    let db = Database::open(&fixture.db).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        use redb::ReadableTable;
+        let mut table = tx
+            .open_table(TableDefinition::<&str, &str>::new("runs"))
+            .unwrap();
         let mut run: serde_json::Value = {
             let row = table.get("run1").unwrap().unwrap();
             serde_json::from_str(row.value()).unwrap()

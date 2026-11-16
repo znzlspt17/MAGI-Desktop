@@ -138,10 +138,23 @@ pub(crate) fn export_run(
     let mut exported_evidence = Vec::new();
     let mut total_evidence = 0usize;
     if let Some(items) = run["evidence"].as_array() {
-        total_evidence = items.len();
         for item in items {
             let entry: VerificationEvidence = serde_json::from_value(item.clone()).map_err(err)?;
-            let context = &run["evidence_contexts"][&entry.verification_id];
+            let (attempt, context) = match crate::evidence::context(&run, item) {
+                Ok(value) => value,
+                Err(_) => {
+                    total_evidence += 1;
+                    continue;
+                }
+            };
+            if crate::evidence::resolve(&run, &entry.verification_id, attempt).is_err() {
+                total_evidence += 1;
+                continue;
+            }
+            let current = run["agent_attempt"].as_u64() == Some(attempt);
+            if current {
+                total_evidence += 1;
+            }
             if !entry.verification_id.is_empty()
                 && !entry.worktree_hash.is_empty()
                 && entry.spec_hash == hash
@@ -151,7 +164,6 @@ pub(crate) fn export_run(
                 && run["context_version"].as_u64().is_some()
                 && run["agent_attempt"].as_u64().is_some()
                 && context["context_version"] == run["context_version"]
-                && context["agent_attempt"] == run["agent_attempt"]
                 && context["task_id"].as_str().is_some_and(|v| !v.is_empty())
             {
                 // 2026-11-16: 명령과 저장된 맥락을 함께 남겨 각 결과의 출처를 추적한다. 출력 원문은 포함하지 않는다.
@@ -169,7 +181,9 @@ pub(crate) fn export_run(
                     "requirement_ids": entry.requirement_ids,
                     "acceptance_ids": entry.acceptance_ids,
                 }));
-                evidence.push(entry);
+                if current {
+                    evidence.push(entry);
+                }
             }
         }
     }
@@ -202,7 +216,12 @@ pub(crate) fn export_run(
                 || matches[0].command != *command
                 || matches[0].requirement_ids != binding.requirement_ids
                 || matches[0].acceptance_ids != binding.acceptance_ids
-                || run["evidence_contexts"][&verification_id]["task_id"] != task.id
+                || crate::evidence::resolve(
+                    &run,
+                    &verification_id,
+                    run["agent_attempt"].as_u64().ok_or("invalid attempt")?,
+                )?
+                .is_none_or(|(_, context)| context["task_id"] != task.id)
             {
                 covered = false;
             }

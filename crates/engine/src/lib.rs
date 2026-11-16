@@ -7,6 +7,7 @@ pub mod agent_loop;
 // 2026-11-16: StartAgent가 내구 runtime bridge를 통해 실행한다.
 mod agent_runtime;
 mod completion;
+mod evidence;
 mod knowledge_indexing;
 mod knowledge_text;
 mod mcp_connections;

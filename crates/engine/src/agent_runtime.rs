@@ -526,21 +526,12 @@ impl Runtime {
             if run["status"] != "awaiting_implementation" {
                 return Err("run not ready".into());
             }
-            let all = run["evidence"].as_array().ok_or("invalid evidence")?;
-            let matches: Vec<_> = all
-                .iter()
-                .filter(|v| v["verification_id"].as_str() == Some(id.as_str()))
-                .collect();
-            let context = run["evidence_contexts"].get(&id);
-            if matches.is_empty() && context.is_none() {
+            let Some((row, context)) = crate::evidence::resolve(&run, &id, identity.attempt)?
+            else {
                 return Ok(None);
-            }
-            if matches.len() != 1 {
-                return Err("invalid saved evidence".into());
-            }
-            let context = context.ok_or("invalid saved evidence context")?;
+            };
             let evidence: domain::VerificationEvidence =
-                serde_json::from_value(matches[0].clone()).map_err(|_| "invalid saved evidence")?;
+                serde_json::from_value(row.clone()).map_err(|_| "invalid saved evidence")?;
             let approved = spec
                 .tasks
                 .iter()
@@ -1103,7 +1094,7 @@ mod bridge_integration_tests {
                 let v = table.get(fixture.run_id.as_str()).unwrap().unwrap();
                 serde_json::from_str(v.value()).unwrap()
             };
-            run["evidence_contexts"]["verification-1"]["agent_attempt"] = json!(2);
+            run["evidence_contexts_by_attempt"]["1"]["verification-1"]["agent_attempt"] = json!(2);
             table
                 .insert(fixture.run_id.as_str(), run.to_string().as_str())
                 .unwrap();
