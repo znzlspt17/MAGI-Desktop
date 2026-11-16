@@ -189,6 +189,22 @@ impl Engine {
                 result: mcp_oauth::handle(Arc::clone(&self), request.command).await,
             };
         }
+        if let Command::SearchKnowledge {
+            project_id,
+            query,
+            semantic: true,
+        } = &request.command
+        {
+            return Response {
+                id: request_id,
+                result: knowledge_indexing::semantic_search(
+                    Arc::clone(&self),
+                    project_id.clone(),
+                    query.clone(),
+                )
+                .await,
+            };
+        }
         if let Command::IndexKnowledge {
             project_id,
             document_id,
