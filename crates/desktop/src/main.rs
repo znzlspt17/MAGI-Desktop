@@ -547,7 +547,13 @@ impl App {
         }
     }
 
+    fn resume_agent(&mut self, project: &Project) {
+        self.agent_request(project, true);
+    }
     fn start_agent(&mut self, project: &Project) {
+        self.agent_request(project, false);
+    }
+    fn agent_request(&mut self, project: &Project, resume: bool) {
         let Some(run_id) = self.state.history.selected.clone() else {
             return;
         };
@@ -566,20 +572,43 @@ impl App {
                 .spec_forms
                 .get(&project.id)
                 .is_none_or(|form| form.is_clean(project))
-            || !agent_run_ui::start_available(project, run)
+            || (resume
+                && (self.state.tool_pending.contains(&run_id)
+                    || self.state.manual_mcp.pending.contains(&run_id)))
+            || !(if resume {
+                agent_run_ui::resume_available(project, run)
+            } else {
+                agent_run_ui::start_available(project, run)
+            })
         {
             return;
         }
         if self.send(worker::Work::new(
-            worker::Kind::AgentStart {
-                project_id: project.id.clone(),
-                run_id: run_id.clone(),
-                request: self.state.history.selection_request,
-                generation: self.state.generation,
+            if resume {
+                worker::Kind::AgentResume {
+                    project_id: project.id.clone(),
+                    run_id: run_id.clone(),
+                    request: self.state.history.selection_request,
+                    generation: self.state.generation,
+                }
+            } else {
+                worker::Kind::AgentStart {
+                    project_id: project.id.clone(),
+                    run_id: run_id.clone(),
+                    request: self.state.history.selection_request,
+                    generation: self.state.generation,
+                }
             },
-            Command::StartAgent {
-                run_id: run_id.clone(),
-                mock_script: vec![],
+            if resume {
+                Command::ResumeAgent {
+                    run_id: run_id.clone(),
+                    mock_script: vec![],
+                }
+            } else {
+                Command::StartAgent {
+                    run_id: run_id.clone(),
+                    mock_script: vec![],
+                }
             },
         )) {
             self.state.agent_pending.insert(run_id);
@@ -1718,6 +1747,42 @@ impl App {
                     ));
                 }
             }
+            Kind::AgentResume {
+                project_id,
+                run_id,
+                request,
+                generation,
+            } => {
+                self.state.agent_pending.remove(&run_id);
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                {
+                    let same_request = self.state.generation == generation
+                        && self.state.history.selection_request == request;
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if same_request {
+                        self.state.status = match reply.result {
+                            Ok(ResponseData::Empty) => {
+                                "에이전트 재개 요청을 접수했습니다. 실행 상태를 다시 확인합니다."
+                                    .into()
+                            }
+                            Err(error) => format!("에이전트 재개 실패: {error}"),
+                            _ => "에이전트 재개 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
+                }
+            }
             Kind::McpOAuth {
                 project_id,
                 epoch,
@@ -2301,8 +2366,19 @@ impl App {
                                     .spec_forms
                                     .get(&project.id)
                                     .is_none_or(|form| form.is_clean(&project));
-                            if agent_run_ui::render(ui, &project, run, busy) {
+                            let start = agent_run_ui::render(ui, &project, run, busy);
+                            let resume_busy = busy
+                                || self.state.history.selected.as_ref().is_some_and(|id| {
+                                    self.state.tool_pending.contains(id)
+                                        || self.state.manual_mcp.pending.contains(id)
+                                });
+                            let resume =
+                                agent_run_ui::render_resume(ui, &project, run, resume_busy);
+                            if start {
                                 self.start_agent(&project);
+                            }
+                            if resume {
+                                self.resume_agent(&project);
                             }
                         }
                         if let (Some(run_id), Some(run)) = (
