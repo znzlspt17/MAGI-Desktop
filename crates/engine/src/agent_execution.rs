@@ -1561,6 +1561,90 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         std::fs::remove_file(work.join("src/pending.txt")).unwrap();
+        let mut completed_run = before_resume.clone();
+        completed_run["id"] = "completed-resume".into();
+        completed_run["agent_active"] = true.into();
+        completed_run["agent_attempt"] = 1.into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("completed-resume", completed_run.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let completed_args = serde_json::json!({"path":"src/completed.txt","content":"once"});
+        let completed_call = serde_json::to_string(&("task", "implementer", 0, "patch")).unwrap();
+        let pending = crate::runs::submit_bound_patch(
+            &db,
+            "completed-resume",
+            "implementer",
+            "task",
+            &completed_call,
+            completed_args.clone(),
+        )
+        .unwrap();
+        let approval = pending["approval_id"].as_str().unwrap().to_owned();
+        let mut completed_checkpoint = checkpoint.clone();
+        completed_checkpoint["role_index"] = 1.into();
+        completed_checkpoint["pending_calls"] =
+            serde_json::json!([{"call_id":"patch","name":"patch","arguments":completed_args}]);
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("checkpoints"))
+                .unwrap()
+                .insert(
+                    "completed-resume",
+                    completed_checkpoint.to_string().as_str(),
+                )
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let result = engine.handle(domain::Request {
+            id: "approve-completed".into(),
+            command: domain::Command::ApproveTool {
+                run_id: "completed-resume".into(),
+                approval_id: approval,
+                approved: true,
+            },
+        });
+        assert!(result.result.is_ok());
+        let mut stopped = crate::runs::get(&db, "completed-resume").unwrap();
+        stopped["agent_active"] = false.into();
+        stopped["status"] = "interrupted".into();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(redb::TableDefinition::<&str, &str>::new("runs"))
+                .unwrap()
+                .insert("completed-resume", stopped.to_string().as_str())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        std::fs::write(work.join("src/completed.txt"), "preserve").unwrap();
+        let result = Arc::clone(&engine)
+            .handle_async(domain::Request {
+                id: "resume-completed".into(),
+                command: domain::Command::ResumeAgent {
+                    run_id: "completed-resume".into(),
+                    mock_script: script.clone(),
+                },
+            })
+            .await;
+        assert!(result.result.is_ok(), "{:?}", result.result);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while engine.slots.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (_, progressed) = crate::runs::load_checkpoint(&db, "completed-resume")
+            .unwrap()
+            .unwrap();
+        assert!(progressed["pending_calls"].as_array().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/completed.txt")).unwrap(),
+            "preserve"
+        );
+        std::fs::remove_file(work.join("src/completed.txt")).unwrap();
         std::fs::write(work.join("src/a.txt"), "before").unwrap();
         let mut unsupported = project.clone();
         unsupported["approved"]["tasks"][0]["validation"] = serde_json::json!(["exec_json:{}"]);
