@@ -74,6 +74,58 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn concurrent_patch_failure_hooks_are_isolated_by_run() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let db1 = Database::open(&first.db).unwrap();
+    let db2 = Database::open(&second.db).unwrap();
+    let args = serde_json::json!({"path":"src/file.txt","content":"after"});
+    let a = submit_bound_patch(
+        &db1,
+        &first.run_id,
+        "implementer",
+        "task",
+        "first",
+        args.clone(),
+    )
+    .unwrap();
+    let b =
+        submit_bound_patch(&db2, &second.run_id, "implementer", "task", "second", args).unwrap();
+    let flag1 = Arc::new(AtomicBool::new(false));
+    let flag2 = Arc::new(AtomicBool::new(false));
+    TEST_FAIL_AFTER_PATCH
+        .lock()
+        .unwrap()
+        .insert(first.run_id.clone(), Arc::clone(&flag1));
+    TEST_FAIL_AFTER_PATCH
+        .lock()
+        .unwrap()
+        .insert(second.run_id.clone(), Arc::clone(&flag2));
+    let result1 = approve_patch(
+        &db1,
+        &first.run_id,
+        a["approval_id"].as_str().unwrap(),
+        true,
+    );
+    TEST_FAIL_AFTER_PATCH.lock().unwrap().remove(&first.run_id);
+    let result2 = approve_patch(
+        &db2,
+        &second.run_id,
+        b["approval_id"].as_str().unwrap(),
+        true,
+    );
+    TEST_FAIL_AFTER_PATCH.lock().unwrap().remove(&second.run_id);
+    result1.unwrap();
+    result2.unwrap();
+    assert!(flag1.load(Ordering::SeqCst));
+    assert!(flag2.load(Ordering::SeqCst));
+}
+
+#[test]
 fn bound_patch_claim_and_pending_are_atomic_and_completed_result_is_reused() {
     let f = Fixture::new();
     let db = Database::open(&f.db).unwrap();
@@ -602,9 +654,12 @@ fn storage_failure_after_bound_patch_preserves_ambiguous_effect_and_never_replay
     )
     .unwrap();
     let approval = proposal["approval_id"].as_str().unwrap().to_owned();
-    *TEST_FAIL_AFTER_PATCH.lock().unwrap() = Some((f.run_id.clone(), Arc::clone(&broken)));
+    TEST_FAIL_AFTER_PATCH
+        .lock()
+        .unwrap()
+        .insert(f.run_id.clone(), Arc::clone(&broken));
     assert!(approve_patch(&db, &f.run_id, &approval, true).is_err());
-    *TEST_FAIL_AFTER_PATCH.lock().unwrap() = None;
+    TEST_FAIL_AFTER_PATCH.lock().unwrap().remove(&f.run_id);
     assert_eq!(fs::read_to_string(f.file()).unwrap(), "after");
     broken.store(false, Ordering::SeqCst);
     drop(db);

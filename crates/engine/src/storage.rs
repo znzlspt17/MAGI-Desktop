@@ -2197,10 +2197,15 @@ mod tests {
         )
         .unwrap();
         let approval = proposal["approval_id"].as_str().unwrap().to_owned();
-        *crate::runs::TEST_FAIL_AFTER_PATCH.lock().unwrap() =
-            Some((run_id.clone(), Arc::clone(&broken)));
+        crate::runs::TEST_FAIL_AFTER_PATCH
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::clone(&broken));
         assert!(crate::runs::approve_patch(&db, &run_id, &approval, true).is_err());
-        *crate::runs::TEST_FAIL_AFTER_PATCH.lock().unwrap() = None;
+        crate::runs::TEST_FAIL_AFTER_PATCH
+            .lock()
+            .unwrap()
+            .remove(&run_id);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
         drop(db);
         broken.store(false, Ordering::SeqCst);
