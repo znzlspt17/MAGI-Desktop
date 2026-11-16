@@ -17,6 +17,7 @@ mod model_settings;
 mod run_controls;
 mod run_diff_ui;
 mod run_history;
+mod semantic_search_ui;
 mod spec_review;
 mod storage;
 mod tool_approval_ui;
@@ -55,6 +56,7 @@ struct State {
     history: run_history::History,
     knowledge: knowledge_text_ui::State,
     knowledge_index: knowledge_index_ui::State,
+    semantic_search: semantic_search_ui::State,
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
@@ -76,6 +78,7 @@ impl State {
         self.spec_notices.insert(project_id.to_owned(), message);
     }
     fn select(&mut self, id: &str) -> u64 {
+        self.semantic_search.reselect(id);
         self.knowledge_index.reselect(id);
         self.mcp.reselect(id);
         let sequence = self.mcp.form(id).endpoint_generation;
@@ -120,6 +123,40 @@ struct App {
 }
 
 impl App {
+    fn semantic_search(&mut self, id: &str) {
+        if self.state.selected.as_deref() != Some(id)
+            || self.state.semantic_search.active.as_deref() != Some(id)
+        {
+            return;
+        }
+        let form = self.state.semantic_search.form(id);
+        if form.pending || form.query.trim().is_empty() {
+            return;
+        }
+        let query = form.query.clone();
+        let sequence = form.sequence.wrapping_add(1);
+        if self.send(worker::Work::new(
+            worker::Kind::SemanticSearch {
+                project_id: id.into(),
+                query: query.clone(),
+                epoch: self.state.semantic_search.epoch,
+                sequence,
+            },
+            Command::SearchKnowledge {
+                project_id: id.into(),
+                query,
+                semantic: true,
+            },
+        )) {
+            let form = self.state.semantic_search.form(id);
+            form.sequence = sequence;
+            form.pending = true;
+            form.result = None;
+            form.error = None;
+            form.page = 0;
+        }
+    }
+
     fn oauth_request(&mut self, project: &str, action: mcp_oauth_ui::Action) {
         if self.state.selected.as_deref() != Some(project)
             || self.state.mcp.active.as_deref() != Some(project)
@@ -1520,6 +1557,32 @@ impl App {
                     }
                 }
             }
+            Kind::SemanticSearch {
+                project_id,
+                query,
+                epoch,
+                sequence,
+            } => {
+                let current = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.semantic_search.active.as_deref() == Some(&project_id)
+                    && self.state.semantic_search.epoch == epoch;
+                let form = self.state.semantic_search.form(&project_id);
+                form.pending = false;
+                if current && form.sequence == sequence && form.query == query {
+                    match reply.result {
+                        Ok(ResponseData::Data(data)) => match semantic_search_ui::parse(&data) {
+                            Ok(result) => {
+                                form.result = Some(result);
+                                form.error = None;
+                                form.page = 0;
+                            }
+                            Err(error) => form.error = Some(error),
+                        },
+                        Err(error) => form.error = Some(format!("검색 실패: {error}")),
+                        _ => form.error = Some("검색 응답이 올바르지 않습니다.".into()),
+                    }
+                }
+            }
             Kind::KnowledgeIndex {
                 project_id,
                 document,
@@ -2350,6 +2413,14 @@ impl App {
                             &project.id,
                         ) {
                             self.index_request(&project.id, action);
+                        }
+                        self.state.semantic_search.select(&project.id);
+                        if semantic_search_ui::render(
+                            ui,
+                            &mut self.state.semantic_search,
+                            &project.id,
+                        ) {
+                            self.semantic_search(&project.id);
                         }
                         self.state.knowledge.select(&project.id);
                         if let Some(action) =
@@ -7553,6 +7624,161 @@ mod tests {
         let f = app.state.knowledge_index.form("a");
         assert!(f.error.is_none());
         assert!(!f.pending);
+    }
+    #[test]
+    fn semantic_search_requires_explicit_query_and_sends_only_selected_project() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.semantic_search.select("a");
+        app.semantic_search("a");
+        assert!(work.try_recv().is_err());
+        app.state.semantic_search.edit("a", "질문");
+        app.semantic_search("a");
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::SearchKnowledge{project_id,query,semantic:true} if project_id=="a" && query=="질문")
+        );
+        assert!(app.state.semantic_search.form("a").pending);
+        app.semantic_search("a");
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn semantic_reply_respects_query_edits_and_displays_fallback_mode() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.semantic_search.select("a");
+        app.state.semantic_search.edit("a", "old");
+        app.semantic_search("a");
+        let old = work.try_recv().unwrap();
+        app.state.semantic_search.edit("a", "new");
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"mode":"semantic","results":[]}),
+            )),
+        });
+        assert!(app.state.semantic_search.form("a").result.is_none());
+        assert!(!app.state.semantic_search.form("a").pending);
+        app.semantic_search("a");
+        let current = work.try_recv().unwrap();
+        app.apply(worker::Reply {
+            kind: current.kind,
+            result: Ok(ResponseData::Data(
+                serde_json::json!({"mode":"text_fallback","results":[]}),
+            )),
+        });
+        assert_eq!(
+            app.state
+                .semantic_search
+                .form("a")
+                .result
+                .as_ref()
+                .unwrap()
+                .mode,
+            semantic_search_ui::Mode::TextFallback
+        );
+    }
+    #[test]
+    fn semantic_panel_renders_without_sending_and_project_reselection_changes_epoch() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="자연어 지식 검색")));
+        assert!(work.try_recv().is_err());
+        let epoch = app.state.semantic_search.epoch;
+        app.state.select("a");
+        assert!(app.state.semantic_search.epoch > epoch);
+    }
+    #[test]
+    fn semantic_queue_failure_preserves_current_query() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.semantic_search.select("a");
+        app.state.semantic_search.edit("a", "질문");
+        app.semantic_search("a");
+        assert!(work.try_recv().is_err());
+        assert!(!app.state.semantic_search.form("a").pending);
+        assert_eq!(app.state.semantic_search.form("a").query, "질문");
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn semantic_late_error_after_project_round_trip_does_not_overwrite_new_state() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.semantic_search.select("a");
+        app.state.semantic_search.edit("a", "질문");
+        app.semantic_search("a");
+        let old = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(project("a"));
+        app.apply(worker::Reply {
+            kind: old.kind,
+            result: Err("이전 오류".into()),
+        });
+        let f = app.state.semantic_search.form("a");
+        assert!(!f.pending);
+        assert!(f.error.is_none());
+        assert_eq!(f.query, "질문");
     }
     #[test]
     fn shell_renders_headlessly_at_multiple_scales() {

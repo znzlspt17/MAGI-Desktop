@@ -7,6 +7,12 @@ use std::sync::{
 };
 
 pub enum Kind {
+    SemanticSearch {
+        project_id: String,
+        query: String,
+        epoch: u64,
+        sequence: u64,
+    },
     McpOAuth {
         project_id: String,
         epoch: u64,
