@@ -234,6 +234,7 @@ mod tests {
             db: slot,
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: dir.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -386,6 +387,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let invoke = |command| {
@@ -560,6 +562,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let project = match engine
@@ -686,6 +689,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let response = engine
@@ -758,6 +762,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(false),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let retry = engine
@@ -944,6 +949,7 @@ mod tests {
             startup_recovery_pending: std::sync::atomic::AtomicBool::new(true),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let status = engine
@@ -1138,6 +1144,7 @@ mod tests {
             db: slot,
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1242,6 +1249,7 @@ mod tests {
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1538,6 +1546,7 @@ mod tests {
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1761,6 +1770,7 @@ mod tests {
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -1942,6 +1952,7 @@ mod tests {
                 Arc::clone(&gate),
             )),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2138,6 +2149,7 @@ mod tests {
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2262,6 +2274,7 @@ mod tests {
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),
@@ -2371,6 +2384,7 @@ mod tests {
             db: StorageSlot::new(path.clone(), db),
             completions: Arc::new(manager),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_root: root.clone(),
             git_gate: Arc::new(std::sync::Mutex::new(())),

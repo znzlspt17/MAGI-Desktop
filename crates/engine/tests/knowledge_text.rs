@@ -204,16 +204,19 @@ async fn text_search_validates_inputs_and_pages_in_stable_order() {
     )
     .await
     .is_err());
-    assert!(send(
-        &engine,
-        Command::SearchKnowledge {
-            project_id: id.clone(),
-            query: "needle".into(),
-            semantic: true
-        }
-    )
-    .await
-    .is_err());
+    let fallback = data(
+        send(
+            &engine,
+            Command::SearchKnowledge {
+                project_id: id.clone(),
+                query: "needle".into(),
+                semantic: true,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(fallback["mode"], "text_fallback");
     assert!(send(
         &engine,
         Command::PutKnowledge {
