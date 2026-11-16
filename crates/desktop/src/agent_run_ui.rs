@@ -207,6 +207,29 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn resume_does_not_race_pending_manual_mcp_request() {
+        let (p, mut run) = fixture();
+        run["status"] = "interrupted".into();
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = crate::App {
+            state: crate::State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.history.detail = Some(run);
+        app.state.manual_mcp.pending.insert("r".into());
+        app.resume_agent(&p);
+        assert!(work.try_recv().is_err());
+    }
 }
 pub(crate) fn render(
     ui: &mut eframe::egui::Ui,

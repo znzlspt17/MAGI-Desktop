@@ -1344,9 +1344,12 @@ mod checkpoint_storage_tests;
 mod durable_patch_tests;
 
 #[cfg(test)]
-pub(crate) static TEST_FAIL_AFTER_PATCH: std::sync::Mutex<
-    Option<(String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
-> = std::sync::Mutex::new(None);
+// 2026-11-16: 병렬 테스트의 서로 다른 실행이 장애 주입 등록을 덮거나 해제하지 않게 한다.
+pub(crate) static TEST_FAIL_AFTER_PATCH: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 #[cfg(test)]
 pub(crate) static TEST_FAIL_AFTER_TRUNCATE: std::sync::Mutex<Option<PathBuf>> =
     std::sync::Mutex::new(None);
@@ -1835,12 +1838,7 @@ pub(crate) fn approve_patch(
         }
     })();
     #[cfg(test)]
-    if let Some((_, flag)) = TEST_FAIL_AFTER_PATCH
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|(run_id, _)| run_id == id)
-    {
+    if let Some(flag) = TEST_FAIL_AFTER_PATCH.lock().unwrap().get(id) {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     finish_patch(db, id, approval, &result)?;

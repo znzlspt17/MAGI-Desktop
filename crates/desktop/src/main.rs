@@ -11,9 +11,11 @@ mod decisions_ui;
 mod knowledge_graph_ui;
 mod knowledge_index_ui;
 mod knowledge_text_ui;
+mod manual_mcp_ui;
 mod mcp_connection_ui;
 mod mcp_oauth_ui;
 mod model_settings;
+mod package_export_ui;
 mod run_controls;
 mod run_diff_ui;
 mod run_history;
@@ -60,11 +62,13 @@ struct State {
     decisions: decisions_ui::State,
     graph: knowledge_graph_ui::State,
     mcp: mcp_connection_ui::State,
+    manual_mcp: manual_mcp_ui::State,
     oauth: mcp_oauth_ui::State,
     agent_settings: agent_settings_ui::State,
     agent_pending: std::collections::HashSet<String>,
     tool_pending: std::collections::HashSet<String>,
     run_diff: run_diff_ui::State,
+    package_export: package_export_ui::State,
     approval_history: approval_history_ui::State,
     execution_pending: std::collections::HashSet<String>,
     cancel_pending: std::collections::HashSet<String>,
@@ -123,6 +127,70 @@ struct App {
 }
 
 impl App {
+    fn export_package(&mut self, project: &Project, target: package_export_ui::Target) {
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.package_export.pending.contains(&project.id)
+        {
+            return;
+        }
+        let form = self.state.package_export.form(&project.id);
+        let destination = match &target {
+            package_export_ui::Target::Project => form.project_destination.clone(),
+            package_export_ui::Target::Run(_) => form.run_destination.clone(),
+        };
+        let expected = match &target {
+            package_export_ui::Target::Project => match project
+                .approved
+                .as_ref()
+                .filter(|a| a.hash == project.draft_hash)
+            {
+                Some(a) => a.hash.clone(),
+                None => {
+                    self.state.status = "현재 승인된 명세가 필요합니다.".into();
+                    return;
+                }
+            },
+            package_export_ui::Target::Run(run_id) => {
+                if self.state.history.project.as_deref() != Some(&project.id)
+                    || self.state.history.selected.as_deref() != Some(run_id)
+                {
+                    return;
+                }
+                match self
+                    .state
+                    .history
+                    .detail
+                    .as_ref()
+                    .filter(|r| r["id"] == *run_id && r["project_id"] == project.id)
+                    .and_then(|r| r["spec_hash"].as_str())
+                {
+                    Some(hash) if !hash.is_empty() => hash.to_owned(),
+                    _ => {
+                        self.state.status = "선택한 실행의 상세 정보를 먼저 조회하세요.".into();
+                        return;
+                    }
+                }
+            }
+        };
+        let Some(command) = package_export_ui::command(&project.id, &target, &destination) else {
+            return;
+        };
+        if self.send(worker::Work::new(
+            worker::Kind::PackageExport {
+                project_id: project.id.clone(),
+                target,
+                destination,
+                expected,
+                generation: self.state.generation,
+                selection: self.state.history.selection_request,
+            },
+            command,
+        )) {
+            self.state.package_export.pending.insert(project.id.clone());
+            self.state.package_export.form(&project.id).result = None;
+        }
+    }
+
     fn semantic_search(&mut self, id: &str) {
         if self.state.selected.as_deref() != Some(id)
             || self.state.semantic_search.active.as_deref() != Some(id)
@@ -333,6 +401,85 @@ impl App {
         }
     }
 
+    fn manual_mcp_action(&mut self, project: &Project, action: manual_mcp_ui::Action) {
+        let endpoint_generation = self.state.mcp.form(&project.id).endpoint_generation;
+        let Some(run_id) = self.state.history.selected.clone() else {
+            return;
+        };
+        let Some(run) = self.state.history.detail.as_ref() else {
+            return;
+        };
+        if self.state.selected.as_deref() != Some(&project.id)
+            || self.state.history.project.as_deref() != Some(&project.id)
+            || self.state.manual_mcp.pending.contains(&run_id)
+            || self.state.tool_pending.contains(&run_id)
+            || self.state.agent_pending.contains(&run_id)
+            || self.state.cancel_pending.contains(&run_id)
+            || self.state.agent_settings.blocked(&project.id)
+            || self.state.spec_review_pending.contains(&project.id)
+            || !self
+                .state
+                .spec_forms
+                .get(&project.id)
+                .is_none_or(|form| form.is_clean(project))
+        {
+            return;
+        }
+        let command = match action {
+            manual_mcp_ui::Action::Request => manual_mcp_ui::request(
+                project,
+                run,
+                &run_id,
+                self.state.manual_mcp.form(&project.id),
+            ),
+            manual_mcp_ui::Action::Call => manual_mcp_ui::approved_call(project, run, &run_id),
+        };
+        let Some(command) = command else { return };
+        if action == manual_mcp_ui::Action::Call
+            && !self.state.manual_mcp.permits(
+                &project.id,
+                &run_id,
+                self.state.generation,
+                self.state.history.selection_request,
+                endpoint_generation,
+                &run["pending"],
+            )
+        {
+            return;
+        }
+        let intent = match &command {
+            Command::RequestMcpApproval {
+                endpoint,
+                name,
+                arguments,
+                cwd,
+                ..
+            } => Some(
+                serde_json::json!({"endpoint":endpoint,"name":name,"arguments":arguments,"cwd":cwd}),
+            ),
+            _ => None,
+        };
+        let snapshot = run.clone();
+        if self.send(worker::Work::new(
+            worker::Kind::ManualMcp {
+                project_id: project.id.clone(),
+                run_id: run_id.clone(),
+                request: self.state.history.selection_request,
+                generation: self.state.generation,
+                action,
+                snapshot,
+                endpoint_generation,
+                intent,
+            },
+            command,
+        )) {
+            self.state.manual_mcp.pending.insert(run_id);
+            self.state.manual_mcp.binding = None;
+            if action == manual_mcp_ui::Action::Call {
+                self.state.history.detail = None;
+            }
+        }
+    }
     fn mcp_save(&mut self, id: &str, endpoint: &str) {
         if self.state.selected.as_deref() != Some(id)
             || self.state.mcp.active.as_deref() != Some(id)
@@ -425,7 +572,9 @@ impl App {
                 .spec_forms
                 .get(&project.id)
                 .is_none_or(|form| form.is_clean(project))
-            || (resume && self.state.tool_pending.contains(&run_id))
+            || (resume
+                && (self.state.tool_pending.contains(&run_id)
+                    || self.state.manual_mcp.pending.contains(&run_id)))
             || !(if resume {
                 agent_run_ui::resume_available(project, run)
             } else {
@@ -652,6 +801,33 @@ impl App {
         true
     }
 
+    fn request_graph_source(&mut self, project: &str) {
+        if self.state.selected.as_deref() != Some(project)
+            || self.state.graph.active.as_deref() != Some(project)
+        {
+            return;
+        }
+        let Some((document_id, version)) = self.state.graph.source_intent.take() else {
+            return;
+        };
+        let request = self.state.graph.source_request;
+        if !self.send(worker::Work::new(
+            worker::Kind::GraphSource {
+                project_id: project.into(),
+                epoch: self.state.graph.epoch,
+                request,
+                document_id: document_id.clone(),
+                version,
+            },
+            Command::GetKnowledgeSource {
+                project_id: project.into(),
+                document_id,
+            },
+        )) {
+            self.state.graph.source_error =
+                Some("원문 조회 요청을 대기열에 넣지 못했습니다. 문서를 다시 선택하세요.".into());
+        }
+    }
     fn apply(&mut self, reply: worker::Reply) {
         use worker::Kind;
         let is_status = matches!(&reply.kind, Kind::Status);
@@ -1397,6 +1573,58 @@ impl App {
                     ));
                 }
             }
+            Kind::PackageExport {
+                project_id,
+                target,
+                destination,
+                expected,
+                generation,
+                selection,
+            } => {
+                self.state.package_export.pending.remove(&project_id);
+                let form = self.state.package_export.form(&project_id);
+                let destination_matches = match &target {
+                    package_export_ui::Target::Project => form.project_destination == destination,
+                    package_export_ui::Target::Run(_) => form.run_destination == destination,
+                };
+                let target_matches = match &target {
+                    package_export_ui::Target::Project => self
+                        .state
+                        .project
+                        .as_ref()
+                        .and_then(|p| p.approved.as_ref())
+                        .is_some_and(|a| a.hash == expected),
+                    package_export_ui::Target::Run(id) => {
+                        self.state.history.selected.as_deref() == Some(id)
+                            && self.state.history.selection_request == selection
+                    }
+                };
+                if self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.generation == generation
+                    && destination_matches
+                    && target_matches
+                {
+                    match reply.result {
+                        Ok(ResponseData::Data(manifest))
+                            if manifest["format_version"].as_u64().is_some()
+                                && manifest["completed_id"] == expected
+                                && manifest["completeness"].is_string()
+                                && manifest["test_status"].is_string() =>
+                        {
+                            let form = self.state.package_export.form(&project_id);
+                            form.result = Some(manifest);
+                            form.result_target = Some(target);
+                            form.result_destination = destination;
+                            self.state.status = "내보내기 응답을 받았습니다.".into();
+                        }
+                        Err(error) => self.state.status = format!("내보내기 실패: {error}"),
+                        _ => {
+                            self.state.status =
+                                "내보내기 응답이 올바르지 않습니다. 대상 경로를 확인하세요.".into()
+                        }
+                    }
+                }
+            }
             Kind::RunDiff {
                 project_id,
                 run_id,
@@ -1444,10 +1672,26 @@ impl App {
                         && self.state.history.detail.as_ref().is_some_and(|v| {
                             v["pending"] == snapshot && v["pending"]["id"] == approval_id
                         });
+                    let endpoint_generation = self.state.mcp.form(&project_id).endpoint_generation;
+                    let update_binding = same
+                        && matches!(&reply.result, Ok(ResponseData::Data(_)))
+                        && self.state.manual_mcp.permits(
+                            &project_id,
+                            &run_id,
+                            self.state.generation,
+                            request,
+                            endpoint_generation,
+                            &snapshot,
+                        );
                     self.state.history.detail = None;
                     self.state.history.selection_request =
                         self.state.history.selection_request.wrapping_add(1);
                     let request = self.state.history.selection_request;
+                    if update_binding {
+                        if let Some(binding) = self.state.manual_mcp.binding.as_mut() {
+                            binding.selection = request;
+                        }
+                    }
                     if same {
                         self.state.status = match reply.result {
                             Ok(ResponseData::Data(_)) => {
@@ -1586,6 +1830,86 @@ impl App {
                             form.error = Some("엔드포인트 저장 응답이 올바르지 않습니다.".into());
                         }
                     }
+                }
+            }
+            Kind::ManualMcp {
+                project_id,
+                run_id,
+                request,
+                generation,
+                action,
+                snapshot,
+                endpoint_generation,
+                intent,
+            } => {
+                self.state.manual_mcp.pending.remove(&run_id);
+                let same = self.state.selected.as_deref() == Some(&project_id)
+                    && self.state.history.project.as_deref() == Some(&project_id)
+                    && self.state.history.selected.as_deref() == Some(&run_id)
+                    && self.state.generation == generation
+                    && self.state.history.selection_request == request
+                    && (action == manual_mcp_ui::Action::Call
+                        || self.state.history.detail.as_ref() == Some(&snapshot));
+                if same {
+                    let same_endpoint =
+                        self.state.mcp.form(&project_id).endpoint_generation == endpoint_generation;
+                    let binding = match (&action, &reply.result, &intent) {
+                        (
+                            manual_mcp_ui::Action::Request,
+                            Ok(ResponseData::Data(data)),
+                            Some(arguments),
+                        ) => data["approval_id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| (id.to_owned(), arguments.clone())),
+                        _ => None,
+                    };
+                    if same_endpoint {
+                        self.state.status = match (action, reply.result) {
+                            (manual_mcp_ui::Action::Request, Ok(ResponseData::Data(data)))
+                                if data["approval_id"].as_str().is_some_and(|s| !s.is_empty()) =>
+                            {
+                                "승인 요청을 접수했습니다. 실행 상태를 다시 확인합니다.".into()
+                            }
+                            (manual_mcp_ui::Action::Call, Ok(ResponseData::Data(data))) => format!(
+                                "호출 응답: {}",
+                                serde_json::to_string(&data).unwrap_or_default()
+                            ),
+                            (manual_mcp_ui::Action::Call, _) => {
+                                "호출 결과를 확인하지 못했습니다. 자동으로 다시 실행하지 않습니다."
+                                    .into()
+                            }
+                            (_, Err(error)) => format!("승인 요청 실패: {error}"),
+                            _ => "승인 요청 응답이 올바르지 않습니다.".into(),
+                        };
+                    }
+                    self.state.history.detail = None;
+                    self.state.history.selection_request =
+                        self.state.history.selection_request.wrapping_add(1);
+                    let request = self.state.history.selection_request;
+                    if let Some((approval_id, arguments)) = binding {
+                        if self.state.mcp.form(&project_id).endpoint_generation
+                            == endpoint_generation
+                        {
+                            self.state.manual_mcp.binding = Some(manual_mcp_ui::Binding {
+                                project: project_id.clone(),
+                                run: run_id.clone(),
+                                generation,
+                                selection: request,
+                                endpoint_generation,
+                                approval_id,
+                                arguments,
+                            });
+                        }
+                    }
+                    self.send(worker::Work::new(
+                        worker::Kind::HistoryDetail {
+                            project_id,
+                            run_id: run_id.clone(),
+                            request,
+                        },
+                        Command::GetRun { run_id },
+                    ));
                 }
             }
             Kind::McpList {
@@ -1778,6 +2102,27 @@ impl App {
                         _ => self.state.status = "실행 시작 응답이 올바르지 않습니다.".into(),
                     }
                 }
+            }
+            Kind::GraphSource {
+                project_id,
+                epoch,
+                request,
+                document_id,
+                version,
+            } => {
+                let result = match reply.result {
+                    Ok(ResponseData::Data(data)) => Ok(data),
+                    Ok(_) => Err("응답 형식이 올바르지 않습니다.".into()),
+                    Err(error) => Err(error),
+                };
+                self.state.graph.apply_source(
+                    &project_id,
+                    epoch,
+                    request,
+                    &document_id,
+                    version,
+                    result,
+                );
             }
             Kind::GraphPage {
                 project_id,
@@ -2023,12 +2368,10 @@ impl App {
                                     .is_none_or(|form| form.is_clean(&project));
                             let start = agent_run_ui::render(ui, &project, run, busy);
                             let resume_busy = busy
-                                || self
-                                    .state
-                                    .history
-                                    .selected
-                                    .as_ref()
-                                    .is_some_and(|id| self.state.tool_pending.contains(id));
+                                || self.state.history.selected.as_ref().is_some_and(|id| {
+                                    self.state.tool_pending.contains(id)
+                                        || self.state.manual_mcp.pending.contains(id)
+                                });
                             let resume =
                                 agent_run_ui::render_resume(ui, &project, run, resume_busy);
                             if start {
@@ -2056,6 +2399,28 @@ impl App {
                                 tool_approval_ui::render(ui, &project, &run, &run_id, busy)
                             {
                                 self.answer_tool(&project, item, approved);
+                            }
+                            let busy = busy || self.state.manual_mcp.pending.contains(&run_id);
+                            let endpoint_generation =
+                                self.state.mcp.form(&project.id).endpoint_generation;
+                            let call_allowed = self.state.manual_mcp.permits(
+                                &project.id,
+                                &run_id,
+                                self.state.generation,
+                                self.state.history.selection_request,
+                                endpoint_generation,
+                                &run["pending"],
+                            );
+                            if let Some(action) = manual_mcp_ui::render(
+                                ui,
+                                &project,
+                                &run,
+                                &run_id,
+                                self.state.manual_mcp.form(&project.id),
+                                busy,
+                                call_allowed,
+                            ) {
+                                self.manual_mcp_action(&project, action);
                             }
                         }
                         if let Some(run_id) = self.state.history.selected.clone() {
@@ -2461,6 +2826,16 @@ impl App {
                         if let Some(action) = action {
                             self.oauth_request(&project.id, action);
                         }
+                        let busy = self.state.package_export.pending.contains(&project.id);
+                        let run = self.state.history.selected.clone();
+                        if let Some(target) = package_export_ui::render(
+                            ui,
+                            self.state.package_export.form(&project.id),
+                            run.as_deref(),
+                            busy,
+                        ) {
+                            self.export_package(&project, target);
+                        }
                         self.state.graph.select(&project.id);
                         if let Some(offset) =
                             knowledge_graph_ui::render(ui, &mut self.state.graph, &project.id)
@@ -2480,8 +2855,10 @@ impl App {
                                 },
                             )) {
                                 self.state.graph.page_request = request;
+                                self.state.graph.invalidate_source();
                             }
                         }
+                        self.request_graph_source(&project.id);
                         self.state.knowledge_index.select(&project.id);
                         if let Some(action) = knowledge_index_ui::render(
                             ui,
@@ -7700,6 +8077,222 @@ mod tests {
         let f = app.state.knowledge_index.form("a");
         assert!(f.error.is_none());
         assert!(!f.pending);
+    }
+    #[test]
+    fn export_sends_current_project_not_selected_history() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.package_export.form("a").project_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Project);
+        assert!(
+            matches!(work.try_recv().unwrap().command,Command::ExportPackage{project_id,destination} if project_id=="a" && destination=="C:/fake.zip")
+        );
+        assert!(app.state.package_export.pending.contains("a"));
+    }
+    #[test]
+    fn export_result_requires_matching_manifest_and_preserves_reported_fields() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.package_export.form("a").project_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Project);
+        let sent = work.try_recv().unwrap();
+        let manifest = serde_json::json!({"format_version":1,"completed_id":"h","completeness":"limited","test_status":"not_collected","warnings":["missing"]});
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Ok(ResponseData::Data(manifest.clone())),
+        });
+        assert_eq!(
+            app.state.package_export.form("a").result.as_ref(),
+            Some(&manifest)
+        );
+        assert!(!app.state.package_export.pending.contains("a"));
+        assert!(app.state.status.contains("내보내기"));
+    }
+    #[test]
+    fn selected_project_shows_package_export_controls_without_sending() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(project("a")),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        let ctx = egui::Context::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 12000.),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text=="현재 승인 명세 내보내기")));
+        assert!(work.try_recv().is_err());
+    }
+    #[test]
+    fn run_export_uses_selected_run_and_discards_late_response_after_selection_changes() {
+        let (tx, work) = std::sync::mpsc::sync_channel(2);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let p = project("a");
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r1".into());
+        app.state.history.detail =
+            Some(serde_json::json!({"id":"r1","project_id":"a","spec_hash":"old"}));
+        app.state.package_export.form("a").run_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Run("r1".into()));
+        let sent = work.try_recv().unwrap();
+        assert!(matches!(sent.command,Command::ExportRunPackage{ref run_id,..} if run_id=="r1"));
+        app.state.history.selected = Some("r2".into());
+        app.state.history.selection_request += 1;
+        app.state.status = "새 선택".into();
+        app.apply(worker::Reply{kind:sent.kind,result:Ok(ResponseData::Data(serde_json::json!({"format_version":1,"completed_id":"old","completeness":"limited","test_status":"not_collected"})))});
+        assert_eq!(app.state.status, "새 선택");
+        assert!(app.state.package_export.form("a").result.is_none());
+        assert!(!app.state.package_export.pending.contains("a"));
+    }
+    #[test]
+    fn export_queue_full_preserves_destination_and_does_not_claim_success() {
+        let (tx, work) = std::sync::mpsc::sync_channel(0);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.package_export.form("a").project_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Project);
+        assert!(work.try_recv().is_err());
+        assert_eq!(
+            app.state.package_export.form("a").project_destination,
+            "C:/fake.zip"
+        );
+        assert!(!app.state.package_export.pending.contains("a"));
+        assert!(app.state.status.contains("대기열"));
+    }
+    #[test]
+    fn export_without_approval_explains_why_no_request_was_sent() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let p = project("a");
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.package_export.form("a").project_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Project);
+        assert!(work.try_recv().is_err());
+        assert!(app.state.status.contains("승인"));
+    }
+    #[test]
+    fn export_requires_selected_run_detail_and_preserves_path() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let p = project("a");
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.history.project("a");
+        app.state.history.selected = Some("r".into());
+        app.state.package_export.form("a").run_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Run("r".into()));
+        assert!(work.try_recv().is_err());
+        assert!(app.state.status.contains("실행"));
+        assert_eq!(
+            app.state.package_export.form("a").run_destination,
+            "C:/fake.zip"
+        );
+    }
+    #[test]
+    fn late_export_response_after_project_round_trip_does_not_change_current_notice() {
+        let (tx, work) = std::sync::mpsc::sync_channel(1);
+        let (_reply, rx) = std::sync::mpsc::sync_channel(1);
+        let mut p = project("a");
+        p.approved=Some(serde_json::from_value(serde_json::json!({"version":1,"hash":"h","base_revision":"rev","scope":[],"requirements":[],"acceptance":[]})).unwrap());
+        let mut app = App {
+            state: State {
+                selected: Some("a".into()),
+                project: Some(p.clone()),
+                ..Default::default()
+            },
+            tx,
+            rx,
+            cancel_startup: Default::default(),
+        };
+        app.state.package_export.form("a").project_destination = "C:/fake.zip".into();
+        app.export_package(&p, package_export_ui::Target::Project);
+        let sent = work.try_recv().unwrap();
+        app.state.select("b");
+        app.state.select("a");
+        app.state.project = Some(p);
+        app.state.status = "새 선택".into();
+        app.apply(worker::Reply {
+            kind: sent.kind,
+            result: Err("이전 오류".into()),
+        });
+        assert_eq!(app.state.status, "새 선택");
+        assert!(app.state.package_export.form("a").result.is_none());
+        assert!(!app.state.package_export.pending.contains("a"));
     }
     #[test]
     fn semantic_search_requires_explicit_query_and_sends_only_selected_project() {
