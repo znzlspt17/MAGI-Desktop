@@ -18,6 +18,12 @@ pub enum Kind {
         epoch: u64,
         sequence: u64,
     },
+    AgentStart {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        generation: u64,
+    },
     AgentSettingsSave {
         project_id: String,
         generation: u64,

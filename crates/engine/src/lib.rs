@@ -10,6 +10,7 @@ mod completion;
 mod knowledge_indexing;
 mod knowledge_text;
 mod mcp_connections;
+mod mcp_oauth;
 mod mcp_runtime;
 mod package_export;
 mod project_decisions;
@@ -42,6 +43,7 @@ pub struct Engine {
     >,
     credentials:
         std::sync::Mutex<std::collections::HashMap<String, (String, domain::SecretString)>>,
+    oauth: std::sync::Mutex<std::collections::HashMap<String, mcp_oauth::Session>>,
 }
 
 type PreparedGeneration = (
@@ -138,6 +140,7 @@ impl Engine {
             completions: Arc::new(completions),
             cancellations: std::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: std::sync::Mutex::new(std::collections::HashMap::new()),
+            oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -175,6 +178,17 @@ impl Engine {
     // 2026-11-15: redb의 동기 I/O가 비동기 실행기를 막지 않도록 전용 작업 영역에서 실행한다.
     pub async fn handle_async(self: Arc<Self>, request: Request) -> Response {
         let request_id = request.id.clone();
+        if matches!(
+            &request.command,
+            Command::DiscoverMcpOAuth { .. }
+                | Command::BeginMcpOAuth { .. }
+                | Command::CompleteMcpOAuth { .. }
+        ) {
+            return Response {
+                id: request_id,
+                result: mcp_oauth::handle(Arc::clone(&self), request.command).await,
+            };
+        }
         if let Command::SearchKnowledge {
             project_id,
             query,
@@ -227,6 +241,10 @@ impl Engine {
         if let Command::StartAgent {
             run_id,
             mock_script,
+        }
+        | Command::ResumeAgent {
+            run_id,
+            mock_script,
         } = &request.command
         {
             return Response {
@@ -235,6 +253,7 @@ impl Engine {
                     Arc::clone(&self),
                     run_id.clone(),
                     mock_script.clone(),
+                    matches!(&request.command, Command::ResumeAgent { .. }),
                 )
                 .await
                 .map(|_| ResponseData::Empty),
@@ -488,6 +507,7 @@ impl Engine {
                 | Command::ListStorageFailures
                 | Command::RetryCompletionSave { .. }
                 | Command::GetProject { .. }
+                | Command::ListHistory { .. }
                 | Command::ListProjects
                 | Command::GetRun { .. }
                 | Command::GetDiff { .. }
@@ -646,7 +666,9 @@ impl Engine {
             }
             Command::ConfigureMcp { project_id, endpoint } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
-                mcp_connections::configure(&db, &project_id, &endpoint)
+                let result = mcp_connections::configure(&db, &project_id, &endpoint)?;
+                self.oauth.lock().map_err(|_| "OAuth state unavailable")?.remove(&project_id);
+                Ok(result)
             }
             Command::RequestMcpApproval { run_id, endpoint, name, arguments, cwd } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
@@ -714,6 +736,8 @@ impl Engine {
             Command::Status => Ok(ResponseData::Status {
                 message: if self.completions.blocked() {
                     "engine storage recovery pending"
+                } else if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
                 } else {
                     "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
                 }.into(),
@@ -752,6 +776,13 @@ impl Engine {
                 }
                 tx.commit().map_err(err)?;
                 Ok(ResponseData::Project(project))
+            }
+            // 2026-11-16: 기존 승인 스냅샷만 조회해 미승인 초안을 이력으로 만들지 않는다.
+            Command::ListHistory { project_id } => {
+                match self.execute(Command::GetProject { project_id })? {
+                    ResponseData::Project(project) => Ok(ResponseData::Data(serde_json::json!({"approvals":project.approval_history}))),
+                    _ => Err("invalid project response".into()),
+                }
             }
             Command::GetProject { project_id } => {
                 let db = self.db.get().ok_or("storage unavailable")?;
@@ -1240,7 +1271,14 @@ mod status_guidance_tests {
             command: Command::Status,
         });
         match response.result.unwrap() {
-            ResponseData::Status { message } => assert_eq!(message, "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"),
+            ResponseData::Status { message } => assert_eq!(
+                message,
+                if cfg!(windows) {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume limited to safe checkpoints; local inference unavailable"
+                } else {
+                    "engine ready; worktree preparation, spec generation, agent execution and storage recovery available; agent resume and local inference unavailable"
+                }
+            ),
             _ => panic!("expected status"),
         }
         drop(engine);

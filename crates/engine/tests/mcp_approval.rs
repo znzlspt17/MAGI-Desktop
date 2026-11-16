@@ -77,6 +77,212 @@ fn call(engine: &Engine, command: Command) -> Result<ResponseData, String> {
         })
         .result
 }
+
+#[tokio::test]
+async fn approved_tool_uses_project_oauth_token() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fixture = Fixture::new();
+    let engine = std::sync::Arc::new(Engine::open(&fixture.db).unwrap());
+    let run = match call(
+        &engine,
+        Command::GetRun {
+            run_id: fixture.run_id.clone(),
+        },
+    )
+    .unwrap()
+    {
+        ResponseData::Data(v) => v,
+        _ => panic!("run"),
+    };
+    let project_id = run["project_id"].as_str().unwrap().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for step in 0..7 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .and_then(|v| v.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8(data).unwrap();
+            if step >= 3
+                && !request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer fixture-token\r\n")
+            {
+                socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                return;
+            }
+            if step == 6 {
+                let json: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(json["method"], "tools/call");
+                assert_eq!(
+                    json["params"]["arguments"],
+                    serde_json::json!({"value":"approved"})
+                );
+            }
+            let body = match step {
+                0 => format!(r#"{{"resource":"http://{addr}/mcp","authorization_servers":["http://{addr}"]}}"#),
+                1 => format!(r#"{{"issuer":"http://{addr}","authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token","code_challenge_methods_supported":["S256"]}}"#),
+                2 => r#"{"access_token":"fixture-token","token_type":"Bearer"}"#.into(),
+                3 => r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}"#.into(),
+                4 => String::new(),
+                5 => r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"write","inputSchema":{"type":"object","required":["value"]}}]}}"#.into(),
+                _ => r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"done"}]}}"#.into(),
+            };
+            let status = if step == 4 { "202 Accepted" } else { "200 OK" };
+            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        }
+    });
+    let send = |command| {
+        engine.clone().handle_async(Request {
+            id: "fixture".into(),
+            command,
+        })
+    };
+    let endpoint = format!("http://{addr}/mcp");
+    send(Command::ConfigureMcp {
+        project_id: project_id.clone(),
+        endpoint: endpoint.clone(),
+    })
+    .await
+    .result
+    .unwrap();
+    let response = send(Command::BeginMcpOAuth {
+        project_id: project_id.clone(),
+        metadata_url: format!("http://{addr}/metadata"),
+        client_id: "fixture".into(),
+        redirect_uri: "http://127.0.0.1:43210/callback".into(),
+    })
+    .await
+    .result
+    .unwrap();
+    let ResponseData::Data(value) = response else {
+        panic!("OAuth")
+    };
+    let state = value["authorization_url"]
+        .as_str()
+        .unwrap()
+        .split(['?', '&'])
+        .find_map(|p| p.strip_prefix("state="))
+        .unwrap();
+    send(Command::CompleteMcpOAuth {
+        project_id,
+        callback: domain::SecretString(format!(
+            "http://127.0.0.1:43210/callback?state={state}&code=fixture"
+        )),
+    })
+    .await
+    .result
+    .unwrap();
+    let response = send(Command::RequestMcpApproval {
+        run_id: fixture.run_id.clone(),
+        endpoint,
+        name: "write".into(),
+        arguments: serde_json::json!({"value":"approved"}),
+        cwd: ".".into(),
+    })
+    .await
+    .result
+    .unwrap();
+    let ResponseData::Data(value) = response else {
+        panic!("approval")
+    };
+    let approval_id = value["approval_id"].as_str().unwrap().to_owned();
+    call(
+        &engine,
+        Command::ApproveTool {
+            run_id: fixture.run_id.clone(),
+            approval_id: approval_id.clone(),
+            approved: true,
+        },
+    )
+    .unwrap();
+    send(Command::CallMcpApproved {
+        run_id: fixture.run_id.clone(),
+        approval_id: approval_id.clone(),
+    })
+    .await
+    .result
+    .unwrap();
+    server.await.unwrap();
+    assert!(send(Command::CallMcpApproved {
+        run_id: fixture.run_id.clone(),
+        approval_id
+    })
+    .await
+    .result
+    .is_err());
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_addr = other.local_addr().unwrap();
+    let other_server = tokio::spawn(async move {
+        let (mut socket, _) = other.accept().await.unwrap();
+        let mut data = Vec::new();
+        while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut buf = [0; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        assert!(!String::from_utf8_lossy(&data)
+            .to_ascii_lowercase()
+            .contains("authorization:"));
+        socket
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let response = send(Command::RequestMcpApproval {
+        run_id: fixture.run_id.clone(),
+        endpoint: format!("http://{other_addr}/mcp"),
+        name: "write".into(),
+        arguments: serde_json::json!({"value":"approved"}),
+        cwd: ".".into(),
+    })
+    .await
+    .result
+    .unwrap();
+    let ResponseData::Data(value) = response else {
+        panic!("approval")
+    };
+    let other_id = value["approval_id"].as_str().unwrap().to_owned();
+    call(
+        &engine,
+        Command::ApproveTool {
+            run_id: fixture.run_id.clone(),
+            approval_id: other_id.clone(),
+            approved: true,
+        },
+    )
+    .unwrap();
+    assert!(send(Command::CallMcpApproved {
+        run_id: fixture.run_id.clone(),
+        approval_id: other_id
+    })
+    .await
+    .result
+    .is_err());
+    other_server.await.unwrap();
+}
 #[tokio::test]
 async fn mcp_request_requires_matching_explicit_approval_before_execution() {
     let fixture = Fixture::new();
