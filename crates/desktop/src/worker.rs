@@ -13,12 +13,32 @@ pub enum Kind {
         epoch: u64,
         sequence: u64,
     },
+    McpOAuth {
+        project_id: String,
+        epoch: u64,
+        sequence: u64,
+        nonce: u64,
+        action: crate::mcp_oauth_ui::Action,
+    },
     KnowledgeIndex {
         project_id: String,
         document: String,
         epoch: u64,
         sequence: u64,
         action: crate::knowledge_index_ui::Action,
+    },
+    RunDiff {
+        project_id: String,
+        run_id: String,
+        selection: u64,
+        sequence: u64,
+    },
+    ToolAnswer {
+        project_id: String,
+        run_id: String,
+        request: u64,
+        approval_id: String,
+        snapshot: serde_json::Value,
     },
     McpSave {
         project_id: String,

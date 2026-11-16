@@ -42,6 +42,19 @@ pub(crate) struct State {
     pub page_request: u64,
     pub pages: std::collections::HashMap<String, Page>,
     selected: std::collections::HashMap<String, Node>,
+    canvas: std::collections::HashMap<String, Canvas>,
+}
+struct Canvas {
+    zoom: f32,
+    pan: egui::Vec2,
+}
+impl Default for Canvas {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+        }
+    }
 }
 impl State {
     pub fn select(&mut self, id: &str) {
@@ -93,6 +106,64 @@ pub(crate) fn render(ui: &mut egui::Ui, state: &mut State, project_id: &str) -> 
         if page.edges.is_empty() {
             ui.label("이 페이지에 출처 관계가 없습니다.");
         }
+        let canvas = state.canvas.entry(project_id.into()).or_default();
+        ui.add(egui::Slider::new(&mut canvas.zoom, 0.5..=2.0).text("확대"));
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 240.0), egui::Sense::drag());
+        canvas.pan += response.drag_delta();
+        let painter = ui.painter_at(rect);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
+            egui::StrokeKind::Inside,
+        );
+        for (i, edge) in page.edges.iter().enumerate() {
+            let a = rect.left_top()
+                + canvas.pan
+                + egui::vec2(20.0, 20.0 + i as f32 * 28.0 * canvas.zoom);
+            let b = a + egui::vec2(220.0 * canvas.zoom, 0.0);
+            painter.line_segment(
+                [a + egui::vec2(0.0, 8.0), b + egui::vec2(0.0, 8.0)],
+                egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
+            );
+            for (point, node, label, color) in [
+                (
+                    a,
+                    Node::Source(edge.source.clone()),
+                    format!("출처 {}", edge.source),
+                    egui::Color32::LIGHT_BLUE,
+                ),
+                (
+                    b,
+                    Node::Document(edge.document_id.clone(), edge.document_version),
+                    format!("문서 {} (v{})", edge.document_id, edge.document_version),
+                    egui::Color32::WHITE,
+                ),
+            ] {
+                let text = painter.text(
+                    point,
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::FontId::proportional(13.0 * canvas.zoom),
+                    color,
+                );
+                let hit = rect.intersect(text.expand(4.0));
+                if hit.is_positive()
+                    && ui
+                        .interact(
+                            hit,
+                            ui.id()
+                                .with(("graph-canvas", i, matches!(node, Node::Document(..)))),
+                            egui::Sense::click(),
+                        )
+                        .clicked()
+                {
+                    state.selected.insert(project_id.into(), node);
+                }
+            }
+        }
+        ui.label("드래그로 이동하고 확대를 조절하세요. 노드를 선택할 수 있습니다.");
         egui::ScrollArea::vertical()
             .id_salt("graph_nodes")
             .max_height(240.0)
@@ -187,6 +258,124 @@ impl Page {
 #[cfg(test)]
 mod node_tests {
     use super::*;
+    #[test]
+    fn graph_page_renders_interactive_canvas_with_original_navigation_hint() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.pages.insert(
+            "p".into(),
+            Page {
+                edges: vec![Edge {
+                    source: "src".into(),
+                    document_id: "doc".into(),
+                    document_version: 2,
+                }],
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &mut state, "p");
+            });
+        });
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("드래그로 이동"))), "current page must expose canvas navigation");
+    }
+    #[test]
+    fn canvas_document_click_selects_exact_kind_id_and_version() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.pages.insert(
+            "p".into(),
+            Page {
+                edges: vec![Edge {
+                    source: "doc".into(),
+                    document_id: "doc".into(),
+                    document_version: 2,
+                }],
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        let frame = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run(frame(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &mut state, "p");
+            });
+        });
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "문서 doc (v2)" => {
+                    Some(t.pos + egui::vec2(5.0, 5.0))
+                }
+                _ => None,
+            })
+            .expect("canvas must draw document");
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(frame(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render(ui, &mut state, "p");
+                });
+            });
+        }
+        assert_eq!(
+            state.selected.get("p"),
+            Some(&Node::Document("doc".into(), 2))
+        );
+    }
+    #[test]
+    fn canvas_clips_panned_nodes_and_keeps_view_state_per_project() {
+        let ctx = egui::Context::default();
+        let mut state = State::default();
+        state.pages.insert(
+            "p".into(),
+            Page {
+                edges: vec![Edge {
+                    source: "src".into(),
+                    document_id: "doc".into(),
+                    document_version: 1,
+                }],
+                loaded: true,
+                ..Default::default()
+            },
+        );
+        state.canvas.insert(
+            "p".into(),
+            Canvas {
+                zoom: 1.5,
+                pan: egui::vec2(0.0, 300.0),
+            },
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &mut state, "p");
+            });
+        });
+        let drawn = output.shapes.iter().find(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "문서 doc (v1)")).expect("node draw command");
+        if let egui::Shape::Text(t) = &drawn.shape {
+            assert!(t.pos.y > drawn.clip_rect.bottom());
+        }
+        assert_eq!(state.canvas.entry("other".into()).or_default().zoom, 1.0);
+        assert_eq!(state.canvas["p"].zoom, 1.5);
+    }
     #[test]
     fn graph_nodes_preserve_kind_id_and_document_version() {
         let page = Page {

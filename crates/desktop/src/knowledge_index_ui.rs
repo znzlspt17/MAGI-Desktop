@@ -8,6 +8,8 @@ pub(crate) struct Form {
     pub document: String,
     pub sequence: u64,
     pub pending: bool,
+    pub mutation_request: Option<(u64, u64)>,
+    pub control_request: Option<(u64, u64, String)>,
     pub status: Option<String>,
     pub released: Option<bool>,
     pub message: Option<String>,
@@ -182,29 +184,41 @@ pub(crate) fn render(ui: &mut eframe::egui::Ui, state: &mut State, id: &str) -> 
         )
         .changed();
     if ui
-        .add_enabled(!form.pending, eframe::egui::Button::new("임베딩 설정"))
+        .add_enabled(
+            !form.pending && form.control_request.is_none(),
+            eframe::egui::Button::new("임베딩 설정"),
+        )
         .clicked()
     {
         action = Some(Action::Configure);
     }
     ui.label("문서 ID");
     changed |= ui.text_edit_singleline(&mut form.document).changed();
-    let enabled = !form.pending && !form.document.trim().is_empty();
+    let has_document = !form.document.trim().is_empty();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(enabled, eframe::egui::Button::new("색인 시작"))
+            .add_enabled(
+                !form.pending && form.control_request.is_none() && has_document,
+                eframe::egui::Button::new("색인 시작"),
+            )
             .clicked()
         {
             action = Some(Action::Start);
         }
         if ui
-            .add_enabled(enabled, eframe::egui::Button::new("색인 상태 조회"))
+            .add_enabled(
+                form.control_request.is_none() && has_document,
+                eframe::egui::Button::new("색인 상태 조회"),
+            )
             .clicked()
         {
             action = Some(Action::Status);
         }
         if ui
-            .add_enabled(enabled, eframe::egui::Button::new("색인 취소 요청"))
+            .add_enabled(
+                form.control_request.is_none() && has_document,
+                eframe::egui::Button::new("색인 취소 요청"),
+            )
             .clicked()
         {
             action = Some(Action::Cancel);
@@ -218,7 +232,10 @@ pub(crate) fn render(ui: &mut eframe::egui::Ui, state: &mut State, id: &str) -> 
         form.error = None;
     }
     if form.pending {
-        ui.label("요청 처리 중");
+        ui.label("설정 또는 색인 시작 요청 처리 중");
+    }
+    if let Some((_, _, document)) = &form.control_request {
+        ui.label(format!("문서 {document} 제어 요청 처리 중"));
     }
     if let Some(message) = &form.message {
         ui.label(message);
