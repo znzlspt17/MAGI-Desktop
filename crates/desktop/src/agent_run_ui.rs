@@ -54,7 +54,7 @@ pub(crate) fn render(
         )
         .clicked();
     ui.add_enabled(false, eframe::egui::Button::new("재개"));
-    ui.label("재개는 현재 엔진에서 지원하지 않습니다.");
+    ui.label("재개는 이 화면에서 지원하지 않습니다.");
     if run["model_provider"] == "mock" {
         ui.label("Mock 실행에는 별도의 테스트 스크립트가 필요합니다.");
     }
@@ -85,7 +85,7 @@ mod ui_tests {
         for label in [
             "에이전트 시작",
             "재개",
-            "재개는 현재 엔진에서 지원하지 않습니다.",
+            "재개는 이 화면에서 지원하지 않습니다.",
             "Mock 실행에는 별도의 테스트 스크립트가 필요합니다.",
         ] {
             assert!(out.shapes.iter().any(|s|matches!(&s.shape,eframe::egui::epaint::Shape::Text(t) if t.galley.job.text==label)),"{label}");
